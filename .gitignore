@@ -1,0 +1,9 @@
+# Herramientas locales / editor
+.claude/
+
+# Archivo vacío que se coló por accidente
+/Navio
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
