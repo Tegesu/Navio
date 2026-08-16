@@ -24,18 +24,21 @@ const TABLE_MAP: Record<string, string> = {
   fuel: "fuel_records",
   maintenance: "maintenance_records",
   compliance: "compliance_records",
+  travel: "travel_expenses",
 };
 
 const MODULE_LABEL: Record<string, string> = {
   fuel: "Combustible",
   maintenance: "Mantenimiento",
   compliance: "Trámites",
+  travel: "Viáticos",
 };
 
 const FIELD_MAP: Record<string, string[]> = {
   fuel: ["unit", "plate", "station", "liters", "amount", "odometer", "efficiency", "date", "vendor", "invoiceFolio", "notes"],
   maintenance: ["unit", "plate", "category", "concept", "amount", "date", "vendor", "invoiceFolio", "notes"],
   compliance: ["unit", "plate", "docType", "concept", "amount", "date", "dueDate", "paymentStatus", "vendor", "invoiceFolio", "notes"],
+  travel: ["unit", "plate", "driverName", "concept", "amount", "date", "vendor", "invoiceFolio", "notes"],
 };
 
 function today() {
@@ -48,11 +51,13 @@ function buildRecord(extracted: any, module: string): Record<string, unknown> | 
   for (const key of FIELD_MAP[module] ?? []) {
     if (raw[key] !== undefined && raw[key] !== null && raw[key] !== "") picked[key] = raw[key];
   }
-  picked.unit = picked.unit || "Sin identificar";
+  // "travel" no está ligado a una unidad — un hospedaje puede no mencionar ninguna.
+  if (module !== "travel") picked.unit = picked.unit || "Sin identificar";
   picked.date = picked.date || today();
 
   if (module === "maintenance" && (!picked.category || !picked.concept)) return null;
   if (module === "compliance" && (!picked.docType || !picked.concept)) return null;
+  if (module === "travel" && !picked.concept) return null;
   return picked;
 }
 
@@ -104,12 +109,13 @@ async function fetchTelegramFileBase64(fileId: string): Promise<{ base64: string
   return { base64, mimeType };
 }
 
-const EXTRACTION_PROMPT = `Extrae los datos de este documento/factura de una flotilla vehicular. Responde ÚNICAMENTE con JSON válido, sin texto adicional ni explicaciones, exactamente con esta forma:
+const EXTRACTION_PROMPT = `Extrae los datos de este documento/factura relacionado con una flotilla vehicular o el viaje de un conductor. Responde ÚNICAMENTE con JSON válido, sin texto adicional ni explicaciones, exactamente con esta forma:
 {
-  "module": "fuel" | "maintenance" | "compliance" | "unknown",
+  "module": "fuel" | "maintenance" | "compliance" | "travel" | "unknown",
   "record": {
     "unit": string | null,
     "plate": string | null,
+    "driverName": string | null,
     "amount": number | null,
     "date": "YYYY-MM-DD" | null,
     "vendor": string | null,
@@ -123,7 +129,7 @@ const EXTRACTION_PROMPT = `Extrae los datos de este documento/factura de una flo
     "paymentStatus": "Pagado" | "Pendiente de Pago" | null
   }
 }
-Usa "fuel" para tickets/facturas de gasolina o diésel. "maintenance" para servicios, refacciones o mantenimiento. "compliance" para tenencias, pólizas, verificaciones, licencias o tarjetas de circulación. Si no puedes identificar de qué se trata, usa "unknown". "unit"/"plate" son la unidad o placa del vehículo si el documento lo menciona.`;
+Usa "fuel" para tickets/facturas de gasolina o diésel. "maintenance" para servicios, refacciones o mantenimiento del vehículo. "compliance" para tenencias, pólizas, verificaciones, licencias o tarjetas de circulación. Usa "travel" para gastos generales del viaje de un conductor que NO son de la unidad en sí — hospedaje/hotel, alimentos, viáticos, casetas sueltas sin factura de combustible. Si no puedes identificar de qué se trata, usa "unknown". "unit"/"plate" son la unidad o placa del vehículo si el documento lo menciona (en "travel" casi nunca aplica, déjalo en null si no aparece). "driverName" es el nombre del huésped/conductor si el documento lo menciona (común en facturas de hotel).`;
 
 async function extractWithGemini({ base64, mimeType, text }: { base64: string | null; mimeType: string; text: string }) {
   const parts: unknown[] = [];
