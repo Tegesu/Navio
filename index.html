@@ -1827,6 +1827,13 @@ function DocumentCell({ documentUrl }) {
   );
 }
 
+// "Facturas y Gastos" (fuel/travel/misc) va de la factura hacia la
+// unidad, no al revés — muchas veces se sube el documento antes de
+// saber a qué vehículo cargarlo, o no aplica a ninguno en particular.
+// Mantenimiento y Trámites sí viven en el expediente de una unidad
+// específica, así que ahí el vehículo se queda obligatorio.
+const VEHICLE_REQUIRED_MODULES = ["maintenance", "compliance"];
+
 function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, vehicles, onSave, onClose }) {
   const { profile } = useAuth();
   const { showToast } = useToast();
@@ -1855,7 +1862,7 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!concept.trim() || !date || (module !== "travel" && module !== "misc" && !unit)) {
+    if (!concept.trim() || !date || (VEHICLE_REQUIRED_MODULES.includes(module) && !unit)) {
       setError("Completa al menos el vehículo, el concepto y la fecha.");
       return;
     }
@@ -1932,9 +1939,9 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
 
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className={labelClass}>Vehículo{(module === "travel" || module === "misc") && " (opcional)"}</label>
+            <label className={labelClass}>Vehículo{!VEHICLE_REQUIRED_MODULES.includes(module) && " (opcional)"}</label>
             <select value={unit} onChange={(e) => setUnit(e.target.value)} className={inputClass}>
-              {(module === "travel" || module === "misc") && <option value="">Sin vehículo asociado</option>}
+              {!VEHICLE_REQUIRED_MODULES.includes(module) && <option value="">Sin vehículo asociado</option>}
               {vehicles.map((v) => (
                 <option key={v.unit} value={v.unit}>
                   {v.unit} — {v.plate}
