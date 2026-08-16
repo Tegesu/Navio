@@ -1827,7 +1827,7 @@ function DocumentCell({ documentUrl }) {
   );
 }
 
-function RecordFormModal({ mode, module: fixedModule, initial, vehicles, onSave, onClose }) {
+function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, vehicles, onSave, onClose }) {
   const { profile } = useAuth();
   const { showToast } = useToast();
   const [module, setModule] = useState(fixedModule ?? initial?.module ?? "maintenance");
@@ -1855,7 +1855,7 @@ function RecordFormModal({ mode, module: fixedModule, initial, vehicles, onSave,
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!concept.trim() || !date || (module !== "travel" && !unit)) {
+    if (!concept.trim() || !date || (module !== "travel" && module !== "misc" && !unit)) {
       setError("Completa al menos el vehículo, el concepto y la fecha.");
       return;
     }
@@ -1901,6 +1901,9 @@ function RecordFormModal({ mode, module: fixedModule, initial, vehicles, onSave,
       if (module === "travel") {
         base.driverName = driverName.trim();
       }
+      if (module === "misc") {
+        base.category = initial?.category ?? fixedCategory;
+      }
       onSave(module, base);
     } catch (err) {
       showToast(`Error al subir el documento: ${err.message}`);
@@ -1929,9 +1932,9 @@ function RecordFormModal({ mode, module: fixedModule, initial, vehicles, onSave,
 
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className={labelClass}>Vehículo{module === "travel" && " (opcional)"}</label>
+            <label className={labelClass}>Vehículo{(module === "travel" || module === "misc") && " (opcional)"}</label>
             <select value={unit} onChange={(e) => setUnit(e.target.value)} className={inputClass}>
-              {module === "travel" && <option value="">Sin vehículo asociado</option>}
+              {(module === "travel" || module === "misc") && <option value="">Sin vehículo asociado</option>}
               {vehicles.map((v) => (
                 <option key={v.unit} value={v.unit}>
                   {v.unit} — {v.plate}
@@ -3477,6 +3480,7 @@ const INVOICE_CATEGORIES = [
 function FuelPage({
   records,
   travelRecords,
+  miscRecords,
   onAddClick,
   onConfirm,
   onEditClick,
@@ -3485,6 +3489,10 @@ function FuelPage({
   onConfirmTravel,
   onEditTravelClick,
   onDeleteTravelClick,
+  onAddMiscClick,
+  onConfirmMisc,
+  onEditMiscClick,
+  onDeleteMiscClick,
 }) {
   const { format } = useDateFormat();
   const { profile } = useAuth();
@@ -3540,6 +3548,28 @@ function FuelPage({
     { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
   ];
 
+  const miscColumns = [
+    {
+      key: "unit",
+      label: "Unidad / Matrícula",
+      render: (r) => (
+        <div>
+          <p className="font-semibold text-slate-700">{r.unit || "Sin unidad asociada"}</p>
+          <p className="text-[11px] text-slate-400">{r.plate}</p>
+        </div>
+      ),
+    },
+    { key: "concept", label: "Concepto", render: (r) => <span className="text-slate-600">{r.concept}</span> },
+    { key: "amount", label: "Monto", render: (r) => formatCurrency(r.amount, currency) },
+    { key: "vendor", label: "Proveedor", render: (r) => r.vendor || "—" },
+    { key: "date", label: "Fecha", render: (r) => formatDate(r.date, format) },
+    { key: "document", label: "Documento", render: (r) => <DocumentCell documentUrl={r.documentUrl} /> },
+    { key: "origin", label: "Origen", render: (r) => <OriginBadge origin={r.origin} /> },
+    { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
+  ];
+
+  const miscRecordsForCategory = miscRecords.filter((r) => r.category === invoiceCategory);
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -3550,7 +3580,13 @@ function FuelPage({
           </p>
         </div>
         <button
-          onClick={invoiceCategory === "travel" ? onAddTravelClick : onAddClick}
+          onClick={
+            invoiceCategory === "travel"
+              ? onAddTravelClick
+              : invoiceCategory === "fuel"
+                ? onAddClick
+                : () => onAddMiscClick(invoiceCategory)
+          }
           className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
         >
           <Plus size={15} /> Cargar Factura
@@ -3616,12 +3652,14 @@ function FuelPage({
           emptyLabel="Sin viáticos registrados todavía."
         />
       ) : (
-        <div className="rounded-2xl border border-dashed border-slate-200 bg-white py-12 text-center">
-          <p className="text-sm font-semibold text-slate-500">
-            Sin registros de {INVOICE_CATEGORIES.find((c) => c.id === invoiceCategory)?.label.toLowerCase()} todavía.
-          </p>
-          <p className="mt-1 text-xs text-slate-400">Usa "Cargar Factura" para comenzar a registrar este tipo de gasto.</p>
-        </div>
+        <RecordsTable
+          records={miscRecordsForCategory}
+          columns={miscColumns}
+          onConfirm={onConfirmMisc}
+          onEdit={onEditMiscClick}
+          onDelete={onDeleteMiscClick}
+          emptyLabel={`Sin registros de ${INVOICE_CATEGORIES.find((c) => c.id === invoiceCategory)?.label.toLowerCase()} todavía.`}
+        />
       )}
 
       {widgetModalOpen && (
@@ -6815,6 +6853,13 @@ function NavioApp() {
     removeRow: removeTravelExpense,
   } = useSupabaseTable("travel_expenses", { companyId });
   const {
+    rows: miscExpenses,
+    loading: miscLoading,
+    insertRow: insertMiscExpense,
+    updateRow: updateMiscExpense,
+    removeRow: removeMiscExpense,
+  } = useSupabaseTable("misc_expenses", { companyId });
+  const {
     rows: trips,
     loading: tripsLoading,
     insertRow: insertTrip,
@@ -6840,6 +6885,7 @@ function NavioApp() {
     complianceLoading ||
     fuelLoading ||
     travelLoading ||
+    miscLoading ||
     tripsLoading ||
     incidentsLoading ||
     communityLoading;
@@ -6865,6 +6911,7 @@ function NavioApp() {
     compliance: { insertRow: insertComplianceRecord, updateRow: updateComplianceRecord, removeRow: removeComplianceRecord },
     fuel: { insertRow: insertFuelRecord, updateRow: updateFuelRecord, removeRow: removeFuelRecord },
     travel: { insertRow: insertTravelExpense, updateRow: updateTravelExpense, removeRow: removeTravelExpense },
+    misc: { insertRow: insertMiscExpense, updateRow: updateMiscExpense, removeRow: removeMiscExpense },
   };
 
   const [deleteRecordTarget, setDeleteRecordTarget] = useState(null);
@@ -7014,6 +7061,7 @@ function NavioApp() {
             <RecordFormModal
               mode={formModal.mode}
               module={formModal.module}
+              fixedCategory={formModal.category}
               initial={formModal.initial}
               vehicles={vehicles}
               onSave={handleSaveRecord}
@@ -7150,6 +7198,7 @@ function NavioApp() {
                     <FuelPage
                       records={fuelRecords}
                       travelRecords={travelExpenses}
+                      miscRecords={miscExpenses}
                       onAddClick={() => setFormModal({ mode: "add", module: "fuel", initial: null })}
                       onConfirm={(r) => handleConfirmRecord("fuel", r)}
                       onEditClick={(r) => setFormModal({ mode: "edit", module: "fuel", initial: r })}
@@ -7158,6 +7207,10 @@ function NavioApp() {
                       onConfirmTravel={(r) => handleConfirmRecord("travel", r)}
                       onEditTravelClick={(r) => setFormModal({ mode: "edit", module: "travel", initial: r })}
                       onDeleteTravelClick={(r) => setDeleteRecordTarget({ module: "travel", record: r })}
+                      onAddMiscClick={(category) => setFormModal({ mode: "add", module: "misc", category, initial: null })}
+                      onConfirmMisc={(r) => handleConfirmRecord("misc", r)}
+                      onEditMiscClick={(r) => setFormModal({ mode: "edit", module: "misc", category: r.category, initial: r })}
+                      onDeleteMiscClick={(r) => setDeleteRecordTarget({ module: "misc", record: r })}
                     />
                   )}
                   {activeTab === "settings" && <SettingsPage />}
@@ -7211,6 +7264,7 @@ function NavioApp() {
             <RecordFormModal
               mode={formModal.mode}
               module={formModal.module}
+              fixedCategory={formModal.category}
               initial={formModal.initial}
               vehicles={vehicles}
               onSave={handleSaveRecord}
