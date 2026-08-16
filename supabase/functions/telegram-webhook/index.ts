@@ -242,14 +242,19 @@ Deno.serve(async (req) => {
   }
 
   // --- ¿A qué empresa pertenece este chat? ---
-  const { data: company } = await supabase
+  const { data: company, error: companyLookupError } = await supabase
     .from("companies")
     .select("id, name")
     .eq("botChatId", chatId)
     .eq("botChannel", "telegram")
     .maybeSingle();
 
+  if (companyLookupError) {
+    console.error("Error al buscar la empresa del chat", chatId, companyLookupError.message);
+  }
+
   if (!company) {
+    console.log("Chat sin empresa vinculada", { chatId, hadError: !!companyLookupError });
     await sendMessage(chatId, "Este chat no está vinculado a ninguna empresa todavía. Envía /vincular TU-CODIGO para empezar.");
     return new Response("ok");
   }
