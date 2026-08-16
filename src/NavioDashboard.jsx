@@ -1824,7 +1824,7 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!concept.trim() || !date || (VEHICLE_REQUIRED_MODULES.includes(module) && !unit)) {
+    if ((module !== "fuel" && !concept.trim()) || !date || (VEHICLE_REQUIRED_MODULES.includes(module) && !unit)) {
       setError("Completa al menos el vehículo, el concepto y la fecha.");
       return;
     }
@@ -1847,7 +1847,6 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
         ...(initial ?? {}),
         unit,
         plate,
-        concept: concept.trim(),
         amount: Number(amount) || 0,
         date,
         vendor: vendor.trim(),
@@ -1855,6 +1854,9 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
         notes: notes.trim(),
         documentUrl,
       };
+      // "fuel_records" no tiene columna "concept" — usa "station" como su
+      // campo descriptivo. Mandarla ahí tira un error de esquema.
+      if (module !== "fuel") base.concept = concept.trim();
       if (module === "maintenance") base.category = category;
       if (module === "compliance") {
         base.docType = docType;
@@ -1949,10 +1951,12 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
           )}
         </div>
 
-        <div>
-          <label className={labelClass}>Concepto</label>
-          <input value={concept} onChange={(e) => setConcept(e.target.value)} placeholder='Ej. "Cambio de aceite y filtro"' className={inputClass} />
-        </div>
+        {module !== "fuel" && (
+          <div>
+            <label className={labelClass}>Concepto</label>
+            <input value={concept} onChange={(e) => setConcept(e.target.value)} placeholder='Ej. "Cambio de aceite y filtro"' className={inputClass} />
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <div>
