@@ -211,6 +211,20 @@ Deno.serve(async (req) => {
   const message = update?.message;
   if (!message) return new Response("ok");
 
+  // Si Gemini tarda en responder, Telegram puede pensar que no
+  // contestamos a tiempo y reenviar este mismo update. Sin esto, el
+  // reenvío se procesaba de nuevo por completo: registro duplicado y
+  // doble llamada a Gemini en paralelo para el mismo documento.
+  if (update?.update_id != null) {
+    const { error: dedupeError } = await supabase
+      .from("telegram_processed_updates")
+      .insert({ updateId: update.update_id });
+    if (dedupeError) {
+      console.log("Update de Telegram duplicado, se ignora", update.update_id);
+      return new Response("ok");
+    }
+  }
+
   const chatId = String(message.chat.id);
   const text = (message.text || message.caption || "").trim();
 
