@@ -135,7 +135,9 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function callGeminiOnce(parts: unknown[]): Promise<{ ok: true; data: any } | { ok: false; retryable: boolean }> {
+async function callGeminiOnce(
+  parts: unknown[]
+): Promise<{ ok: true; data: any } | { ok: false; retryable: boolean; quotaExceeded: boolean }> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
     {
@@ -152,29 +154,35 @@ async function callGeminiOnce(parts: unknown[]): Promise<{ ok: true; data: any }
 
   if (!res.ok) {
     console.error("Gemini API error", res.status, JSON.stringify(data));
-    // 429 (cuota) y 503 (modelo saturado) son errores pasajeros — vale la pena reintentar.
-    return { ok: false, retryable: res.status === 429 || res.status === 503 };
+    // 429 (cuota) y 503 (modelo saturado) son errores pasajeros — vale la pena reintentar,
+    // pero el 429 de cuota no se libera por insistir (a diferencia del 503).
+    return { ok: false, retryable: res.status === 429 || res.status === 503, quotaExceeded: res.status === 429 };
   }
 
   const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   if (!raw) {
     console.error("Gemini sin texto en la respuesta", JSON.stringify(data));
-    return { ok: false, retryable: false };
+    return { ok: false, retryable: false, quotaExceeded: false };
   }
 
   try {
     return { ok: true, data: JSON.parse(raw) };
   } catch (err) {
     console.error("No se pudo parsear el JSON de Gemini", raw, err);
-    return { ok: false, retryable: false };
+    return { ok: false, retryable: false, quotaExceeded: false };
   }
 }
 
-// Gemini a veces responde "503 — modelo con demanda alta" de forma pasajera
-// (lo confirmamos en producción: el mismo documento fallaba y funcionaba en
-// intentos distintos, y a veces la saturación dura varios segundos seguidos).
-// Reintenta hasta 5 veces con espera creciente antes de rendirse.
-async function extractWithGemini({ base64, mimeType, text }: { base64: string | null; mimeType: string; text: string }) {
+// Gemini puede fallar de dos formas pasajeras distintas:
+//  - 503 "modelo con demanda alta": se resuelve solo en segundos, vale la
+//    pena reintentar varias veces.
+//  - 429 "quota exceeded": el nivel gratuito se agotó (por minuto o por
+//    día) — reintentar de inmediato NO ayuda, solo alarga la espera sin
+//    cambiar el resultado. Un par de intentos cortos alcanzan por si fue
+//    un límite por segundo, pero no vale la pena insistir más que eso.
+async function extractWithGemini(
+  { base64, mimeType, text }: { base64: string | null; mimeType: string; text: string }
+): Promise<{ data: any; reason: null } | { data: null; reason: "capacity" | "unrecognized" }> {
   const parts: unknown[] = [];
   if (base64) {
     parts.push({ inline_data: { mime_type: mimeType, data: base64 } });
@@ -183,16 +191,23 @@ async function extractWithGemini({ base64, mimeType, text }: { base64: string | 
   parts.push({ text: EXTRACTION_PROMPT + contextLine });
 
   const delaysMs = [0, 2000, 4000, 8000, 8000];
+  let sawQuotaError = false;
   for (let attempt = 0; attempt < delaysMs.length; attempt++) {
     if (delaysMs[attempt] > 0) {
       console.log(`Reintentando Gemini (intento ${attempt + 1}/${delaysMs.length})`);
       await sleep(delaysMs[attempt]);
     }
     const result = await callGeminiOnce(parts);
-    if (result.ok) return result.data;
-    if (!result.retryable) return null;
+    if (result.ok) return { data: result.data, reason: null };
+    if (!result.retryable) return { data: null, reason: "unrecognized" };
+    if (result.quotaExceeded) {
+      sawQuotaError = true;
+      // Insistir contra una cuota agotada no la libera antes — dos
+      // intentos cortos bastan para descartar que fue un límite momentáneo.
+      if (attempt >= 1) break;
+    }
   }
-  return null;
+  return { data: null, reason: sawQuotaError ? "capacity" : "unrecognized" };
 }
 
 Deno.serve(async (req) => {
@@ -286,19 +301,29 @@ Deno.serve(async (req) => {
 
   console.log("Procesando mensaje", { hasFile: !!file, mimeType: file?.mimeType, textLength: text.length });
 
-  const extraction = await extractWithGemini({ base64: file?.base64 ?? null, mimeType: file?.mimeType ?? "image/jpeg", text });
-  console.log("Resultado de Gemini", JSON.stringify(extraction));
+  const { data: extraction, reason: failureReason } = await extractWithGemini({
+    base64: file?.base64 ?? null,
+    mimeType: file?.mimeType ?? "image/jpeg",
+    text,
+  });
+  console.log("Resultado de Gemini", JSON.stringify(extraction), failureReason);
   const module = extraction?.module;
 
   if (!module || module === "unknown" || !TABLE_MAP[module]) {
+    const summary = failureReason === "capacity" ? "Límite de IA alcanzado temporalmente" : "No se pudo interpretar el documento";
     await supabase.from("bot_ingestions").insert({
       companyId: company.id,
       channel: "telegram",
-      summary: "No se pudo interpretar el documento",
+      summary,
       module: null,
       status: "failed",
     });
-    await sendMessage(chatId, "No logré interpretar ese documento. Intenta con una foto más clara o descríbelo en texto.");
+    await sendMessage(
+      chatId,
+      failureReason === "capacity"
+        ? "Estoy recibiendo demasiadas solicitudes en este momento (límite del servicio gratuito de IA). Intenta de nuevo en unos minutos — no es un problema con tu documento."
+        : "No logré interpretar ese documento. Intenta con una foto más clara o descríbelo en texto."
+    );
     return new Response("ok");
   }
 
