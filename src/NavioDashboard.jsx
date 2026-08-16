@@ -6258,7 +6258,6 @@ function Header({
               </div>
             )}
           </div>
-          <DateFormatToggle />
           <button
             onClick={onLogoClick}
             title="Ir al Home"
