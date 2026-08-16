@@ -131,14 +131,11 @@ const EXTRACTION_PROMPT = `Extrae los datos de este documento/factura relacionad
 }
 Usa "fuel" para tickets/facturas de gasolina o diésel. "maintenance" para servicios, refacciones o mantenimiento del vehículo. "compliance" para tenencias, pólizas, verificaciones, licencias o tarjetas de circulación. Usa "travel" para gastos generales del viaje de un conductor que NO son de la unidad en sí — hospedaje/hotel, alimentos, viáticos, casetas sueltas sin factura de combustible. Si no puedes identificar de qué se trata, usa "unknown". "unit"/"plate" son la unidad o placa del vehículo si el documento lo menciona (en "travel" casi nunca aplica, déjalo en null si no aparece). "driverName" es el nombre del huésped/conductor si el documento lo menciona (común en facturas de hotel).`;
 
-async function extractWithGemini({ base64, mimeType, text }: { base64: string | null; mimeType: string; text: string }) {
-  const parts: unknown[] = [];
-  if (base64) {
-    parts.push({ inline_data: { mime_type: mimeType, data: base64 } });
-  }
-  const contextLine = text ? `\nTexto que acompaña al documento, úsalo como contexto adicional: "${text.replace(/"/g, "'")}"` : "";
-  parts.push({ text: EXTRACTION_PROMPT + contextLine });
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+async function callGeminiOnce(parts: unknown[]): Promise<{ ok: true; data: any } | { ok: false; retryable: boolean }> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
     {
@@ -155,21 +152,47 @@ async function extractWithGemini({ base64, mimeType, text }: { base64: string | 
 
   if (!res.ok) {
     console.error("Gemini API error", res.status, JSON.stringify(data));
-    return null;
+    // 429 (cuota) y 503 (modelo saturado) son errores pasajeros — vale la pena reintentar.
+    return { ok: false, retryable: res.status === 429 || res.status === 503 };
   }
 
   const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   if (!raw) {
     console.error("Gemini sin texto en la respuesta", JSON.stringify(data));
-    return null;
+    return { ok: false, retryable: false };
   }
 
   try {
-    return JSON.parse(raw);
+    return { ok: true, data: JSON.parse(raw) };
   } catch (err) {
     console.error("No se pudo parsear el JSON de Gemini", raw, err);
-    return null;
+    return { ok: false, retryable: false };
   }
+}
+
+// Gemini a veces responde "503 — modelo con demanda alta" de forma pasajera
+// (lo confirmamos en producción: el mismo documento fallaba y funcionaba en
+// intentos distintos, y a veces la saturación dura varios segundos seguidos).
+// Reintenta hasta 5 veces con espera creciente antes de rendirse.
+async function extractWithGemini({ base64, mimeType, text }: { base64: string | null; mimeType: string; text: string }) {
+  const parts: unknown[] = [];
+  if (base64) {
+    parts.push({ inline_data: { mime_type: mimeType, data: base64 } });
+  }
+  const contextLine = text ? `\nTexto que acompaña al documento, úsalo como contexto adicional: "${text.replace(/"/g, "'")}"` : "";
+  parts.push({ text: EXTRACTION_PROMPT + contextLine });
+
+  const delaysMs = [0, 2000, 4000, 8000, 8000];
+  for (let attempt = 0; attempt < delaysMs.length; attempt++) {
+    if (delaysMs[attempt] > 0) {
+      console.log(`Reintentando Gemini (intento ${attempt + 1}/${delaysMs.length})`);
+      await sleep(delaysMs[attempt]);
+    }
+    const result = await callGeminiOnce(parts);
+    if (result.ok) return result.data;
+    if (!result.retryable) return null;
+  }
+  return null;
 }
 
 Deno.serve(async (req) => {
@@ -282,9 +305,10 @@ Deno.serve(async (req) => {
     .single();
 
   const amountLabel = record.amount != null ? `$${record.amount}` : "sin monto";
+  const unitLabel = record.unit || "sin unidad";
   const summary = insertError
     ? `Error al guardar en ${MODULE_LABEL[module]}: ${insertError.message}`
-    : `${MODULE_LABEL[module]} — ${record.unit} — ${amountLabel}`;
+    : `${MODULE_LABEL[module]} — ${unitLabel} — ${amountLabel}`;
 
   await supabase.from("bot_ingestions").insert({
     companyId: company.id,

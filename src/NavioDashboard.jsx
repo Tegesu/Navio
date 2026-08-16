@@ -5963,7 +5963,7 @@ function CommunityPage({ posts, insertCommunityPost, updateCommunityPost, refres
   );
 }
 
-const BOT_MODULE_ICON = { fuel: "⛽", maintenance: "🔧", compliance: "📋" };
+const BOT_MODULE_ICON = { fuel: "⛽", maintenance: "🔧", compliance: "📋", travel: "🧳" };
 
 function BotFeedPanel() {
   const { profile } = useAuth();
