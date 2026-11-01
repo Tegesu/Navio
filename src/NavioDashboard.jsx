@@ -1153,6 +1153,7 @@ const ORIGIN_STYLES = {
 const STATUS_BADGE_STYLES = {
   pending: { label: "Pendiente de Validación", className: "bg-amber-50 text-amber-700 ring-amber-200", icon: AlertTriangle },
   verified: { label: "Verificado", className: "bg-emerald-50 text-emerald-700 ring-emerald-200", icon: CheckCircle2 },
+  rejected: { label: "Rechazado", className: "bg-rose-50 text-rose-700 ring-rose-200", icon: X },
 };
 
 const TONE_CLASSES = {
@@ -1796,11 +1797,183 @@ function DocumentCell({ documentUrl }) {
 // específica, así que ahí el vehículo se queda obligatorio.
 const VEHICLE_REQUIRED_MODULES = ["maintenance", "compliance"];
 
-function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, vehicles, onSave, onClose }) {
+/* ---------------------------------------------------------------------- */
+/*  Facturas y Gastos — conceptos, órdenes de trabajo y plazos            */
+/* ---------------------------------------------------------------------- */
+
+// Las tres tablas que alimentan "Facturas y Gastos".
+const INVOICE_MODULES = ["fuel", "travel", "misc"];
+
+// "Concepto" de una factura. Cada uno vive en una de las tres tablas:
+// gasolina → fuel_records; viáticos/hotel/alimentos/transporte/otro →
+// travel_expenses; los demás → misc_expenses (con su "category").
+const EXPENSE_TYPES = [
+  { id: "viaticos", label: "Viáticos", defaultDays: 5, module: "travel" },
+  { id: "hotel", label: "Hotel", defaultDays: 5, module: "travel" },
+  { id: "alimentos", label: "Alimentos", defaultDays: 3, module: "travel" },
+  { id: "transporte", label: "Transporte", defaultDays: 3, module: "travel" },
+  { id: "gasolina", label: "Gasolina", defaultDays: 3, module: "fuel" },
+  { id: "casetas", label: "Casetas", defaultDays: 3, module: "misc", category: "tolls" },
+  { id: "consumibles", label: "Consumibles", defaultDays: 7, module: "misc", category: "consumables" },
+  { id: "refrigerante", label: "Refrigerante", defaultDays: 7, module: "misc", category: "coolant" },
+  { id: "refacciones", label: "Refacciones", defaultDays: 7, module: "misc", category: "parts" },
+  { id: "otro", label: "Otro", defaultDays: 7, module: "travel" },
+];
+const EXPENSE_TYPE_MAP = Object.fromEntries(EXPENSE_TYPES.map((t) => [t.id, t]));
+
+function expenseTypeLabel(id) {
+  return EXPENSE_TYPE_MAP[id]?.label ?? id ?? "—";
+}
+
+function targetForExpenseType(id) {
+  const t = EXPENSE_TYPE_MAP[id] ?? EXPENSE_TYPE_MAP.otro;
+  return { module: t.module, category: t.category ?? null };
+}
+
+// Concepto por defecto de un registro que todavía no lo trae (los
+// anteriores a esta versión), según la tabla donde vive.
+function defaultExpenseType(module, category) {
+  if (module === "fuel") return "gasolina";
+  if (module === "misc") return EXPENSE_TYPES.find((t) => t.category === category)?.id ?? "consumibles";
+  return "viaticos";
+}
+
+function expenseTypeOf(module, record) {
+  return record.expenseType || defaultExpenseType(module, record.category);
+}
+
+// Al editar una factura se queda en su tabla, así que solo se ofrecen
+// los conceptos que le corresponden a esa tabla.
+function expenseTypesForEdit(module, category) {
+  return EXPENSE_TYPES.filter((t) => t.module === module && (module !== "misc" || t.category === category));
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ORDER_WARN_DAYS = 2;
+
+function startOfLocalDay(d = new Date()) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function localISODate(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function parseISODate(iso) {
+  const [y, m, d] = String(iso).slice(0, 10).split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function daysFromToday(iso) {
+  return Math.round((parseISODate(iso) - startOfLocalDay()) / DAY_MS);
+}
+
+function addDaysISO(iso, n) {
+  const d = parseISODate(iso);
+  d.setDate(d.getDate() + n);
+  return localISODate(d);
+}
+
+// Plazos por concepto: lo que guardó la empresa, o el valor por defecto.
+function getDeadlineDays(deadlineRows = []) {
+  const days = Object.fromEntries(EXPENSE_TYPES.map((t) => [t.id, t.defaultDays]));
+  for (const row of deadlineRows) days[row.expenseType] = row.days;
+  return days;
+}
+
+// Une las tres tablas de facturas en una sola lista con el mismo formato.
+function normalizeInvoices({ fuel = [], travel = [], misc = [] }) {
+  const make = (module) => (r) => ({
+    key: `${module}-${r.id}`,
+    module,
+    id: r.id,
+    raw: r,
+    expenseType: expenseTypeOf(module, r),
+    project: (r.project || "").trim(),
+    workOrder: (r.workOrder || "").trim(),
+    date: r.date,
+    amount: Number(r.amount) || 0,
+    liters: module === "fuel" ? Number(r.liters) || 0 : 0,
+    description: module === "fuel" ? r.station || r.vendor || "" : r.concept || "",
+    origin: r.origin || "manual",
+    status: r.status || "pending",
+    approved: !!r.approved,
+    approvedByName: r.approvedByName || "",
+    uploadedByName: r.uploadedByName || "",
+    documentUrl: r.documentUrl || null,
+    createdAt: r.createdAt || null,
+  });
+  return [...fuel.map(make("fuel")), ...travel.map(make("travel")), ...misc.map(make("misc"))];
+}
+
+// Una factura "cerrada" tiene su documento, un monto y ya fue verificada.
+function isInvoiceDone(inv) {
+  return !!inv.documentUrl && inv.amount > 0 && inv.status === "verified";
+}
+
+// Las órdenes de trabajo se arman agrupando facturas por (proyecto, orden);
+// "work_orders" solo aporta datos propios de la orden (su fecha límite).
+// Las facturas rechazadas no cuentan: se consideran descartadas.
+function buildOrders(invoices, workOrderRows = [], deadlineDays = getDeadlineDays()) {
+  const map = new Map();
+  const ensure = (project, code) => {
+    const key = `${project}\u0001${code}`;
+    if (!map.has(key)) map.set(key, { key, project, code, dueDate: null, createdAt: null, invoices: [] });
+    return map.get(key);
+  };
+  for (const wo of workOrderRows) {
+    const o = ensure((wo.project || "").trim(), wo.code);
+    o.dueDate = wo.dueDate || null;
+    o.createdAt = wo.createdAt || null;
+  }
+  for (const inv of invoices) {
+    if (inv.workOrder && inv.status !== "rejected") ensure(inv.project, inv.workOrder).invoices.push(inv);
+  }
+
+  return [...map.values()].map((o) => {
+    const created = [o.createdAt, ...o.invoices.map((i) => i.createdAt)].filter(Boolean).sort();
+    const missingDocs = o.invoices.length === 0 || o.invoices.some((i) => !i.documentUrl || i.amount <= 0);
+    const pendingVerification = o.invoices.some((i) => i.status === "pending");
+    const complete = o.invoices.length > 0 && o.invoices.every(isInvoiceDone);
+
+    // Fecha límite: la propia de la orden y, por cada factura sin cerrar,
+    // su fecha + el plazo del concepto. Manda la que llegue primero.
+    let deadline = null;
+    let daysLeft = null;
+    if (!complete) {
+      const candidates = [];
+      if (o.dueDate) candidates.push(o.dueDate);
+      for (const inv of o.invoices) {
+        if (!isInvoiceDone(inv) && inv.date) candidates.push(addDaysISO(inv.date, deadlineDays[inv.expenseType] ?? 7));
+      }
+      deadline = candidates.sort()[0] ?? null;
+      daysLeft = deadline ? daysFromToday(deadline) : null;
+    }
+    return { ...o, createdAt: created[0] ?? null, missingDocs, pendingVerification, complete, deadline, daysLeft };
+  });
+}
+
+function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpenseType, initial, vehicles, orders = [], projectOptions = [], onSave, onClose }) {
   const { profile } = useAuth();
   const { showToast } = useToast();
-  const [module, setModule] = useState(fixedModule ?? initial?.module ?? "maintenance");
-  const [unit, setUnit] = useState(initial?.unit ?? vehicles[0]?.unit ?? "");
+  const [moduleState, setModule] = useState(fixedModule ?? initial?.module ?? "maintenance");
+  const [expenseType, setExpenseType] = useState(
+    initial?.expenseType ?? presetExpenseType ?? defaultExpenseType(fixedModule ?? initial?.module ?? "maintenance", initial?.category ?? fixedCategory)
+  );
+  const isInvoiceFlow = INVOICE_MODULES.includes(moduleState);
+  const typeTarget = targetForExpenseType(expenseType);
+  // Al crear una factura, el concepto elegido decide en qué tabla cae;
+  // al editar, se queda en la tabla donde ya vive.
+  const module = isInvoiceFlow && !initial ? typeTarget.module : moduleState;
+  const typeOptions = initial ? expenseTypesForEdit(module, initial.category) : EXPENSE_TYPES;
+  const [project, setProject] = useState(initial?.project ?? "");
+  const [workOrder, setWorkOrder] = useState(initial?.workOrder ?? "");
+  const [orderDueDate, setOrderDueDate] = useState(
+    orders.find((o) => o.code === (initial?.workOrder ?? "") && o.project === (initial?.project ?? ""))?.dueDate ?? ""
+  );
+  // En facturas el vehículo es opcional: no se preselecciona ninguno.
+  const [unit, setUnit] = useState(initial?.unit ?? (isInvoiceFlow ? "" : vehicles[0]?.unit ?? ""));
   const [category, setCategory] = useState(initial?.category ?? "engine");
   const [docType, setDocType] = useState(initial?.docType ?? "Tenencia");
   const [paymentStatus, setPaymentStatus] = useState(initial?.paymentStatus ?? "Pendiente de Pago");
@@ -1822,10 +1995,22 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
 
   const plate = vehicles.find((v) => v.unit === unit)?.plate ?? "";
 
+  // Al escribir una orden que ya existe, se completan su proyecto y fecha límite.
+  function handleWorkOrderChange(value) {
+    setWorkOrder(value);
+    const match = orders.find((o) => o.code === value.trim() && (!project.trim() || o.project === project.trim()));
+    if (match) {
+      if (!project.trim()) setProject(match.project);
+      if (match.dueDate && !orderDueDate) setOrderDueDate(match.dueDate);
+    }
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
     if ((module !== "fuel" && !concept.trim()) || !date || (VEHICLE_REQUIRED_MODULES.includes(module) && !unit)) {
-      setError("Completa al menos el vehículo, el concepto y la fecha.");
+      setError(
+        isInvoiceFlow ? "Completa al menos la descripción y la fecha." : "Completa al menos el vehículo, el concepto y la fecha."
+      );
       return;
     }
     if (module === "fuel" && (!liters || Number(liters) <= 0)) {
@@ -1873,9 +2058,14 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
         base.driverName = driverName.trim();
       }
       if (module === "misc") {
-        base.category = initial?.category ?? fixedCategory;
+        base.category = initial?.category ?? typeTarget.category ?? fixedCategory;
       }
-      onSave(module, base);
+      if (INVOICE_MODULES.includes(module)) {
+        base.expenseType = expenseType;
+        base.project = project.trim();
+        base.workOrder = workOrder.trim();
+      }
+      onSave(module, base, { orderDueDate: orderDueDate || null });
     } catch (err) {
       showToast(`Error al subir el documento: ${err.message}`);
     } finally {
@@ -1887,12 +2077,31 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
   const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
 
   return (
-    <Modal title={mode === "edit" ? "Editar / Corregir Registro" : "Agregar Registro Manual"} width="max-w-lg" onClose={onClose}>
+    <Modal
+      title={
+        isInvoiceFlow
+          ? mode === "edit"
+            ? "Editar factura"
+            : "Cargar factura"
+          : mode === "edit"
+          ? "Editar / Corregir Registro"
+          : "Agregar Registro Manual"
+      }
+      width="max-w-lg"
+      onClose={onClose}
+    >
       <form onSubmit={handleSubmit} className="max-h-[70vh] space-y-3 overflow-y-auto pr-1">
         {!fixedModule && (
           <div>
             <label className={labelClass}>Módulo Destino</label>
-            <select value={module} onChange={(e) => setModule(e.target.value)} className={inputClass}>
+            <select
+              value={moduleState}
+              onChange={(e) => {
+                setModule(e.target.value);
+                setExpenseType(defaultExpenseType(e.target.value));
+              }}
+              className={inputClass}
+            >
               <option value="maintenance">Mantenimiento</option>
               <option value="compliance">Cumplimiento</option>
               <option value="fuel">Consumo de Combustible</option>
@@ -1951,10 +2160,78 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, initial, ve
           )}
         </div>
 
+        {isInvoiceFlow && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className={labelClass}>Concepto</label>
+                <select value={expenseType} onChange={(e) => setExpenseType(e.target.value)} className={inputClass}>
+                  {typeOptions.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className={labelClass}>Proyecto</label>
+                <input
+                  list="navio-project-options"
+                  value={project}
+                  onChange={(e) => setProject(e.target.value)}
+                  placeholder="Ej. Tren Maya"
+                  className={inputClass}
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className={labelClass}>Orden de trabajo</label>
+                <input
+                  list="navio-order-options"
+                  value={workOrder}
+                  onChange={(e) => handleWorkOrderChange(e.target.value)}
+                  placeholder="Ej. OT24053"
+                  className={inputClass}
+                />
+              </div>
+              <div>
+                <label className={labelClass}>Fecha límite de la orden (opcional)</label>
+                <input
+                  type="date"
+                  value={orderDueDate}
+                  onChange={(e) => setOrderDueDate(e.target.value)}
+                  disabled={!workOrder.trim()}
+                  className={`${inputClass} disabled:bg-slate-50 disabled:text-slate-300`}
+                />
+              </div>
+            </div>
+            <datalist id="navio-project-options">
+              {projectOptions.map((p) => (
+                <option key={p} value={p} />
+              ))}
+            </datalist>
+            <datalist id="navio-order-options">
+              {orders
+                .filter((o) => !project.trim() || o.project === project.trim())
+                .map((o) => (
+                  <option key={o.key} value={o.code}>
+                    {o.project}
+                  </option>
+                ))}
+            </datalist>
+          </>
+        )}
+
         {module !== "fuel" && (
           <div>
-            <label className={labelClass}>Concepto</label>
-            <input value={concept} onChange={(e) => setConcept(e.target.value)} placeholder='Ej. "Cambio de aceite y filtro"' className={inputClass} />
+            <label className={labelClass}>{isInvoiceFlow ? "Descripción" : "Concepto"}</label>
+            <input
+              value={concept}
+              onChange={(e) => setConcept(e.target.value)}
+              placeholder={isInvoiceFlow ? 'Ej. "Renta de habitación"' : 'Ej. "Cambio de aceite y filtro"'}
+              className={inputClass}
+            />
           </div>
         )}
 
@@ -3442,6 +3719,7 @@ function CompliancePage({ records, onAddClick, onConfirm, onEditClick, onDeleteC
 /* ---------------------------------------------------------------------- */
 
 const INVOICE_CATEGORIES = [
+  { id: "overview", label: "Resumen" },
   { id: "fuel", label: "Consumo de Combustible" },
   { id: "travel", label: "Viáticos" },
   { id: "consumables", label: "Consumibles" },
@@ -3450,22 +3728,680 @@ const INVOICE_CATEGORIES = [
   { id: "tolls", label: "Casetas" },
 ];
 
+// Concepto que se preselecciona al darle "Cargar Factura" desde cada pestaña.
+const INVOICE_CATEGORY_TYPE = {
+  overview: "viaticos",
+  fuel: "gasolina",
+  travel: "viaticos",
+  consumables: "consumibles",
+  coolant: "refrigerante",
+  parts: "refacciones",
+  tolls: "casetas",
+};
+
+const DESGLOSE_PRESETS = [
+  { label: "Hoy", days: 1 },
+  { label: "Esta semana", days: 7 },
+  { label: "30 días", days: 30 },
+];
+
+function SparkBars({ values, barClass = "bg-blue-500" }) {
+  const max = Math.max(...values, 1);
+  return (
+    <div className="mt-3 flex h-12 items-end gap-[2px]">
+      {values.map((v, i) => (
+        <div
+          key={i}
+          className={`flex-1 rounded-t-sm ${v > 0 ? barClass : "bg-slate-100"}`}
+          style={{ height: v > 0 ? `${Math.max(10, Math.round((v / max) * 100))}%` : "4%" }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function OverviewCard({ icon: Icon, tone, label, right = null, className = "", children }) {
+  return (
+    <div className={`rounded-2xl border border-slate-200 bg-white p-4 shadow-sm ${className}`}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${TONE_CLASSES[tone]}`}>
+            <Icon size={15} />
+          </span>
+          <p className="text-xs font-semibold text-slate-500">{label}</p>
+        </div>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function InvoiceDesgloseTable({ rows, currency, isAdmin, onEdit, onConfirm, onApprove, onReject, emptyLabel }) {
+  const { format } = useDateFormat();
+  const headers = ["Proyecto", "Orden de trabajo", "Fecha", "Monto", "Concepto", "Origen", "Usuario", "Estado", "Aprobado", "Aprobado por", "Documento"];
+  return (
+    <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <table className="w-full min-w-[1180px] text-left text-xs">
+        <thead>
+          <tr className="border-b border-slate-100 text-[11px] uppercase tracking-wide text-slate-400">
+            {headers.map((h) => (
+              <th key={h} className="whitespace-nowrap px-3 py-3 font-semibold">
+                {h}
+              </th>
+            ))}
+            <th className="px-3 py-3 text-right font-semibold">Acciones</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((inv) => (
+            <tr key={inv.key} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/60">
+              <td className="whitespace-nowrap px-3 py-3 font-semibold text-slate-700">
+                {inv.project || <span className="font-normal text-slate-300">Sin proyecto</span>}
+              </td>
+              <td className="whitespace-nowrap px-3 py-3 text-slate-600">{inv.workOrder || <span className="text-slate-300">—</span>}</td>
+              <td className="whitespace-nowrap px-3 py-3 text-slate-600">{formatDate(inv.date, format)}</td>
+              <td className="whitespace-nowrap px-3 py-3 font-semibold text-slate-700">{formatCurrency(inv.amount, currency)}</td>
+              <td className="px-3 py-3 text-slate-600">{expenseTypeLabel(inv.expenseType)}</td>
+              <td className="px-3 py-3">
+                <OriginBadge origin={inv.origin} />
+              </td>
+              <td className="px-3 py-3 text-slate-600">{inv.uploadedByName || "—"}</td>
+              <td className="px-3 py-3">
+                <StatusBadge status={inv.status} />
+              </td>
+              <td className="px-3 py-3">
+                {inv.approved ? (
+                  <CheckCircle2 size={16} className="text-emerald-500" aria-label="Aprobada" />
+                ) : (
+                  <X size={16} className="text-rose-400" aria-label="Sin aprobar" />
+                )}
+              </td>
+              <td className="px-3 py-3 text-slate-600">{inv.approvedByName || "—"}</td>
+              <td className="px-3 py-3">
+                <DocumentCell documentUrl={inv.documentUrl} />
+              </td>
+              <td className="px-3 py-3">
+                <div className="flex justify-end gap-1.5">
+                  {inv.status === "pending" && (
+                    <button
+                      onClick={() => onConfirm(inv)}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
+                    >
+                      <CheckCircle2 size={12} /> Confirmar
+                    </button>
+                  )}
+                  {isAdmin && inv.status !== "rejected" && !inv.approved && (
+                    <button
+                      onClick={() => onApprove(inv)}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-[11px] font-semibold text-blue-700 hover:bg-blue-100"
+                    >
+                      <ShieldCheck size={12} /> Aprobar
+                    </button>
+                  )}
+                  {isAdmin && inv.status !== "rejected" && (
+                    <button
+                      onClick={() => onReject(inv)}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-rose-200 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
+                    >
+                      <X size={12} /> Rechazar
+                    </button>
+                  )}
+                  <button
+                    onClick={() => onEdit(inv)}
+                    className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                  >
+                    <Edit2 size={12} /> Editar
+                  </button>
+                </div>
+              </td>
+            </tr>
+          ))}
+          {rows.length === 0 && (
+            <tr>
+              <td colSpan={headers.length + 1} className="px-4 py-8 text-center text-xs text-slate-400">
+                {emptyLabel}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function DesgloseSettingsModal({ settings, onChange, onClose }) {
+  const [daysDraft, setDaysDraft] = useState(String(settings.days));
+
+  function setDays(n) {
+    const v = Math.min(365, Math.max(1, Math.round(Number(n)) || 1));
+    setDaysDraft(String(v));
+    onChange({ ...settings, days: v });
+  }
+  function toggleConcept(id) {
+    const has = settings.concepts.includes(id);
+    onChange({ ...settings, concepts: has ? settings.concepts.filter((c) => c !== id) : [...settings.concepts, id] });
+  }
+
+  return (
+    <Modal title="Configurar desglose" onClose={onClose}>
+      <p className="mb-2 text-[11px] font-semibold text-slate-500">Mostrar lo subido en los últimos…</p>
+      <div className="flex flex-wrap items-center gap-2">
+        {DESGLOSE_PRESETS.map((p) => (
+          <button
+            key={p.days}
+            onClick={() => setDays(p.days)}
+            className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
+              settings.days === p.days ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+            }`}
+          >
+            {p.label}
+          </button>
+        ))}
+        <span className="flex items-center gap-1.5 text-xs text-slate-500">
+          o
+          <input
+            type="number"
+            min="1"
+            max="365"
+            value={daysDraft}
+            onChange={(e) => setDaysDraft(e.target.value)}
+            onBlur={() => setDays(daysDraft)}
+            className="w-16 rounded-lg border border-slate-200 px-2 py-1.5 text-xs focus:border-blue-400 focus:outline-none"
+          />
+          días
+        </span>
+      </div>
+
+      <div className="mb-2 mt-4 flex items-center justify-between">
+        <p className="text-[11px] font-semibold text-slate-500">Conceptos que quiero ver</p>
+        <div className="flex gap-3 text-[11px] font-semibold text-blue-600">
+          <button onClick={() => onChange({ ...settings, concepts: EXPENSE_TYPES.map((t) => t.id) })}>Todos</button>
+          <button onClick={() => onChange({ ...settings, concepts: [] })}>Ninguno</button>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        {EXPENSE_TYPES.map((t) => (
+          <label key={t.id} className="flex cursor-pointer items-center justify-between rounded-xl border border-slate-100 px-3 py-2 hover:bg-slate-50">
+            <span className="text-xs font-medium text-slate-600">{t.label}</span>
+            <input type="checkbox" checked={settings.concepts.includes(t.id)} onChange={() => toggleConcept(t.id)} className="h-4 w-4 accent-blue-600" />
+          </label>
+        ))}
+      </div>
+      <button onClick={onClose} className="mt-4 w-full rounded-lg bg-blue-600 py-2 text-xs font-semibold text-white hover:bg-blue-700">
+        Listo
+      </button>
+    </Modal>
+  );
+}
+
+function DeadlinesModal({ days, isAdmin, onSave, onClose }) {
+  const [draft, setDraft] = useState(() => Object.fromEntries(Object.entries(days).map(([k, v]) => [k, String(v)])));
+  const [saving, setSaving] = useState(false);
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const changes = {};
+      for (const t of EXPENSE_TYPES) {
+        const v = Math.min(365, Math.max(0, Math.round(Number(draft[t.id])) || 0));
+        if (v !== days[t.id]) changes[t.id] = v;
+      }
+      const ok = await onSave(changes);
+      if (ok !== false) onClose();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal title="Plazos por concepto" onClose={onClose}>
+      <p className="mb-3 text-xs text-slate-400">
+        Días que tiene cada tipo de factura, contados desde su fecha, para quedar con documento y verificada. Cuando faltan {ORDER_WARN_DAYS} días o
+        menos, su orden aparece como "próxima a expirar".
+      </p>
+      <div className="grid grid-cols-2 gap-2">
+        {EXPENSE_TYPES.map((t) => (
+          <label key={t.id} className="flex items-center justify-between gap-2 rounded-xl border border-slate-100 px-3 py-2">
+            <span className="text-xs font-medium text-slate-600">{t.label}</span>
+            <span className="flex items-center gap-1 text-[11px] text-slate-400">
+              <input
+                type="number"
+                min="0"
+                max="365"
+                value={draft[t.id]}
+                disabled={!isAdmin}
+                onChange={(e) => setDraft((prev) => ({ ...prev, [t.id]: e.target.value }))}
+                className="w-14 rounded-lg border border-slate-200 px-2 py-1 text-xs focus:border-blue-400 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400"
+              />
+              días
+            </span>
+          </label>
+        ))}
+      </div>
+      {!isAdmin && <p className="mt-3 text-[11px] text-slate-400">Solo un administrador de la empresa puede cambiar los plazos.</p>}
+      <div className="mt-4 flex justify-end gap-2">
+        <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+          {isAdmin ? "Cancelar" : "Cerrar"}
+        </button>
+        {isAdmin && (
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
+          >
+            {saving ? "Guardando..." : "Guardar plazos"}
+          </button>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function InvoiceOverview({
+  invoices,
+  orders,
+  deadlineDays,
+  currency,
+  userName,
+  isAdmin,
+  reminders,
+  onEditInvoice,
+  onConfirmInvoice,
+  onApproveInvoice,
+  onRejectInvoice,
+  onSaveDeadlines,
+}) {
+  const [settings, setSettings] = usePersistentState("navio.invoices.desglose.v1", {
+    days: 7,
+    concepts: EXPENSE_TYPES.map((t) => t.id),
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [deadlinesOpen, setDeadlinesOpen] = useState(false);
+  const [ordersPeriod, setOrdersPeriod] = useState("week");
+  const [explore, setExplore] = useState(null);
+  const [reminderDraft, setReminderDraft] = useState("");
+
+  const tableActions = {
+    currency,
+    isAdmin,
+    onEdit: onEditInvoice,
+    onConfirm: onConfirmInvoice,
+    onApprove: onApproveInvoice,
+    onReject: onRejectInvoice,
+  };
+
+  const now = new Date();
+  const monthKey = localISODate(now).slice(0, 7);
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const monthInvoices = invoices.filter((i) => i.status !== "rejected" && String(i.date || "").slice(0, 7) === monthKey);
+  const monthTotal = monthInvoices.reduce((s, i) => s + i.amount, 0);
+  const monthLiters = monthInvoices.reduce((s, i) => s + i.liters, 0);
+  const dailySpend = Array.from({ length: daysInMonth }, () => 0);
+  const dailyLiters = Array.from({ length: daysInMonth }, () => 0);
+  for (const i of monthInvoices) {
+    const day = Number(String(i.date).slice(8, 10)) - 1;
+    if (day >= 0 && day < daysInMonth) {
+      dailySpend[day] += i.amount;
+      dailyLiters[day] += i.liters;
+    }
+  }
+
+  const ordersMissingDocs = orders.filter((o) => o.missingDocs);
+  const unverifiedCount = invoices.filter((i) => i.status === "pending").length;
+  const completedOrders = orders.filter((o) => o.complete);
+  const expiringOrders = orders
+    .filter((o) => !o.complete && o.daysLeft !== null && o.daysLeft >= 0 && o.daysLeft <= ORDER_WARN_DAYS)
+    .sort((a, b) => a.daysLeft - b.daysLeft);
+  const overdueOrders = orders.filter((o) => !o.complete && o.daysLeft !== null && o.daysLeft < 0);
+  const pendingApprovalCount = invoices.filter((i) => i.status !== "rejected" && !i.approved).length;
+
+  const periodStart =
+    ordersPeriod === "day"
+      ? startOfLocalDay(now).getTime()
+      : ordersPeriod === "week"
+      ? startOfLocalDay(now).getTime() - 6 * DAY_MS
+      : new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const newOrdersCount = orders.filter((o) => o.createdAt && new Date(o.createdAt).getTime() >= periodStart).length;
+  const periodLabel = { day: "hoy", week: "últimos 7 días", month: "este mes" }[ordersPeriod];
+
+  const latest = invoices
+    .filter((i) => i.createdAt)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .slice(0, 4);
+
+  const since = startOfLocalDay(now).getTime() - (settings.days - 1) * DAY_MS;
+  const desgloseRows = invoices
+    .filter((i) => i.createdAt && new Date(i.createdAt).getTime() >= since && settings.concepts.includes(i.expenseType))
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const desgloseWindow = settings.days === 1 ? "hoy" : `los últimos ${settings.days} días`;
+
+  function groupInvoices(keyFn) {
+    const map = new Map();
+    for (const i of invoices) {
+      const k = keyFn(i);
+      const g = map.get(k) ?? { value: k, count: 0, total: 0 };
+      g.count += 1;
+      g.total += i.amount;
+      map.set(k, g);
+    }
+    return [...map.values()].sort((a, b) => b.count - a.count);
+  }
+  const byConcept = EXPENSE_TYPES.map((t) => {
+    const rs = invoices.filter((i) => i.expenseType === t.id);
+    return { value: t.id, label: t.label, count: rs.length, total: rs.reduce((s, i) => s + i.amount, 0) };
+  });
+  const byProject = groupInvoices((i) => i.project);
+  const byUser = groupInvoices((i) => i.uploadedByName);
+
+  function addReminder(e) {
+    e.preventDefault();
+    const text = reminderDraft.trim();
+    if (!text) return;
+    setReminderDraft("");
+    reminders.insertRow({ text }).catch(() => setReminderDraft(text));
+  }
+  const reminderRows = [...reminders.rows].sort((a, b) => Number(a.done) - Number(b.done) || b.id - a.id);
+  const firstName = (userName || "").split(" ")[0] || "equipo";
+
+  if (explore) {
+    const rows = invoices
+      .filter((i) =>
+        explore.kind === "concept"
+          ? i.expenseType === explore.value
+          : explore.kind === "project"
+          ? i.project === explore.value
+          : i.uploadedByName === explore.value
+      )
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const total = rows.reduce((s, i) => s + i.amount, 0);
+    const title =
+      explore.kind === "concept"
+        ? `Concepto: ${expenseTypeLabel(explore.value)}`
+        : explore.kind === "project"
+        ? `Proyecto: ${explore.value || "Sin proyecto"}`
+        : `Usuario: ${explore.value || "Sin identificar"}`;
+    return (
+      <div className="space-y-4">
+        <button onClick={() => setExplore(null)} className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700">
+          <ArrowLeft size={13} /> Volver al resumen
+        </button>
+        <div>
+          <h2 className="text-base font-bold text-slate-900">{title}</h2>
+          <p className="text-xs text-slate-500">
+            {rows.length} registro{rows.length === 1 ? "" : "s"} · {formatCurrency(total, currency)}
+          </p>
+        </div>
+        <InvoiceDesgloseTable rows={rows} emptyLabel="No hay registros con este filtro." {...tableActions} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="order-first flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm xl:order-none xl:col-start-3 xl:row-span-3 xl:row-start-1">
+          <div>
+            <h2 className="text-sm font-bold text-slate-800">Hola, {firstName}</h2>
+            <p className="text-[11px] text-slate-400">Cambios y facturas nuevas</p>
+            <div className="mt-2.5 space-y-2">
+              {latest.length === 0 && <p className="text-xs text-slate-400">Todavía no hay facturas cargadas.</p>}
+              {latest.map((i) => (
+                <div key={i.key} className="rounded-xl bg-slate-50 px-2.5 py-2">
+                  <p className="text-xs font-semibold text-slate-700">
+                    {expenseTypeLabel(i.expenseType)} · {formatCurrency(i.amount, currency)}
+                  </p>
+                  <p className="text-[11px] text-slate-400">
+                    {i.uploadedByName || "Sin identificar"} · {timeAgoLabel(i.createdAt)}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex min-h-0 flex-1 flex-col border-t border-slate-100 pt-3">
+            <h3 className="text-sm font-bold text-slate-800">Recordatorios</h3>
+            <form onSubmit={addReminder} className="mt-2 flex gap-1.5">
+              <input
+                value={reminderDraft}
+                onChange={(e) => setReminderDraft(e.target.value)}
+                placeholder="Escribe una tarea y presiona Enter"
+                className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none"
+              />
+              <button type="submit" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-white hover:bg-blue-700" aria-label="Agregar">
+                <Plus size={14} />
+              </button>
+            </form>
+            <div className="mt-2 max-h-56 space-y-1 overflow-y-auto">
+              {reminderRows.length === 0 && <p className="py-2 text-[11px] text-slate-400">Sin recordatorios. Anota aquí lo que no quieres olvidar.</p>}
+              {reminderRows.map((r) => (
+                <div key={r.id} className="flex items-start gap-2 rounded-lg px-1 py-1 hover:bg-slate-50">
+                  <input
+                    type="checkbox"
+                    checked={r.done}
+                    onChange={() => reminders.updateRow(r.id, { done: !r.done })}
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-blue-600"
+                  />
+                  <span className={`min-w-0 flex-1 break-words text-xs ${r.done ? "text-slate-300 line-through" : "text-slate-600"}`}>{r.text}</span>
+                  <button onClick={() => reminders.removeRow(r.id)} className="shrink-0 text-slate-300 hover:text-rose-500" aria-label="Eliminar recordatorio">
+                    <X size={13} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <OverviewCard icon={DollarSign} tone="blue" label="Gasto total del mes">
+          <p className="mt-3 text-2xl font-bold text-slate-800">{formatCurrency(monthTotal, currency)}</p>
+          <p className="text-[11px] text-slate-400">
+            {monthInvoices.length} factura{monthInvoices.length === 1 ? "" : "s"} este mes
+          </p>
+          <SparkBars values={dailySpend} />
+        </OverviewCard>
+
+        <OverviewCard icon={Droplet} tone="sky" label="Litros consumidos">
+          <p className="mt-3 text-2xl font-bold text-slate-800">{monthLiters.toLocaleString()} L</p>
+          <p className="text-[11px] text-slate-400">Cargas de combustible de este mes</p>
+          <SparkBars values={dailyLiters} barClass="bg-sky-500" />
+        </OverviewCard>
+
+        <OverviewCard icon={FileText} tone="amber" label="Órdenes sin documentación completa">
+          <p className="mt-3 text-3xl font-bold text-slate-800">{ordersMissingDocs.length}</p>
+          <p className="text-[11px] text-slate-400">Les falta un documento o el monto</p>
+        </OverviewCard>
+
+        <OverviewCard icon={AlertTriangle} tone="rose" label="Servicios sin verificar">
+          <p className="mt-3 text-3xl font-bold text-slate-800">{unverifiedCount}</p>
+          <p className="text-[11px] text-slate-400">Facturas pendientes de validación</p>
+        </OverviewCard>
+
+        <OverviewCard
+          icon={Plus}
+          tone="emerald"
+          label="Nuevas órdenes de trabajo"
+          right={
+            <div className="flex items-center rounded-lg border border-slate-200 p-0.5 text-[10px] font-semibold">
+              {[
+                ["day", "Día"],
+                ["week", "Semana"],
+                ["month", "Mes"],
+              ].map(([id, label]) => (
+                <button
+                  key={id}
+                  onClick={() => setOrdersPeriod(id)}
+                  className={`rounded-md px-1.5 py-0.5 transition ${ordersPeriod === id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          }
+        >
+          <p className="mt-3 text-3xl font-bold text-slate-800">{newOrdersCount}</p>
+          <p className="text-[11px] text-slate-400">Creadas {periodLabel}</p>
+        </OverviewCard>
+
+        <OverviewCard icon={CheckCircle2} tone="emerald" label="Órdenes completadas">
+          <p className="mt-3 text-3xl font-bold text-slate-800">{completedOrders.length}</p>
+          <p className="text-[11px] text-slate-400">Con documentos y todo verificado</p>
+        </OverviewCard>
+
+        <OverviewCard
+          icon={Clock}
+          tone="amber"
+          label="Próximas a expirar"
+          className="sm:col-span-2"
+          right={
+            <button
+              onClick={() => setDeadlinesOpen(true)}
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+              aria-label="Plazos por concepto"
+              title="Plazos por concepto"
+            >
+              <Settings size={14} />
+            </button>
+          }
+        >
+          <div className="mt-3 flex flex-wrap items-end gap-x-6 gap-y-2">
+            <div>
+              <p className="text-3xl font-bold text-slate-800">{expiringOrders.length}</p>
+              <p className="text-[11px] text-slate-400">Vencen en {ORDER_WARN_DAYS} días o menos</p>
+            </div>
+            <div>
+              <p className={`text-xl font-bold ${overdueOrders.length > 0 ? "text-rose-600" : "text-slate-800"}`}>{overdueOrders.length}</p>
+              <p className="text-[11px] text-slate-400">Ya vencidas</p>
+            </div>
+          </div>
+          {expiringOrders.length > 0 && (
+            <div className="mt-3 space-y-1">
+              {expiringOrders.slice(0, 3).map((o) => (
+                <p key={o.key} className="text-[11px] text-slate-500">
+                  <b className="text-slate-700">{o.code}</b>
+                  {o.project ? ` · ${o.project}` : ""} — {o.daysLeft === 0 ? "vence hoy" : `vence en ${o.daysLeft} día${o.daysLeft === 1 ? "" : "s"}`}
+                </p>
+              ))}
+            </div>
+          )}
+        </OverviewCard>
+
+        <OverviewCard icon={ShieldCheck} tone="blue" label="Pendientes de aprobación">
+          <p className="mt-3 text-3xl font-bold text-slate-800">{pendingApprovalCount}</p>
+          <p className="text-[11px] text-slate-400">Facturas sin aprobar</p>
+        </OverviewCard>
+      </div>
+
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-bold text-slate-800">Desglose</h2>
+            <p className="text-[11px] text-slate-400">
+              Lo subido {desgloseWindow} · {settings.concepts.length} de {EXPENSE_TYPES.length} conceptos
+            </p>
+          </div>
+          <button
+            onClick={() => setSettingsOpen(true)}
+            className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50"
+            aria-label="Configurar desglose"
+            title="Configurar desglose"
+          >
+            <Settings size={14} />
+          </button>
+        </div>
+        <InvoiceDesgloseTable rows={desgloseRows} emptyLabel="No hay facturas subidas en este periodo. Ajusta los días o conceptos con la ruedita." {...tableActions} />
+      </div>
+
+      <div className="space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div>
+          <h2 className="text-sm font-bold text-slate-800">Explorar registros</h2>
+          <p className="text-[11px] text-slate-400">Entra para ver todos los registros de un concepto, proyecto o usuario.</p>
+        </div>
+
+        <div>
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Por concepto</p>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+            {byConcept.map((c) => (
+              <button
+                key={c.value}
+                onClick={() => setExplore({ kind: "concept", value: c.value })}
+                className={`rounded-xl border px-3 py-2.5 text-left transition hover:border-blue-300 hover:bg-blue-50/40 ${
+                  c.count === 0 ? "border-slate-100 opacity-60" : "border-slate-200"
+                }`}
+              >
+                <p className="text-xs font-semibold text-slate-700">{c.label}</p>
+                <p className="text-[11px] text-slate-400">
+                  {c.count} · {formatCurrency(c.total, currency)}
+                </p>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div>
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Por proyecto</p>
+            <div className="flex flex-wrap gap-1.5">
+              {byProject.length === 0 && <p className="text-[11px] text-slate-400">Aún no hay facturas.</p>}
+              {byProject.map((g) => (
+                <button
+                  key={`p-${g.value}`}
+                  onClick={() => setExplore({ kind: "project", value: g.value })}
+                  className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:border-blue-300 hover:bg-blue-50/40"
+                >
+                  {g.value || "Sin proyecto"} <b className="text-slate-400">{g.count}</b>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Por usuario</p>
+            <div className="flex flex-wrap gap-1.5">
+              {byUser.length === 0 && <p className="text-[11px] text-slate-400">Aún no hay facturas.</p>}
+              {byUser.map((g) => (
+                <button
+                  key={`u-${g.value}`}
+                  onClick={() => setExplore({ kind: "user", value: g.value })}
+                  className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:border-blue-300 hover:bg-blue-50/40"
+                >
+                  {g.value || "Sin identificar"} <b className="text-slate-400">{g.count}</b>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {settingsOpen && <DesgloseSettingsModal settings={settings} onChange={setSettings} onClose={() => setSettingsOpen(false)} />}
+      {deadlinesOpen && <DeadlinesModal days={deadlineDays} isAdmin={isAdmin} onSave={onSaveDeadlines} onClose={() => setDeadlinesOpen(false)} />}
+    </div>
+  );
+}
+
 function FuelPage({
   records,
   travelRecords,
   miscRecords,
-  onAddClick,
+  invoices,
+  orders,
+  deadlineDays,
+  reminders,
+  isAdmin,
+  userName,
+  onAddInvoice,
   onConfirm,
   onEditClick,
   onDeleteClick,
-  onAddTravelClick,
   onConfirmTravel,
   onEditTravelClick,
   onDeleteTravelClick,
-  onAddMiscClick,
   onConfirmMisc,
   onEditMiscClick,
   onDeleteMiscClick,
+  onEditInvoice,
+  onConfirmInvoice,
+  onApproveInvoice,
+  onRejectInvoice,
+  onSaveDeadlines,
 }) {
   const { format } = useDateFormat();
   const { profile } = useAuth();
@@ -3473,11 +4409,22 @@ function FuelPage({
   const fuelWidgets = useMemo(() => getFuelWidgets(records, currency), [records, currency]);
   const [visibleWidgets, setVisibleWidgets] = useState({ totalSpend: true, liters: true, efficiency: true, ocr: true });
   const [widgetModalOpen, setWidgetModalOpen] = useState(false);
-  const [invoiceCategory, setInvoiceCategory] = useState("fuel");
+  const [invoiceCategory, setInvoiceCategory] = useState("overview");
 
   function toggleWidget(id) {
     setVisibleWidgets((prev) => ({ ...prev, [id]: !prev[id] }));
   }
+
+  // Columnas que se repiten en las tablas de cada concepto.
+  const projectColumns = [
+    { key: "project", label: "Proyecto", render: (r) => r.project || "—" },
+    { key: "workOrder", label: "Orden de trabajo", render: (r) => r.workOrder || "—" },
+  ];
+  const typeColumn = (module) => ({
+    key: "expenseType",
+    label: "Concepto",
+    render: (r) => expenseTypeLabel(expenseTypeOf(module, r)),
+  });
 
   const columns = [
     {
@@ -3485,7 +4432,7 @@ function FuelPage({
       label: "Unidad / Matrícula",
       render: (r) => (
         <div>
-          <p className="font-semibold text-slate-700">{r.unit}</p>
+          <p className="font-semibold text-slate-700">{r.unit || "Sin unidad asociada"}</p>
           <p className="text-[11px] text-slate-400">{r.plate}</p>
         </div>
       ),
@@ -3496,6 +4443,7 @@ function FuelPage({
     { key: "odometer", label: "Odómetro", render: (r) => `${r.odometer.toLocaleString()} km` },
     { key: "efficiency", label: "Rendimiento", render: (r) => (r.efficiency ? `${r.efficiency} km/L` : "—") },
     { key: "date", label: "Fecha", render: (r) => formatDate(r.date, format) },
+    ...projectColumns,
     { key: "document", label: "Documento", render: (r) => <DocumentCell documentUrl={r.documentUrl} /> },
     { key: "origin", label: "Origen", render: (r) => <OriginBadge origin={r.origin} /> },
     { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
@@ -3512,10 +4460,12 @@ function FuelPage({
         </div>
       ),
     },
-    { key: "concept", label: "Concepto", render: (r) => <span className="text-slate-600">{r.concept}</span> },
+    typeColumn("travel"),
+    { key: "concept", label: "Descripción", render: (r) => <span className="text-slate-600">{r.concept}</span> },
     { key: "amount", label: "Monto", render: (r) => formatCurrency(r.amount, currency) },
     { key: "vendor", label: "Proveedor", render: (r) => r.vendor || "—" },
     { key: "date", label: "Fecha", render: (r) => formatDate(r.date, format) },
+    ...projectColumns,
     { key: "document", label: "Documento", render: (r) => <DocumentCell documentUrl={r.documentUrl} /> },
     { key: "origin", label: "Origen", render: (r) => <OriginBadge origin={r.origin} /> },
     { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
@@ -3532,10 +4482,12 @@ function FuelPage({
         </div>
       ),
     },
-    { key: "concept", label: "Concepto", render: (r) => <span className="text-slate-600">{r.concept}</span> },
+    typeColumn("misc"),
+    { key: "concept", label: "Descripción", render: (r) => <span className="text-slate-600">{r.concept}</span> },
     { key: "amount", label: "Monto", render: (r) => formatCurrency(r.amount, currency) },
     { key: "vendor", label: "Proveedor", render: (r) => r.vendor || "—" },
     { key: "date", label: "Fecha", render: (r) => formatDate(r.date, format) },
+    ...projectColumns,
     { key: "document", label: "Documento", render: (r) => <DocumentCell documentUrl={r.documentUrl} /> },
     { key: "origin", label: "Origen", render: (r) => <OriginBadge origin={r.origin} /> },
     { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
@@ -3553,13 +4505,7 @@ function FuelPage({
           </p>
         </div>
         <button
-          onClick={
-            invoiceCategory === "travel"
-              ? onAddTravelClick
-              : invoiceCategory === "fuel"
-                ? onAddClick
-                : () => onAddMiscClick(invoiceCategory)
-          }
+          onClick={() => onAddInvoice(INVOICE_CATEGORY_TYPE[invoiceCategory])}
           className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
         >
           <Plus size={15} /> Cargar Factura
@@ -3582,7 +4528,22 @@ function FuelPage({
         ))}
       </div>
 
-      {invoiceCategory === "fuel" ? (
+      {invoiceCategory === "overview" ? (
+        <InvoiceOverview
+          invoices={invoices}
+          orders={orders}
+          deadlineDays={deadlineDays}
+          currency={currency}
+          userName={userName}
+          isAdmin={isAdmin}
+          reminders={reminders}
+          onEditInvoice={onEditInvoice}
+          onConfirmInvoice={onConfirmInvoice}
+          onApproveInvoice={onApproveInvoice}
+          onRejectInvoice={onRejectInvoice}
+          onSaveDeadlines={onSaveDeadlines}
+        />
+      ) : invoiceCategory === "fuel" ? (
         <>
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
             <div className="mb-3 flex items-center justify-between">
@@ -6832,6 +7793,23 @@ function NavioApp() {
     updateRow: updateMiscExpense,
     removeRow: removeMiscExpense,
   } = useSupabaseTable("misc_expenses", { companyId });
+  // Datos propios del resumen de Facturas y Gastos (migración v11): si esa
+  // migración todavía no se corrió, estas tablas vienen vacías y el resto
+  // de la app sigue funcionando.
+  const { rows: workOrderRows, refresh: refreshWorkOrders } = useSupabaseTable("work_orders", { companyId });
+  const { rows: deadlineRows, refresh: refreshDeadlines } = useSupabaseTable("concept_deadlines", { orderBy: "expenseType", companyId });
+  const reminders = useSupabaseTable("user_reminders");
+  const invoices = useMemo(
+    () => normalizeInvoices({ fuel: fuelRecords, travel: travelExpenses, misc: miscExpenses }),
+    [fuelRecords, travelExpenses, miscExpenses]
+  );
+  const deadlineDays = useMemo(() => getDeadlineDays(deadlineRows), [deadlineRows]);
+  const invoiceOrders = useMemo(() => buildOrders(invoices, workOrderRows, deadlineDays), [invoices, workOrderRows, deadlineDays]);
+  const projectOptions = useMemo(
+    () =>
+      [...new Set([...invoices.map((i) => i.project), ...workOrderRows.map((w) => (w.project || "").trim())].filter(Boolean))].sort(),
+    [invoices, workOrderRows]
+  );
   const {
     rows: trips,
     loading: tripsLoading,
@@ -6889,14 +7867,29 @@ function NavioApp() {
 
   const [deleteRecordTarget, setDeleteRecordTarget] = useState(null);
 
-  async function handleSaveRecord(module, record) {
+  // Guarda los datos propios de una orden de trabajo (por ahora su fecha
+  // límite). Si falla (p. ej. la migración v11 aún no se corrió), no
+  // estorba: la factura ya se guardó.
+  async function ensureWorkOrder(project, code, dueDate) {
+    if (!code || !companyId) return;
+    const { error } = await supabase
+      .from("work_orders")
+      .upsert({ companyId, project: project || "", code, dueDate: dueDate || null }, { onConflict: "companyId,project,code" });
+    if (!error) refreshWorkOrders();
+  }
+
+  async function handleSaveRecord(module, record, extra = {}) {
     const { insertRow, updateRow } = recordTables[module];
     try {
       if (record.id) {
         const { id, ...patch } = record;
         await updateRow(id, { ...patch, status: "verified" });
       } else {
-        await insertRow({ ...record, origin: "manual", status: "verified" });
+        const author = INVOICE_MODULES.includes(module) ? { uploadedByName: currentUserName } : {};
+        await insertRow({ ...record, ...author, origin: "manual", status: "verified" });
+      }
+      if (INVOICE_MODULES.includes(module) && record.workOrder) {
+        await ensureWorkOrder(record.project, record.workOrder, extra.orderDueDate);
       }
       setFormModal(null);
       showToast("Registro guardado en Supabase.");
@@ -6912,6 +7905,49 @@ function NavioApp() {
     } catch (err) {
       showToast(`Error al confirmar: ${err.message}`);
     }
+  }
+
+  // Acciones del resumen de Facturas y Gastos sobre una factura ya
+  // normalizada (inv.module / inv.id indican en qué tabla vive).
+  async function updateInvoice(inv, patch, errorLabel) {
+    try {
+      await recordTables[inv.module].updateRow(inv.id, patch);
+    } catch (err) {
+      showToast(`${errorLabel}: ${err.message}`);
+    }
+  }
+  const handleConfirmInvoice = (inv) => updateInvoice(inv, { status: "verified" }, "Error al confirmar");
+  const handleApproveInvoice = (inv) =>
+    updateInvoice(
+      inv,
+      { approved: true, approvedBy: user?.id ?? null, approvedByName: currentUserName, approvedAt: new Date().toISOString() },
+      "Error al aprobar"
+    );
+  const handleRejectInvoice = (inv) =>
+    updateInvoice(inv, { status: "rejected", approved: false, approvedBy: null, approvedByName: null, approvedAt: null }, "Error al rechazar");
+
+  async function handleSaveDeadlines(changes) {
+    const entries = Object.entries(changes);
+    if (entries.length === 0) return true;
+    const { error } = await supabase
+      .from("concept_deadlines")
+      .upsert(entries.map(([expenseType, days]) => ({ companyId, expenseType, days })), { onConflict: "companyId,expenseType" });
+    if (error) {
+      showToast(`Error al guardar plazos: ${error.message}`);
+      return false;
+    }
+    await refreshDeadlines();
+    showToast("Plazos guardados.");
+    return true;
+  }
+
+  function handleAddInvoice(expenseType) {
+    const target = targetForExpenseType(expenseType);
+    setFormModal({ mode: "add", module: target.module, category: target.category, expenseType, initial: null });
+  }
+
+  function handleEditInvoice(inv) {
+    setFormModal({ mode: "edit", module: inv.module, category: inv.raw.category, initial: inv.raw });
   }
 
   async function handleDeleteRecord() {
@@ -7035,8 +8071,11 @@ function NavioApp() {
               mode={formModal.mode}
               module={formModal.module}
               fixedCategory={formModal.category}
+              presetExpenseType={formModal.expenseType}
               initial={formModal.initial}
               vehicles={vehicles}
+              orders={invoiceOrders}
+              projectOptions={projectOptions}
               onSave={handleSaveRecord}
               onClose={() => setFormModal(null)}
             />
@@ -7172,18 +8211,27 @@ function NavioApp() {
                       records={fuelRecords}
                       travelRecords={travelExpenses}
                       miscRecords={miscExpenses}
-                      onAddClick={() => setFormModal({ mode: "add", module: "fuel", initial: null })}
+                      invoices={invoices}
+                      orders={invoiceOrders}
+                      deadlineDays={deadlineDays}
+                      reminders={reminders}
+                      isAdmin={isCompanyAdmin}
+                      userName={currentUserName}
+                      onAddInvoice={handleAddInvoice}
                       onConfirm={(r) => handleConfirmRecord("fuel", r)}
                       onEditClick={(r) => setFormModal({ mode: "edit", module: "fuel", initial: r })}
                       onDeleteClick={(r) => setDeleteRecordTarget({ module: "fuel", record: r })}
-                      onAddTravelClick={() => setFormModal({ mode: "add", module: "travel", initial: null })}
                       onConfirmTravel={(r) => handleConfirmRecord("travel", r)}
                       onEditTravelClick={(r) => setFormModal({ mode: "edit", module: "travel", initial: r })}
                       onDeleteTravelClick={(r) => setDeleteRecordTarget({ module: "travel", record: r })}
-                      onAddMiscClick={(category) => setFormModal({ mode: "add", module: "misc", category, initial: null })}
                       onConfirmMisc={(r) => handleConfirmRecord("misc", r)}
                       onEditMiscClick={(r) => setFormModal({ mode: "edit", module: "misc", category: r.category, initial: r })}
                       onDeleteMiscClick={(r) => setDeleteRecordTarget({ module: "misc", record: r })}
+                      onEditInvoice={handleEditInvoice}
+                      onConfirmInvoice={handleConfirmInvoice}
+                      onApproveInvoice={handleApproveInvoice}
+                      onRejectInvoice={handleRejectInvoice}
+                      onSaveDeadlines={handleSaveDeadlines}
                     />
                   )}
                   {activeTab === "settings" && <SettingsPage />}
@@ -7238,8 +8286,11 @@ function NavioApp() {
               mode={formModal.mode}
               module={formModal.module}
               fixedCategory={formModal.category}
+              presetExpenseType={formModal.expenseType}
               initial={formModal.initial}
               vehicles={vehicles}
+              orders={invoiceOrders}
+              projectOptions={projectOptions}
               onSave={handleSaveRecord}
               onClose={() => setFormModal(null)}
             />

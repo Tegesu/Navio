@@ -35,11 +35,17 @@ const MODULE_LABEL: Record<string, string> = {
 };
 
 const FIELD_MAP: Record<string, string[]> = {
-  fuel: ["unit", "plate", "station", "liters", "amount", "odometer", "efficiency", "date", "vendor", "invoiceFolio", "notes"],
+  fuel: ["unit", "plate", "station", "liters", "amount", "odometer", "efficiency", "date", "vendor", "invoiceFolio", "notes", "project", "workOrder"],
   maintenance: ["unit", "plate", "category", "concept", "amount", "date", "vendor", "invoiceFolio", "notes"],
   compliance: ["unit", "plate", "docType", "concept", "amount", "date", "dueDate", "paymentStatus", "vendor", "invoiceFolio", "notes"],
-  travel: ["unit", "plate", "driverName", "concept", "amount", "date", "vendor", "invoiceFolio", "notes"],
+  travel: ["unit", "plate", "driverName", "concept", "amount", "date", "vendor", "invoiceFolio", "notes", "expenseType", "project", "workOrder"],
 };
+
+// Las tablas de "Facturas y Gastos" (migración v11) guardan concepto,
+// proyecto, orden de trabajo y quién subió la factura. Mantenimiento y
+// Trámites no tienen esas columnas.
+const INVOICE_MODULES = ["fuel", "travel"];
+const TRAVEL_EXPENSE_TYPES = ["viaticos", "hotel", "alimentos", "transporte", "otro"];
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -54,6 +60,8 @@ function buildRecord(extracted: any, module: string): Record<string, unknown> | 
   // "travel" no está ligado a una unidad — un hospedaje puede no mencionar ninguna.
   if (module !== "travel") picked.unit = picked.unit || "Sin identificar";
   picked.date = picked.date || today();
+  if (module === "fuel") picked.expenseType = "gasolina";
+  if (module === "travel" && !TRAVEL_EXPENSE_TYPES.includes(picked.expenseType as string)) picked.expenseType = "viaticos";
 
   if (module === "maintenance" && (!picked.category || !picked.concept)) return null;
   if (module === "compliance" && (!picked.docType || !picked.concept)) return null;
@@ -126,31 +134,44 @@ const EXTRACTION_PROMPT = `Extrae los datos de este documento/factura relacionad
     "concept": string | null,
     "docType": "Tenencia" | "Póliza de Seguro" | "Verificación Vehicular" | "Licencia de Conducir" | "Tarjeta de Circulación" | null,
     "dueDate": "YYYY-MM-DD" | null,
-    "paymentStatus": "Pagado" | "Pendiente de Pago" | null
+    "paymentStatus": "Pagado" | "Pendiente de Pago" | null,
+    "expenseType": "viaticos" | "hotel" | "alimentos" | "transporte" | "otro" | null,
+    "project": string | null,
+    "workOrder": string | null
   }
 }
-Usa "fuel" para tickets/facturas de gasolina o diésel. "maintenance" para servicios, refacciones o mantenimiento del vehículo. "compliance" para tenencias, pólizas, verificaciones, licencias o tarjetas de circulación. Usa "travel" para gastos generales del viaje de un conductor que NO son de la unidad en sí — hospedaje/hotel, alimentos, viáticos, casetas sueltas sin factura de combustible. Si no puedes identificar de qué se trata, usa "unknown". "unit"/"plate" son la unidad o placa del vehículo si el documento lo menciona (en "travel" casi nunca aplica, déjalo en null si no aparece). "driverName" es el nombre del huésped/conductor si el documento lo menciona (común en facturas de hotel).`;
+Usa "fuel" para tickets/facturas de gasolina o diésel. "maintenance" para servicios, refacciones o mantenimiento del vehículo. "compliance" para tenencias, pólizas, verificaciones, licencias o tarjetas de circulación. Usa "travel" para gastos generales del viaje de un conductor que NO son de la unidad en sí — hospedaje/hotel, alimentos, viáticos, casetas sueltas sin factura de combustible. Si no puedes identificar de qué se trata, usa "unknown". "unit"/"plate" son la unidad o placa del vehículo si el documento lo menciona (en "travel" casi nunca aplica, déjalo en null si no aparece). "driverName" es el nombre del huésped/conductor si el documento lo menciona (común en facturas de hotel). "expenseType" solo aplica a "travel": "hotel" para hospedaje, "alimentos" para comida, "transporte" para taxis, autobuses, vuelos o casetas, "viaticos" para viáticos generales y "otro" si no encaja en ninguno. "project" y "workOrder" son el proyecto y la orden de trabajo (por ejemplo "OT24053"), solo si el documento o el texto que lo acompaña los menciona; si no, déjalos en null.`;
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function callGeminiOnce(
-  parts: unknown[]
+  parts: unknown[],
+  timeoutMs: number
 ): Promise<{ ok: true; data: any } | { ok: false; retryable: boolean; quotaExceeded: boolean }> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: { response_mime_type: "application/json" },
-      }),
-    }
-  );
-
-  const data = await res.json();
+  let res: Response;
+  let data: any;
+  try {
+    res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts }],
+          generationConfig: { response_mime_type: "application/json" },
+        }),
+        // Sin tope, una respuesta lenta de Gemini (común con PDFs) dejaba la
+        // función colgada hasta que Supabase la mataba sin mandar respuesta.
+        signal: AbortSignal.timeout(timeoutMs),
+      }
+    );
+    data = await res.json();
+  } catch (err) {
+    console.error("Gemini no respondió a tiempo o falló la conexión", String(err));
+    return { ok: false, retryable: true, quotaExceeded: false };
+  }
 
   if (!res.ok) {
     console.error("Gemini API error", res.status, JSON.stringify(data));
@@ -182,7 +203,7 @@ async function callGeminiOnce(
 //    un límite por segundo, pero no vale la pena insistir más que eso.
 async function extractWithGemini(
   { base64, mimeType, text }: { base64: string | null; mimeType: string; text: string }
-): Promise<{ data: any; reason: null } | { data: null; reason: "capacity" | "unrecognized" }> {
+): Promise<{ data: any; reason: null } | { data: null; reason: "capacity" | "unrecognized" | "slow" }> {
   const parts: unknown[] = [];
   if (base64) {
     parts.push({ inline_data: { mime_type: mimeType, data: base64 } });
@@ -190,14 +211,22 @@ async function extractWithGemini(
   const contextLine = text ? `\nTexto que acompaña al documento, úsalo como contexto adicional: "${text.replace(/"/g, "'")}"` : "";
   parts.push({ text: EXTRACTION_PROMPT + contextLine });
 
+  // Presupuesto total: la función tiene que alcanzar a contestarle al
+  // usuario antes de que Supabase la corte, pase lo que pase con Gemini.
+  const TOTAL_BUDGET_MS = 100_000;
+  const PER_CALL_MS = 40_000;
+  const startedAt = Date.now();
   const delaysMs = [0, 2000, 4000, 8000, 8000];
   let sawQuotaError = false;
+  let sawTimeoutOrOverload = false;
   for (let attempt = 0; attempt < delaysMs.length; attempt++) {
     if (delaysMs[attempt] > 0) {
       console.log(`Reintentando Gemini (intento ${attempt + 1}/${delaysMs.length})`);
       await sleep(delaysMs[attempt]);
     }
-    const result = await callGeminiOnce(parts);
+    const remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt);
+    if (remaining < 10_000) break;
+    const result = await callGeminiOnce(parts, Math.min(PER_CALL_MS, remaining - 5_000));
     if (result.ok) return { data: result.data, reason: null };
     if (!result.retryable) return { data: null, reason: "unrecognized" };
     if (result.quotaExceeded) {
@@ -205,9 +234,12 @@ async function extractWithGemini(
       // Insistir contra una cuota agotada no la libera antes — dos
       // intentos cortos bastan para descartar que fue un límite momentáneo.
       if (attempt >= 1) break;
+    } else {
+      sawTimeoutOrOverload = true;
     }
   }
-  return { data: null, reason: sawQuotaError ? "capacity" : "unrecognized" };
+  if (sawQuotaError) return { data: null, reason: "capacity" };
+  return { data: null, reason: sawTimeoutOrOverload ? "slow" : "unrecognized" };
 }
 
 Deno.serve(async (req) => {
@@ -301,6 +333,10 @@ Deno.serve(async (req) => {
 
   console.log("Procesando mensaje", { hasFile: !!file, mimeType: file?.mimeType, textLength: text.length });
 
+  // Leer un PDF puede tardar más de un minuto; avisar enseguida evita que
+  // parezca que el bot no recibió nada.
+  if (file) await sendMessage(chatId, "Recibí tu documento, lo estoy leyendo… (puede tardar un poco)");
+
   const { data: extraction, reason: failureReason } = await extractWithGemini({
     base64: file?.base64 ?? null,
     mimeType: file?.mimeType ?? "image/jpeg",
@@ -310,7 +346,12 @@ Deno.serve(async (req) => {
   const module = extraction?.module;
 
   if (!module || module === "unknown" || !TABLE_MAP[module]) {
-    const summary = failureReason === "capacity" ? "Límite de IA alcanzado temporalmente" : "No se pudo interpretar el documento";
+    const summary =
+      failureReason === "capacity"
+        ? "Límite de IA alcanzado temporalmente"
+        : failureReason === "slow"
+        ? "La IA tardó demasiado en responder"
+        : "No se pudo interpretar el documento";
     await supabase.from("bot_ingestions").insert({
       companyId: company.id,
       channel: "telegram",
@@ -322,6 +363,8 @@ Deno.serve(async (req) => {
       chatId,
       failureReason === "capacity"
         ? "Estoy recibiendo demasiadas solicitudes en este momento (límite del servicio gratuito de IA). Intenta de nuevo en unos minutos — no es un problema con tu documento."
+        : failureReason === "slow"
+        ? "El servicio de IA está tardando demasiado en responder. Reenvía el documento en unos minutos — no es un problema con tu archivo."
         : "No logré interpretar ese documento. Intenta con una foto más clara o descríbelo en texto."
     );
     return new Response("ok");
@@ -342,11 +385,28 @@ Deno.serve(async (req) => {
 
   const documentUrl = file ? await uploadDocument(company.id, module, file) : null;
 
+  // El chat está ligado a la empresa, no a un usuario de Navío: como
+  // "Usuario" se guarda el nombre de quien mandó el mensaje en Telegram.
+  const senderName =
+    [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ") || message.from?.username || null;
+  const invoiceFields = INVOICE_MODULES.includes(module) ? { uploadedByName: senderName } : {};
+
   const { data: inserted, error: insertError } = await supabase
     .from(TABLE_MAP[module])
-    .insert({ ...record, companyId: company.id, origin: "telegram", status: "pending", documentUrl })
+    .insert({ ...record, ...invoiceFields, companyId: company.id, origin: "telegram", status: "pending", documentUrl })
     .select()
     .single();
+
+  // Si la factura trae orden de trabajo, se da de alta sin tocar una
+  // fecha límite que la orden ya tuviera.
+  if (!insertError && INVOICE_MODULES.includes(module) && record.workOrder) {
+    await supabase
+      .from("work_orders")
+      .upsert(
+        { companyId: company.id, project: String(record.project ?? "").trim(), code: String(record.workOrder).trim() },
+        { onConflict: "companyId,project,code", ignoreDuplicates: true }
+      );
+  }
 
   const amountLabel = record.amount != null ? `$${record.amount}` : "sin monto";
   const unitLabel = record.unit || "sin unidad";
