@@ -130,6 +130,16 @@ function formatCurrency(amount, currency = "MXN") {
   }
 }
 
+// Con centavos: para importes de factura, que deben coincidir con el documento.
+function formatMoney(amount, currency = "MXN") {
+  const value = Number(amount) || 0;
+  try {
+    return new Intl.NumberFormat("es-MX", { style: "currency", currency, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+  } catch {
+    return `$${value.toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+}
+
 /* ---------------------------------------------------------------------- */
 /*  Persistence — localStorage-backed state                               */
 /* ---------------------------------------------------------------------- */
@@ -1934,6 +1944,16 @@ function normalizeInvoices({ fuel = [], travel = [], misc = [] }) {
     amount: Number(r.amount) || 0,
     liters: module === "fuel" ? Number(r.liters) || 0 : 0,
     description: module === "fuel" ? r.station || r.vendor || "" : r.concept || "",
+    vendor: r.vendor || "",
+    invoiceFolio: r.invoiceFolio || "",
+    unit: r.unit || "",
+    plate: r.plate || "",
+    driverName: r.driverName || "",
+    station: r.station || "",
+    odometer: Number(r.odometer) || 0,
+    efficiency: Number(r.efficiency) || 0,
+    notes: r.notes || "",
+    cfdi: r.cfdi || null,
     origin: r.origin || "manual",
     status: r.status || "pending",
     approved: !!r.approved,
@@ -1992,6 +2012,177 @@ function buildOrders(invoices, workOrderRows = [], deadlineDays = getDeadlineDay
   });
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Datos fiscales (CFDI)                                                 */
+/* ---------------------------------------------------------------------- */
+
+// Catálogos del SAT: la factura trae la clave ("G03") y aquí se traduce.
+const SAT_TIPO_COMPROBANTE = { I: "Ingreso", E: "Egreso", T: "Traslado", P: "Pago", N: "Nómina" };
+const SAT_METODO_PAGO = { PUE: "Pago en una sola exhibición", PPD: "Pago en parcialidades o diferido" };
+const SAT_FORMA_PAGO = {
+  "01": "Efectivo",
+  "02": "Cheque nominativo",
+  "03": "Transferencia electrónica",
+  "04": "Tarjeta de crédito",
+  "05": "Monedero electrónico",
+  "06": "Dinero electrónico",
+  "08": "Vales de despensa",
+  12: "Dación en pago",
+  13: "Pago por subrogación",
+  14: "Pago por consignación",
+  15: "Condonación",
+  17: "Compensación",
+  23: "Novación",
+  24: "Confusión",
+  25: "Remisión de deuda",
+  26: "Prescripción o caducidad",
+  27: "A satisfacción del acreedor",
+  28: "Tarjeta de débito",
+  29: "Tarjeta de servicios",
+  30: "Aplicación de anticipos",
+  31: "Intermediario de pagos",
+  99: "Por definir",
+};
+const SAT_USO_CFDI = {
+  G01: "Adquisición de mercancías",
+  G02: "Devoluciones, descuentos o bonificaciones",
+  G03: "Gastos en general",
+  I01: "Construcciones",
+  I02: "Mobiliario y equipo de oficina",
+  I03: "Equipo de transporte",
+  I04: "Equipo de cómputo y accesorios",
+  I05: "Dados, troqueles, moldes y herramental",
+  I06: "Comunicaciones telefónicas",
+  I07: "Comunicaciones satelitales",
+  I08: "Otra maquinaria y equipo",
+  D01: "Honorarios médicos y gastos hospitalarios",
+  D02: "Gastos médicos por incapacidad",
+  D03: "Gastos funerales",
+  D04: "Donativos",
+  D05: "Intereses de créditos hipotecarios",
+  D06: "Aportaciones voluntarias al SAR",
+  D07: "Primas por seguros de gastos médicos",
+  D08: "Transportación escolar obligatoria",
+  D09: "Depósitos para el ahorro y pensiones",
+  D10: "Servicios educativos (colegiaturas)",
+  S01: "Sin efectos fiscales",
+  CP01: "Pagos",
+  CN01: "Nómina",
+};
+const SAT_REGIMEN = {
+  601: "General de Ley Personas Morales",
+  603: "Personas Morales con Fines no Lucrativos",
+  605: "Sueldos y Salarios",
+  606: "Arrendamiento",
+  607: "Enajenación o Adquisición de Bienes",
+  608: "Demás ingresos",
+  610: "Residentes en el Extranjero",
+  611: "Dividendos",
+  612: "Personas Físicas con Actividades Empresariales y Profesionales",
+  614: "Ingresos por intereses",
+  615: "Obtención de premios",
+  616: "Sin obligaciones fiscales",
+  620: "Sociedades Cooperativas de Producción",
+  621: "Incorporación Fiscal",
+  622: "Actividades Agrícolas, Ganaderas, Silvícolas y Pesqueras",
+  623: "Opcional para Grupos de Sociedades",
+  624: "Coordinados",
+  625: "Plataformas Tecnológicas",
+  626: "Régimen Simplificado de Confianza (RESICO)",
+};
+
+function decodeSat(catalog, code) {
+  if (code === undefined || code === null || code === "") return "";
+  const key = String(code).trim();
+  const label = catalog[key] ?? catalog[key.padStart(2, "0")];
+  return label ? `${code} — ${label}` : String(code);
+}
+
+function getAtPath(obj, path) {
+  return path.split(".").reduce((value, key) => value?.[key], obj);
+}
+
+function setAtPath(obj, path, value) {
+  const [head, ...rest] = path.split(".");
+  return { ...obj, [head]: rest.length ? setAtPath(obj?.[head] ?? {}, rest.join("."), value) : value };
+}
+
+function pruneEmpty(value) {
+  if (value === null || value === undefined || value === "") return undefined;
+  if (Array.isArray(value)) {
+    const items = value.map(pruneEmpty).filter((v) => v !== undefined);
+    return items.length ? items : undefined;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value)
+      .map(([k, v]) => [k, pruneEmpty(v)])
+      .filter(([, v]) => v !== undefined);
+    return entries.length ? Object.fromEntries(entries) : undefined;
+  }
+  return value;
+}
+
+// Campos fiscales que se pueden capturar o corregir a mano en el formulario.
+// Las partidas y los "otros datos" que leyó la IA se conservan sin tocarlos.
+const CFDI_FORM_FIELDS = [
+  { path: "uuid", label: "Folio fiscal (UUID)", wide: true },
+  { path: "emisor.rfc", label: "RFC emisor" },
+  { path: "emisor.regimenFiscal", label: "Régimen emisor" },
+  { path: "receptor.nombre", label: "Receptor" },
+  { path: "receptor.rfc", label: "RFC receptor" },
+  { path: "receptor.usoCFDI", label: "Uso de CFDI" },
+  { path: "receptor.regimenFiscal", label: "Régimen receptor" },
+  { path: "metodoPago", label: "Método de pago" },
+  { path: "formaPago", label: "Forma de pago" },
+  { path: "moneda", label: "Moneda" },
+  { path: "tipoCambio", label: "Tipo de cambio", number: true },
+  { path: "importes.subtotal", label: "Subtotal", number: true },
+  { path: "importes.descuento", label: "Descuento", number: true },
+  { path: "importes.iva", label: "IVA", number: true },
+  { path: "importes.ieps", label: "IEPS", number: true },
+  { path: "importes.ish", label: "ISH", number: true },
+  { path: "importes.otrosImpuestos", label: "Otros impuestos", number: true },
+  { path: "importes.retencionIVA", label: "Retención IVA", number: true },
+  { path: "importes.retencionISR", label: "Retención ISR", number: true },
+];
+
+// Datos fiscales listos para guardar, o null si no hay ninguno. El total
+// siempre es el Monto del formulario, para que nunca se contradigan.
+function buildCfdiFromForm(cfdi, amount) {
+  let out = cfdi;
+  for (const field of CFDI_FORM_FIELDS) {
+    const value = getAtPath(out, field.path);
+    if (field.number && value !== undefined && value !== "") {
+      const n = Number(String(value).replace(/[$,\s]/g, ""));
+      if (Number.isFinite(n)) out = setAtPath(out, field.path, n);
+    }
+  }
+  const pruned = pruneEmpty(out);
+  return pruned ? setAtPath(pruned, "importes.total", amount) : null;
+}
+
+// Revisiones simples para detectar una lectura equivocada antes de confirmar.
+function cfdiWarnings(cfdi) {
+  if (!cfdi) return [];
+  const warnings = [];
+  if (cfdi.uuid && !/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(cfdi.uuid)) {
+    warnings.push("El folio fiscal (UUID) no tiene el formato correcto.");
+  }
+  const rfcPattern = /^[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}$/i;
+  if (cfdi.emisor?.rfc && !rfcPattern.test(cfdi.emisor.rfc)) warnings.push("El RFC del emisor no tiene el formato correcto.");
+  if (cfdi.receptor?.rfc && !rfcPattern.test(cfdi.receptor.rfc)) warnings.push("El RFC del receptor no tiene el formato correcto.");
+  const i = cfdi.importes ?? {};
+  const n = (v) => Number(v) || 0;
+  if (i.subtotal !== undefined && i.total !== undefined) {
+    const expected = n(i.subtotal) - n(i.descuento) + n(i.iva) + n(i.ieps) + n(i.ish) + n(i.otrosImpuestos) - n(i.retencionIVA) - n(i.retencionISR);
+    // La propina a veces va dentro del total y a veces no: cualquiera de los dos cuadra.
+    if (Math.abs(expected - n(i.total)) > 1 && Math.abs(expected + n(i.propina) - n(i.total)) > 1) {
+      warnings.push(`Los importes no cuadran: la suma da ${formatMoney(expected, cfdi.moneda || "MXN")} y el total dice ${formatMoney(i.total, cfdi.moneda || "MXN")}.`);
+    }
+  }
+  return warnings;
+}
+
 function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpenseType, initial, vehicles, orders = [], projectOptions = [], onSave, onClose }) {
   const { profile } = useAuth();
   const { showToast } = useToast();
@@ -2006,6 +2197,7 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
   const module = isInvoiceFlow && !initial ? typeTarget.module : moduleState;
   const typeOptions = initial ? expenseTypesForEdit(module, initial.category) : EXPENSE_TYPES;
   const [project, setProject] = useState(initial?.project ?? "");
+  const [cfdi, setCfdi] = useState(initial?.cfdi ?? {});
   const [workOrder, setWorkOrder] = useState(initial?.workOrder ?? "");
   const [orderDueDate, setOrderDueDate] = useState(
     orders.find((o) => o.code === (initial?.workOrder ?? "") && o.project === (initial?.project ?? ""))?.dueDate ?? ""
@@ -2102,6 +2294,9 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
         base.expenseType = expenseType;
         base.project = project.trim();
         base.workOrder = workOrder.trim();
+        const fiscal = buildCfdiFromForm(cfdi, base.amount);
+        if (fiscal) base.cfdi = fiscal;
+        else if (initial?.cfdi) base.cfdi = null;
       }
       onSave(module, base, { orderDueDate: orderDueDate || null });
     } catch (err) {
@@ -2280,7 +2475,7 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
           </div>
           <div>
             <label className={labelClass}>Monto (MXN)</label>
-            <input type="number" min="0" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0" className={inputClass} />
+            <input type="number" min="0" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0" className={inputClass} />
           </div>
         </div>
 
@@ -2304,15 +2499,15 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
           <div className="grid grid-cols-3 gap-3">
             <div>
               <label className={labelClass}>Litros Cargados</label>
-              <input type="number" min="0" value={liters} onChange={(e) => setLiters(e.target.value)} className={inputClass} />
+              <input type="number" min="0" step="any" value={liters} onChange={(e) => setLiters(e.target.value)} className={inputClass} />
             </div>
             <div>
               <label className={labelClass}>Odómetro (km)</label>
-              <input type="number" min="0" value={odometer} onChange={(e) => setOdometer(e.target.value)} className={inputClass} />
+              <input type="number" min="0" step="any" value={odometer} onChange={(e) => setOdometer(e.target.value)} className={inputClass} />
             </div>
             <div>
               <label className={labelClass}>Rendimiento (km/L)</label>
-              <input type="number" min="0" step="0.1" value={efficiency} onChange={(e) => setEfficiency(e.target.value)} placeholder="Ej. 3.6" className={inputClass} />
+              <input type="number" min="0" step="any" value={efficiency} onChange={(e) => setEfficiency(e.target.value)} placeholder="Ej. 3.6" className={inputClass} />
             </div>
           </div>
         )}
@@ -2327,6 +2522,28 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
             <input value={invoiceFolio} onChange={(e) => setInvoiceFolio(e.target.value)} placeholder="Ej. FA-00123" className={inputClass} />
           </div>
         </div>
+
+        {isInvoiceFlow && (
+          <details open={!!initial?.cfdi} className="rounded-xl border border-slate-200 px-3 py-2">
+            <summary className="cursor-pointer text-[11px] font-semibold text-slate-600">Datos fiscales (CFDI) — opcional</summary>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              {CFDI_FORM_FIELDS.map((field) => (
+                <div key={field.path} className={field.wide ? "col-span-2" : ""}>
+                  <label className={labelClass}>{field.label}</label>
+                  <input
+                    value={getAtPath(cfdi, field.path) ?? ""}
+                    onChange={(e) => setCfdi((prev) => setAtPath(prev, field.path, e.target.value))}
+                    inputMode={field.number ? "decimal" : undefined}
+                    className={inputClass}
+                  />
+                </div>
+              ))}
+            </div>
+            {initial?.cfdi?.conceptos && (
+              <p className="mt-2 text-[11px] text-slate-400">Las partidas y otros datos que leyó la IA se conservan; se ven en "Detalle".</p>
+            )}
+          </details>
+        )}
 
         <div>
           <label className={labelClass}>Notas (opcional)</label>
@@ -3815,17 +4032,126 @@ function OverviewCard({ icon: Icon, tone, label, right = null, className = "", c
   );
 }
 
-function InvoiceDesgloseTable({ rows, currency, isAdmin, onEdit, onConfirm, onApprove, onReject, emptyLabel }) {
+const EMPTY_CELL = <span className="text-slate-300">—</span>;
+const orEmpty = (value) => (value === undefined || value === null || value === "" ? EMPTY_CELL : value);
+const invoiceCurrency = (inv, ctx) => inv.cfdi?.moneda || ctx.currency;
+const importeColumn = (id, label, get) => ({
+  id,
+  label,
+  group: "Importes",
+  align: "right",
+  render: (inv, ctx) => {
+    const value = get(inv.cfdi?.importes ?? {});
+    return value === undefined || value === null ? EMPTY_CELL : formatMoney(value, invoiceCurrency(inv, ctx));
+  },
+});
+const invoiceConcepts = (inv) => (inv.cfdi?.conceptos ?? []).map((c) => c.descripcion).filter(Boolean).join(", ");
+
+// Columnas disponibles en los desgloses, en el orden en que se muestran.
+const INVOICE_COLUMNS = [
+  {
+    id: "unit",
+    label: "Unidad / Matrícula",
+    group: "General",
+    render: (inv) => (
+      <div>
+        <p className="font-semibold text-slate-700">{inv.unit || "Sin unidad asociada"}</p>
+        {inv.plate && <p className="text-[11px] text-slate-400">{inv.plate}</p>}
+      </div>
+    ),
+  },
+  { id: "driver", label: "Conductor / Huésped", group: "General", render: (inv) => orEmpty(inv.driverName) },
+  {
+    id: "project",
+    label: "Proyecto",
+    group: "General",
+    render: (inv) => (inv.project ? <span className="font-semibold text-slate-700">{inv.project}</span> : <span className="text-slate-300">Sin proyecto</span>),
+  },
+  { id: "workOrder", label: "Orden de trabajo", group: "General", render: (inv) => orEmpty(inv.workOrder) },
+  { id: "station", label: "Estación de Servicio", group: "Combustible", render: (inv) => orEmpty(inv.station) },
+  { id: "date", label: "Fecha", group: "General", render: (inv, ctx) => formatDate(inv.date, ctx.format) },
+  {
+    id: "amount",
+    label: "Monto",
+    group: "General",
+    align: "right",
+    render: (inv, ctx) => <span className="font-semibold text-slate-700">{formatMoney(inv.amount, invoiceCurrency(inv, ctx))}</span>,
+  },
+  { id: "liters", label: "Litros", group: "Combustible", align: "right", render: (inv) => (inv.module === "fuel" ? `${inv.liters.toLocaleString()} L` : EMPTY_CELL) },
+  { id: "odometer", label: "Odómetro", group: "Combustible", align: "right", render: (inv) => (inv.module === "fuel" ? `${inv.odometer.toLocaleString()} km` : EMPTY_CELL) },
+  { id: "efficiency", label: "Rendimiento", group: "Combustible", align: "right", render: (inv) => (inv.efficiency ? `${inv.efficiency} km/L` : EMPTY_CELL) },
+  { id: "expenseType", label: "Concepto", group: "General", render: (inv) => expenseTypeLabel(inv.expenseType) },
+  {
+    id: "description",
+    label: "Descripción",
+    group: "General",
+    cellClass: "max-w-[16rem] truncate",
+    render: (inv) => <span title={inv.description}>{orEmpty(inv.description)}</span>,
+  },
+  { id: "vendor", label: "Proveedor", group: "Emisor y receptor", render: (inv) => orEmpty(inv.vendor || inv.cfdi?.emisor?.nombre) },
+  { id: "emisorRfc", label: "RFC emisor", group: "Emisor y receptor", render: (inv) => orEmpty(inv.cfdi?.emisor?.rfc) },
+  { id: "emisorRegimen", label: "Régimen emisor", group: "Emisor y receptor", render: (inv) => orEmpty(decodeSat(SAT_REGIMEN, inv.cfdi?.emisor?.regimenFiscal)) },
+  { id: "receptor", label: "Receptor", group: "Emisor y receptor", render: (inv) => orEmpty(inv.cfdi?.receptor?.nombre) },
+  { id: "receptorRfc", label: "RFC receptor", group: "Emisor y receptor", render: (inv) => orEmpty(inv.cfdi?.receptor?.rfc) },
+  { id: "receptorRegimen", label: "Régimen receptor", group: "Emisor y receptor", render: (inv) => orEmpty(decodeSat(SAT_REGIMEN, inv.cfdi?.receptor?.regimenFiscal)) },
+  { id: "usoCfdi", label: "Uso de CFDI", group: "Comprobante fiscal", render: (inv) => orEmpty(decodeSat(SAT_USO_CFDI, inv.cfdi?.receptor?.usoCFDI)) },
+  { id: "uuid", label: "Folio fiscal (UUID)", group: "Comprobante fiscal", render: (inv) => (inv.cfdi?.uuid ? <span className="font-mono text-[11px]">{inv.cfdi.uuid}</span> : EMPTY_CELL) },
+  { id: "folio", label: "Folio", group: "Comprobante fiscal", render: (inv) => orEmpty(inv.invoiceFolio || inv.cfdi?.folio) },
+  { id: "tipoComprobante", label: "Tipo de comprobante", group: "Comprobante fiscal", render: (inv) => orEmpty(decodeSat(SAT_TIPO_COMPROBANTE, inv.cfdi?.tipoComprobante)) },
+  { id: "metodoPago", label: "Método de pago", group: "Comprobante fiscal", render: (inv) => orEmpty(decodeSat(SAT_METODO_PAGO, inv.cfdi?.metodoPago)) },
+  { id: "formaPago", label: "Forma de pago", group: "Comprobante fiscal", render: (inv) => orEmpty(decodeSat(SAT_FORMA_PAGO, inv.cfdi?.formaPago)) },
+  { id: "moneda", label: "Moneda", group: "Comprobante fiscal", render: (inv) => orEmpty(inv.cfdi?.moneda) },
+  { id: "tipoCambio", label: "Tipo de cambio", group: "Comprobante fiscal", align: "right", render: (inv) => orEmpty(inv.cfdi?.tipoCambio) },
+  {
+    id: "partidas",
+    label: "Partidas",
+    group: "Comprobante fiscal",
+    cellClass: "max-w-[16rem] truncate",
+    render: (inv) => <span title={invoiceConcepts(inv)}>{orEmpty(invoiceConcepts(inv))}</span>,
+  },
+  importeColumn("subtotal", "Subtotal", (i) => i.subtotal),
+  importeColumn("descuento", "Descuento", (i) => i.descuento),
+  importeColumn("iva", "IVA", (i) => i.iva),
+  importeColumn("ieps", "IEPS", (i) => i.ieps),
+  importeColumn("ish", "ISH", (i) => i.ish),
+  importeColumn("otrosImpuestos", "Otros impuestos", (i) => i.otrosImpuestos),
+  importeColumn("retenciones", "Retenciones", (i) =>
+    i.retencionIVA === undefined && i.retencionISR === undefined ? undefined : (Number(i.retencionIVA) || 0) + (Number(i.retencionISR) || 0)
+  ),
+  importeColumn("propina", "Propina", (i) => i.propina),
+  { id: "origin", label: "Origen", group: "General", render: (inv) => <OriginBadge origin={inv.origin} /> },
+  { id: "user", label: "Usuario", group: "General", render: (inv) => orEmpty(inv.uploadedByName) },
+  { id: "status", label: "Estado", group: "General", render: (inv) => <StatusBadge status={inv.status} /> },
+  {
+    id: "approved",
+    label: "Aprobado",
+    group: "General",
+    render: (inv) =>
+      inv.approved ? <CheckCircle2 size={16} className="text-emerald-500" aria-label="Aprobada" /> : <X size={16} className="text-rose-400" aria-label="Sin aprobar" />,
+  },
+  { id: "approvedBy", label: "Aprobado por", group: "General", render: (inv) => orEmpty(inv.approvedByName) },
+  { id: "document", label: "Documento", group: "General", render: (inv) => <DocumentCell documentUrl={inv.documentUrl} /> },
+];
+
+const DEFAULT_INVOICE_COLUMNS = {
+  overview: ["project", "workOrder", "date", "amount", "expenseType", "vendor", "emisorRfc", "origin", "user", "status", "approved", "approvedBy", "document"],
+  fuel: ["unit", "project", "workOrder", "station", "date", "amount", "liters", "odometer", "efficiency", "document", "origin", "status"],
+  travel: ["unit", "driver", "project", "workOrder", "date", "amount", "expenseType", "description", "vendor", "document", "origin", "status"],
+  misc: ["unit", "project", "workOrder", "date", "amount", "expenseType", "description", "vendor", "document", "origin", "status"],
+};
+
+function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onConfirm, onApprove, onReject, onDetail, onDelete, emptyLabel }) {
   const { format } = useDateFormat();
-  const headers = ["Proyecto", "Orden de trabajo", "Fecha", "Monto", "Concepto", "Origen", "Usuario", "Estado", "Aprobado", "Aprobado por", "Documento"];
+  const columns = INVOICE_COLUMNS.filter((c) => columnIds.includes(c.id));
+  const ctx = { currency, format };
   return (
     <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
-      <table className="w-full min-w-[1180px] text-left text-xs">
+      <table className="w-full min-w-max text-left text-xs">
         <thead>
           <tr className="border-b border-slate-100 text-[11px] uppercase tracking-wide text-slate-400">
-            {headers.map((h) => (
-              <th key={h} className="whitespace-nowrap px-3 py-3 font-semibold">
-                {h}
+            {columns.map((c) => (
+              <th key={c.id} className={`whitespace-nowrap px-3 py-3 font-semibold ${c.align === "right" ? "text-right" : ""}`}>
+                {c.label}
               </th>
             ))}
             <th className="px-3 py-3 text-right font-semibold">Acciones</th>
@@ -3834,33 +4160,19 @@ function InvoiceDesgloseTable({ rows, currency, isAdmin, onEdit, onConfirm, onAp
         <tbody>
           {rows.map((inv) => (
             <tr key={inv.key} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/60">
-              <td className="whitespace-nowrap px-3 py-3 font-semibold text-slate-700">
-                {inv.project || <span className="font-normal text-slate-300">Sin proyecto</span>}
-              </td>
-              <td className="whitespace-nowrap px-3 py-3 text-slate-600">{inv.workOrder || <span className="text-slate-300">—</span>}</td>
-              <td className="whitespace-nowrap px-3 py-3 text-slate-600">{formatDate(inv.date, format)}</td>
-              <td className="whitespace-nowrap px-3 py-3 font-semibold text-slate-700">{formatCurrency(inv.amount, currency)}</td>
-              <td className="px-3 py-3 text-slate-600">{expenseTypeLabel(inv.expenseType)}</td>
-              <td className="px-3 py-3">
-                <OriginBadge origin={inv.origin} />
-              </td>
-              <td className="px-3 py-3 text-slate-600">{inv.uploadedByName || "—"}</td>
-              <td className="px-3 py-3">
-                <StatusBadge status={inv.status} />
-              </td>
-              <td className="px-3 py-3">
-                {inv.approved ? (
-                  <CheckCircle2 size={16} className="text-emerald-500" aria-label="Aprobada" />
-                ) : (
-                  <X size={16} className="text-rose-400" aria-label="Sin aprobar" />
-                )}
-              </td>
-              <td className="px-3 py-3 text-slate-600">{inv.approvedByName || "—"}</td>
-              <td className="px-3 py-3">
-                <DocumentCell documentUrl={inv.documentUrl} />
-              </td>
+              {columns.map((c) => (
+                <td key={c.id} className={`whitespace-nowrap px-3 py-3 text-slate-600 ${c.align === "right" ? "text-right" : ""} ${c.cellClass ?? ""}`}>
+                  {c.render(inv, ctx)}
+                </td>
+              ))}
               <td className="px-3 py-3">
                 <div className="flex justify-end gap-1.5">
+                  <button
+                    onClick={() => onDetail(inv)}
+                    className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                  >
+                    <Eye size={12} /> Detalle
+                  </button>
                   {inv.status === "pending" && (
                     <button
                       onClick={() => onConfirm(inv)}
@@ -3891,13 +4203,21 @@ function InvoiceDesgloseTable({ rows, currency, isAdmin, onEdit, onConfirm, onAp
                   >
                     <Edit2 size={12} /> Editar
                   </button>
+                  {isAdmin && onDelete && (
+                    <button
+                      onClick={() => onDelete(inv)}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-rose-200 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
+                    >
+                      <Trash2 size={12} /> Eliminar
+                    </button>
+                  )}
                 </div>
               </td>
             </tr>
           ))}
           {rows.length === 0 && (
             <tr>
-              <td colSpan={headers.length + 1} className="px-4 py-8 text-center text-xs text-slate-400">
+              <td colSpan={columns.length + 1} className="px-4 py-8 text-center text-xs text-slate-400">
                 {emptyLabel}
               </td>
             </tr>
@@ -3905,6 +4225,236 @@ function InvoiceDesgloseTable({ rows, currency, isAdmin, onEdit, onConfirm, onAp
         </tbody>
       </table>
     </div>
+  );
+}
+
+function InvoiceColumnsButton({ onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+    >
+      <Sliders size={13} /> Columnas
+    </button>
+  );
+}
+
+function ColumnPickerModal({ selected, defaults, onChange, onClose }) {
+  const groups = [...new Set(INVOICE_COLUMNS.map((c) => c.group))];
+  function toggle(id) {
+    onChange(selected.includes(id) ? selected.filter((c) => c !== id) : [...selected, id]);
+  }
+  return (
+    <Modal title="Columnas visibles" width="max-w-2xl" onClose={onClose}>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-xs text-slate-400">Elige qué datos quieres ver en esta tabla. Se guarda en este navegador.</p>
+        <div className="flex shrink-0 gap-3 text-[11px] font-semibold text-blue-600">
+          <button onClick={() => onChange(INVOICE_COLUMNS.map((c) => c.id))}>Todas</button>
+          <button onClick={() => onChange(defaults)}>Restablecer</button>
+        </div>
+      </div>
+      <div className="max-h-[60vh] space-y-4 overflow-y-auto pr-1">
+        {groups.map((group) => (
+          <div key={group}>
+            <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">{group}</p>
+            <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+              {INVOICE_COLUMNS.filter((c) => c.group === group).map((c) => (
+                <label key={c.id} className="flex cursor-pointer items-center justify-between gap-2 rounded-lg border border-slate-100 px-2.5 py-1.5 hover:bg-slate-50">
+                  <span className="text-xs font-medium text-slate-600">{c.label}</span>
+                  <input type="checkbox" checked={selected.includes(c.id)} onChange={() => toggle(c.id)} className="h-4 w-4 shrink-0 accent-blue-600" />
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <button onClick={onClose} className="mt-4 w-full rounded-lg bg-blue-600 py-2 text-xs font-semibold text-white hover:bg-blue-700">
+        Listo
+      </button>
+    </Modal>
+  );
+}
+
+function DetailSection({ title, fields }) {
+  const visible = fields.filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (visible.length === 0) return null;
+  return (
+    <section>
+      <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">{title}</h4>
+      <dl className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
+        {visible.map(([label, value]) => (
+          <div key={label} className="min-w-0">
+            <dt className="text-[11px] text-slate-400">{label}</dt>
+            <dd className="break-words text-xs font-medium text-slate-700">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
+
+function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
+  const { format } = useDateFormat();
+  const c = invoice.cfdi ?? {};
+  const money = (value) => formatMoney(value, c.moneda || currency);
+  const importe = (value) => (value === undefined || value === null ? undefined : money(value));
+  const i = c.importes ?? {};
+  const warnings = cfdiWarnings(invoice.cfdi);
+  const taxText = (tax) =>
+    [tax.tipo, tax.tasa !== undefined ? `${+(Number(tax.tasa) * 100).toFixed(4)}%` : null, tax.importe !== undefined ? money(tax.importe) : null].filter(Boolean).join(" ");
+
+  return (
+    <Modal title="Detalle de la factura" width="max-w-3xl" onClose={onClose}>
+      <div className="max-h-[75vh] space-y-5 overflow-y-auto pr-1">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2.5">
+          <div>
+            <p className="text-lg font-bold text-slate-800">{money(invoice.amount)}</p>
+            <p className="text-xs text-slate-500">
+              {expenseTypeLabel(invoice.expenseType)}
+              {invoice.description ? ` · ${invoice.description}` : ""}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <OriginBadge origin={invoice.origin} />
+            <StatusBadge status={invoice.status} />
+            <DocumentCell documentUrl={invoice.documentUrl} />
+          </div>
+        </div>
+
+        {warnings.length > 0 && (
+          <div className="space-y-1 rounded-xl bg-amber-50 px-3 py-2 text-[11px] font-medium text-amber-700">
+            {warnings.map((w) => (
+              <p key={w} className="flex items-start gap-1.5">
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}
+              </p>
+            ))}
+          </div>
+        )}
+
+        {!invoice.cfdi && (
+          <p className="rounded-xl border border-slate-200 px-3 py-2 text-xs text-slate-500">
+            Esta factura no tiene datos fiscales. Se cargó antes de esta función o a mano. Puedes volver a enviarla al bot o capturarlos con "Editar".
+          </p>
+        )}
+
+        <DetailSection
+          title="Registro"
+          fields={[
+            ["Proyecto", invoice.project],
+            ["Orden de trabajo", invoice.workOrder],
+            ["Proveedor", invoice.vendor],
+            ["Fecha", invoice.date ? formatDate(invoice.date, format) : ""],
+            ["Unidad", invoice.unit && `${invoice.unit}${invoice.plate ? ` — ${invoice.plate}` : ""}`],
+            ["Conductor / Huésped", invoice.driverName],
+            ["Estación de servicio", invoice.station],
+            ["Litros", invoice.module === "fuel" ? `${invoice.liters.toLocaleString()} L` : ""],
+            ["Usuario", invoice.uploadedByName],
+            ["Aprobado por", invoice.approvedByName],
+            ["Notas", invoice.notes],
+          ]}
+        />
+
+        <DetailSection
+          title="Comprobante fiscal"
+          fields={[
+            ["Folio fiscal (UUID)", c.uuid],
+            ["Serie y folio", [c.serie, c.folio || invoice.invoiceFolio].filter(Boolean).join("-")],
+            ["Tipo de comprobante", decodeSat(SAT_TIPO_COMPROBANTE, c.tipoComprobante)],
+            ["Fecha de emisión", c.fechaEmision && String(c.fechaEmision).replace("T", " ")],
+            ["Fecha de certificación", c.fechaCertificacion && String(c.fechaCertificacion).replace("T", " ")],
+            ["Método de pago", decodeSat(SAT_METODO_PAGO, c.metodoPago)],
+            ["Forma de pago", decodeSat(SAT_FORMA_PAGO, c.formaPago)],
+            ["Moneda", c.moneda],
+            ["Tipo de cambio", c.tipoCambio],
+            ["Exportación", c.exportacion],
+            ["Lugar de expedición", c.lugarExpedicion],
+            ["Certificado del emisor", c.certificadoEmisor],
+            ["Certificado del SAT", c.certificadoSAT],
+          ]}
+        />
+
+        <DetailSection
+          title="Emisor"
+          fields={[
+            ["Razón social", c.emisor?.nombre],
+            ["Nombre comercial", c.emisor?.nombreComercial],
+            ["RFC", c.emisor?.rfc],
+            ["Régimen fiscal", decodeSat(SAT_REGIMEN, c.emisor?.regimenFiscal)],
+            ["Domicilio", c.emisor?.domicilio],
+          ]}
+        />
+
+        <DetailSection
+          title="Receptor"
+          fields={[
+            ["Razón social", c.receptor?.nombre],
+            ["RFC", c.receptor?.rfc],
+            ["Uso de CFDI", decodeSat(SAT_USO_CFDI, c.receptor?.usoCFDI)],
+            ["Régimen fiscal", decodeSat(SAT_REGIMEN, c.receptor?.regimenFiscal)],
+            ["Domicilio fiscal", c.receptor?.domicilioFiscal],
+          ]}
+        />
+
+        {c.conceptos?.length > 0 && (
+          <section>
+            <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Partidas</h4>
+            <div className="overflow-x-auto rounded-xl border border-slate-100">
+              <table className="w-full min-w-max text-left text-xs">
+                <thead>
+                  <tr className="border-b border-slate-100 text-[11px] text-slate-400">
+                    {["Cant.", "Unidad", "Clave", "Descripción", "P. unitario", "Importe", "Impuestos"].map((h) => (
+                      <th key={h} className="px-2.5 py-2 font-semibold">
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {c.conceptos.map((line, index) => (
+                    <tr key={index} className="border-b border-slate-50 text-slate-600 last:border-0">
+                      <td className="px-2.5 py-2">{orEmpty(line.cantidad)}</td>
+                      <td className="px-2.5 py-2">{orEmpty(line.unidad)}</td>
+                      <td className="px-2.5 py-2">{orEmpty(line.claveProdServ)}</td>
+                      <td className="px-2.5 py-2 font-medium text-slate-700">{orEmpty(line.descripcion)}</td>
+                      <td className="px-2.5 py-2">{line.valorUnitario !== undefined ? money(line.valorUnitario) : EMPTY_CELL}</td>
+                      <td className="px-2.5 py-2">{line.importe !== undefined ? money(line.importe) : EMPTY_CELL}</td>
+                      <td className="px-2.5 py-2">{line.impuestos?.length ? line.impuestos.map(taxText).join(", ") : EMPTY_CELL}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        <DetailSection
+          title="Importes"
+          fields={[
+            ["Subtotal", importe(i.subtotal)],
+            ["Descuento", importe(i.descuento)],
+            ["IVA", importe(i.iva)],
+            ["IEPS", importe(i.ieps)],
+            ["ISH (hospedaje)", importe(i.ish)],
+            ["Otros impuestos", importe(i.otrosImpuestos)],
+            ["Retención de IVA", importe(i.retencionIVA)],
+            ["Retención de ISR", importe(i.retencionISR)],
+            ["Propina", importe(i.propina)],
+            ["Total", importe(i.total)],
+            ["Total con letra", i.totalConLetra],
+          ]}
+        />
+
+        <DetailSection title="Otros datos" fields={(c.otros ?? []).map((o) => [o.campo, o.valor])} />
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+          Cerrar
+        </button>
+        <button onClick={() => onEdit(invoice)} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
+          Editar / Corregir
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -4044,6 +4594,10 @@ function InvoiceOverview({
   userName,
   isAdmin,
   reminders,
+  columnIds,
+  onOpenColumns,
+  onDetail,
+  onDelete,
   onEditInvoice,
   onConfirmInvoice,
   onApproveInvoice,
@@ -4061,8 +4615,11 @@ function InvoiceOverview({
   const [reminderDraft, setReminderDraft] = useState("");
 
   const tableActions = {
+    columnIds,
     currency,
     isAdmin,
+    onDetail,
+    onDelete,
     onEdit: onEditInvoice,
     onConfirm: onConfirmInvoice,
     onApprove: onApproveInvoice,
@@ -4164,11 +4721,14 @@ function InvoiceOverview({
         <button onClick={() => setExplore(null)} className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700">
           <ArrowLeft size={13} /> Volver al resumen
         </button>
-        <div>
-          <h2 className="text-base font-bold text-slate-900">{title}</h2>
-          <p className="text-xs text-slate-500">
-            {rows.length} registro{rows.length === 1 ? "" : "s"} · {formatCurrency(total, currency)}
-          </p>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-base font-bold text-slate-900">{title}</h2>
+            <p className="text-xs text-slate-500">
+              {rows.length} registro{rows.length === 1 ? "" : "s"} · {formatMoney(total, currency)}
+            </p>
+          </div>
+          <InvoiceColumnsButton onClick={onOpenColumns} />
         </div>
         <InvoiceDesgloseTable rows={rows} emptyLabel="No hay registros con este filtro." {...tableActions} />
       </div>
@@ -4187,7 +4747,7 @@ function InvoiceOverview({
               {latest.map((i) => (
                 <div key={i.key} className="rounded-xl bg-slate-50 px-2.5 py-2">
                   <p className="text-xs font-semibold text-slate-700">
-                    {expenseTypeLabel(i.expenseType)} · {formatCurrency(i.amount, currency)}
+                    {expenseTypeLabel(i.expenseType)} · {formatMoney(i.amount, currency)}
                   </p>
                   <p className="text-[11px] text-slate-400">
                     {i.uploadedByName || "Sin identificar"} · {timeAgoLabel(i.createdAt)}
@@ -4337,14 +4897,17 @@ function InvoiceOverview({
               Lo subido {desgloseWindow} · {settings.concepts.length} de {EXPENSE_TYPES.length} conceptos
             </p>
           </div>
-          <button
-            onClick={() => setSettingsOpen(true)}
-            className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50"
-            aria-label="Configurar desglose"
-            title="Configurar desglose"
-          >
-            <Settings size={14} />
-          </button>
+          <div className="flex items-center gap-2">
+            <InvoiceColumnsButton onClick={onOpenColumns} />
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+              aria-label="Configurar desglose"
+              title="Configurar desglose"
+            >
+              <Settings size={14} />
+            </button>
+          </div>
         </div>
         <InvoiceDesgloseTable rows={desgloseRows} emptyLabel="No hay facturas subidas en este periodo. Ajusta los días o conceptos con la ruedita." {...tableActions} />
       </div>
@@ -4417,8 +4980,6 @@ function InvoiceOverview({
 
 function FuelPage({
   records,
-  travelRecords,
-  miscRecords,
   invoices,
   orders,
   deadlineDays,
@@ -4426,112 +4987,53 @@ function FuelPage({
   isAdmin,
   userName,
   onAddInvoice,
-  onConfirm,
-  onEditClick,
-  onDeleteClick,
-  onConfirmTravel,
-  onEditTravelClick,
-  onDeleteTravelClick,
-  onConfirmMisc,
-  onEditMiscClick,
-  onDeleteMiscClick,
   onEditInvoice,
   onConfirmInvoice,
   onApproveInvoice,
   onRejectInvoice,
+  onDeleteInvoice,
   onSaveDeadlines,
 }) {
-  const { format } = useDateFormat();
   const { profile } = useAuth();
   const currency = profile?.company?.currency || "MXN";
   const fuelWidgets = useMemo(() => getFuelWidgets(records, currency), [records, currency]);
   const [visibleWidgets, setVisibleWidgets] = useState({ totalSpend: true, liters: true, efficiency: true, ocr: true });
   const [widgetModalOpen, setWidgetModalOpen] = useState(false);
   const [invoiceCategory, setInvoiceCategory] = useState("overview");
+  const [columnPrefs, setColumnPrefs] = usePersistentState("navio.invoices.columns.v1", {});
+  const [columnPickerView, setColumnPickerView] = useState(null);
+  const [detailKey, setDetailKey] = useState(null);
+  const detailInvoice = invoices.find((i) => i.key === detailKey) ?? null;
 
   function toggleWidget(id) {
     setVisibleWidgets((prev) => ({ ...prev, [id]: !prev[id] }));
   }
 
-  // Columnas que se repiten en las tablas de cada concepto.
-  const projectColumns = [
-    { key: "project", label: "Proyecto", render: (r) => r.project || "—" },
-    { key: "workOrder", label: "Orden de trabajo", render: (r) => r.workOrder || "—" },
-  ];
-  const typeColumn = (module) => ({
-    key: "expenseType",
-    label: "Concepto",
-    render: (r) => expenseTypeLabel(expenseTypeOf(module, r)),
-  });
+  const columnsFor = (view) => columnPrefs[view] ?? DEFAULT_INVOICE_COLUMNS[view];
+  const handleDetail = (inv) => setDetailKey(inv.key);
+  const tableProps = {
+    currency,
+    isAdmin,
+    onDetail: handleDetail,
+    onDelete: onDeleteInvoice,
+    onEdit: onEditInvoice,
+    onConfirm: onConfirmInvoice,
+    onApprove: onApproveInvoice,
+    onReject: onRejectInvoice,
+  };
 
-  const columns = [
-    {
-      key: "unit",
-      label: "Unidad / Matrícula",
-      render: (r) => (
-        <div>
-          <p className="font-semibold text-slate-700">{r.unit || "Sin unidad asociada"}</p>
-          <p className="text-[11px] text-slate-400">{r.plate}</p>
-        </div>
-      ),
-    },
-    { key: "station", label: "Estación de Servicio", render: (r) => <span className="text-slate-600">{r.station}</span> },
-    { key: "liters", label: "Litros", render: (r) => `${r.liters.toLocaleString()} L` },
-    { key: "amount", label: "Monto", render: (r) => formatCurrency(r.amount, currency) },
-    { key: "odometer", label: "Odómetro", render: (r) => `${r.odometer.toLocaleString()} km` },
-    { key: "efficiency", label: "Rendimiento", render: (r) => (r.efficiency ? `${r.efficiency} km/L` : "—") },
-    { key: "date", label: "Fecha", render: (r) => formatDate(r.date, format) },
-    ...projectColumns,
-    { key: "document", label: "Documento", render: (r) => <DocumentCell documentUrl={r.documentUrl} /> },
-    { key: "origin", label: "Origen", render: (r) => <OriginBadge origin={r.origin} /> },
-    { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
-  ];
-
-  const travelColumns = [
-    {
-      key: "unit",
-      label: "Unidad / Conductor",
-      render: (r) => (
-        <div>
-          <p className="font-semibold text-slate-700">{r.unit || "Sin unidad asociada"}</p>
-          <p className="text-[11px] text-slate-400">{r.driverName || "—"}</p>
-        </div>
-      ),
-    },
-    typeColumn("travel"),
-    { key: "concept", label: "Descripción", render: (r) => <span className="text-slate-600">{r.concept}</span> },
-    { key: "amount", label: "Monto", render: (r) => formatCurrency(r.amount, currency) },
-    { key: "vendor", label: "Proveedor", render: (r) => r.vendor || "—" },
-    { key: "date", label: "Fecha", render: (r) => formatDate(r.date, format) },
-    ...projectColumns,
-    { key: "document", label: "Documento", render: (r) => <DocumentCell documentUrl={r.documentUrl} /> },
-    { key: "origin", label: "Origen", render: (r) => <OriginBadge origin={r.origin} /> },
-    { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
-  ];
-
-  const miscColumns = [
-    {
-      key: "unit",
-      label: "Unidad / Matrícula",
-      render: (r) => (
-        <div>
-          <p className="font-semibold text-slate-700">{r.unit || "Sin unidad asociada"}</p>
-          <p className="text-[11px] text-slate-400">{r.plate}</p>
-        </div>
-      ),
-    },
-    typeColumn("misc"),
-    { key: "concept", label: "Descripción", render: (r) => <span className="text-slate-600">{r.concept}</span> },
-    { key: "amount", label: "Monto", render: (r) => formatCurrency(r.amount, currency) },
-    { key: "vendor", label: "Proveedor", render: (r) => r.vendor || "—" },
-    { key: "date", label: "Fecha", render: (r) => formatDate(r.date, format) },
-    ...projectColumns,
-    { key: "document", label: "Documento", render: (r) => <DocumentCell documentUrl={r.documentUrl} /> },
-    { key: "origin", label: "Origen", render: (r) => <OriginBadge origin={r.origin} /> },
-    { key: "status", label: "Estado del Dato", render: (r) => <StatusBadge status={r.status} /> },
-  ];
-
-  const miscRecordsForCategory = miscRecords.filter((r) => r.category === invoiceCategory);
+  // Cada pestaña de concepto es una vista filtrada de las mismas facturas.
+  const view = invoiceCategory === "overview" || invoiceCategory === "fuel" || invoiceCategory === "travel" ? invoiceCategory : "misc";
+  const categoryRows =
+    view === "misc"
+      ? invoices.filter((i) => i.module === "misc" && i.raw.category === invoiceCategory)
+      : invoices.filter((i) => i.module === view);
+  const emptyLabel =
+    view === "fuel"
+      ? "Sin cargas de combustible registradas."
+      : view === "travel"
+      ? "Sin viáticos registrados todavía."
+      : `Sin registros de ${INVOICE_CATEGORIES.find((c) => c.id === invoiceCategory)?.label.toLowerCase()} todavía.`;
 
   return (
     <div className="space-y-5">
@@ -4566,7 +5068,7 @@ function FuelPage({
         ))}
       </div>
 
-      {invoiceCategory === "overview" ? (
+      {view === "overview" ? (
         <InvoiceOverview
           invoices={invoices}
           orders={orders}
@@ -4575,63 +5077,46 @@ function FuelPage({
           userName={userName}
           isAdmin={isAdmin}
           reminders={reminders}
+          columnIds={columnsFor("overview")}
+          onOpenColumns={() => setColumnPickerView("overview")}
+          onDetail={handleDetail}
+          onDelete={onDeleteInvoice}
           onEditInvoice={onEditInvoice}
           onConfirmInvoice={onConfirmInvoice}
           onApproveInvoice={onApproveInvoice}
           onRejectInvoice={onRejectInvoice}
           onSaveDeadlines={onSaveDeadlines}
         />
-      ) : invoiceCategory === "fuel" ? (
-        <>
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-sm font-bold text-slate-800">Resumen del mes — Consumo de Combustible</h2>
-              <button
-                onClick={() => setWidgetModalOpen(true)}
-                className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-              >
-                <Settings size={13} /> Personalizar Widgets
-              </button>
-            </div>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              {fuelWidgets.filter((w) => visibleWidgets[w.id]).map((w) => (
-                <KpiCard key={w.id} widget={w} />
-              ))}
-              {fuelWidgets.every((w) => !visibleWidgets[w.id]) && (
-                <p className="col-span-full py-4 text-center text-xs text-slate-400">
-                  No hay widgets visibles. Actívalos desde "Personalizar Widgets".
-                </p>
-              )}
-            </div>
-          </div>
-
-          <RecordsTable
-            records={records}
-            columns={columns}
-            onConfirm={onConfirm}
-            onEdit={onEditClick}
-            onDelete={onDeleteClick}
-            emptyLabel="Sin cargas de combustible registradas."
-          />
-        </>
-      ) : invoiceCategory === "travel" ? (
-        <RecordsTable
-          records={travelRecords}
-          columns={travelColumns}
-          onConfirm={onConfirmTravel}
-          onEdit={onEditTravelClick}
-          onDelete={onDeleteTravelClick}
-          emptyLabel="Sin viáticos registrados todavía."
-        />
       ) : (
-        <RecordsTable
-          records={miscRecordsForCategory}
-          columns={miscColumns}
-          onConfirm={onConfirmMisc}
-          onEdit={onEditMiscClick}
-          onDelete={onDeleteMiscClick}
-          emptyLabel={`Sin registros de ${INVOICE_CATEGORIES.find((c) => c.id === invoiceCategory)?.label.toLowerCase()} todavía.`}
-        />
+        <>
+          {view === "fuel" && (
+            <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+              <div className="mb-3 flex items-center justify-between">
+                <h2 className="text-sm font-bold text-slate-800">Resumen del mes — Consumo de Combustible</h2>
+                <button
+                  onClick={() => setWidgetModalOpen(true)}
+                  className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                >
+                  <Settings size={13} /> Personalizar Widgets
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {fuelWidgets.filter((w) => visibleWidgets[w.id]).map((w) => (
+                  <KpiCard key={w.id} widget={w} />
+                ))}
+                {fuelWidgets.every((w) => !visibleWidgets[w.id]) && (
+                  <p className="col-span-full py-4 text-center text-xs text-slate-400">
+                    No hay widgets visibles. Actívalos desde "Personalizar Widgets".
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+          <div className="flex justify-end">
+            <InvoiceColumnsButton onClick={() => setColumnPickerView(view)} />
+          </div>
+          <InvoiceDesgloseTable rows={categoryRows} columnIds={columnsFor(view)} emptyLabel={emptyLabel} {...tableProps} />
+        </>
       )}
 
       {widgetModalOpen && (
@@ -4640,6 +5125,25 @@ function FuelPage({
           visible={visibleWidgets}
           onToggle={toggleWidget}
           onClose={() => setWidgetModalOpen(false)}
+        />
+      )}
+      {columnPickerView && (
+        <ColumnPickerModal
+          selected={columnsFor(columnPickerView)}
+          defaults={DEFAULT_INVOICE_COLUMNS[columnPickerView]}
+          onChange={(ids) => setColumnPrefs((prev) => ({ ...prev, [columnPickerView]: ids }))}
+          onClose={() => setColumnPickerView(null)}
+        />
+      )}
+      {detailInvoice && (
+        <InvoiceDetailModal
+          invoice={detailInvoice}
+          currency={currency}
+          onEdit={(inv) => {
+            setDetailKey(null);
+            onEditInvoice(inv);
+          }}
+          onClose={() => setDetailKey(null)}
         />
       )}
     </div>
@@ -8247,8 +8751,6 @@ function NavioApp() {
                   {activeTab === "fuel" && (
                     <FuelPage
                       records={fuelRecords}
-                      travelRecords={travelExpenses}
-                      miscRecords={miscExpenses}
                       invoices={invoices}
                       orders={invoiceOrders}
                       deadlineDays={deadlineDays}
@@ -8256,19 +8758,11 @@ function NavioApp() {
                       isAdmin={isCompanyAdmin}
                       userName={currentUserName}
                       onAddInvoice={handleAddInvoice}
-                      onConfirm={(r) => handleConfirmRecord("fuel", r)}
-                      onEditClick={(r) => setFormModal({ mode: "edit", module: "fuel", initial: r })}
-                      onDeleteClick={(r) => setDeleteRecordTarget({ module: "fuel", record: r })}
-                      onConfirmTravel={(r) => handleConfirmRecord("travel", r)}
-                      onEditTravelClick={(r) => setFormModal({ mode: "edit", module: "travel", initial: r })}
-                      onDeleteTravelClick={(r) => setDeleteRecordTarget({ module: "travel", record: r })}
-                      onConfirmMisc={(r) => handleConfirmRecord("misc", r)}
-                      onEditMiscClick={(r) => setFormModal({ mode: "edit", module: "misc", category: r.category, initial: r })}
-                      onDeleteMiscClick={(r) => setDeleteRecordTarget({ module: "misc", record: r })}
                       onEditInvoice={handleEditInvoice}
                       onConfirmInvoice={handleConfirmInvoice}
                       onApproveInvoice={handleApproveInvoice}
                       onRejectInvoice={handleRejectInvoice}
+                      onDeleteInvoice={(inv) => setDeleteRecordTarget({ module: inv.module, record: inv.raw })}
                       onSaveDeadlines={handleSaveDeadlines}
                     />
                   )}
@@ -8356,7 +8850,9 @@ function NavioApp() {
           {deleteRecordTarget && (
             <ConfirmModal
               title="Eliminar registro"
-              message={`¿Eliminar "${deleteRecordTarget.record.concept || deleteRecordTarget.record.unit}" (${deleteRecordTarget.record.unit})? Esta acción no se puede deshacer.`}
+              message={`¿Eliminar "${
+                deleteRecordTarget.record.concept || deleteRecordTarget.record.station || deleteRecordTarget.record.vendor || "este registro"
+              }"${deleteRecordTarget.record.unit ? ` (${deleteRecordTarget.record.unit})` : ""}? Esta acción no se puede deshacer.`}
               confirmLabel="Eliminar"
               danger
               onConfirm={handleDeleteRecord}
