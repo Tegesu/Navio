@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback, useContext, useRef, createContext } from "react";
+import React, { useState, useMemo, useEffect, useLayoutEffect, useCallback, useContext, useRef, createContext } from "react";
 import { createClient } from "@supabase/supabase-js";
 import {
   Home,
@@ -57,6 +57,9 @@ import {
   ShieldAlert,
   ZoomIn,
   ZoomOut,
+  Highlighter,
+  Underline,
+  Eraser,
 } from "lucide-react";
 
 /* ---------------------------------------------------------------------- */
@@ -1821,15 +1824,14 @@ function loadPdfJs() {
   return pdfJsPromise;
 }
 
-// Ajusta el canvas al ancho disponible y devuelve la escala a la que hay que dibujar.
+// Da al canvas la resolución que pide el zoom y devuelve la escala a la que hay
+// que dibujar. Su tamaño en pantalla lo decide el contenedor de la página.
 function fitCanvas(canvas, natural, width, zoom) {
   const cssScale = (width / natural.width) * zoom;
   const maxScale = Math.sqrt(MAX_CANVAS_PIXELS / (natural.width * natural.height));
   const scale = Math.min(cssScale * Math.min(window.devicePixelRatio || 1, 2), maxScale);
   canvas.width = Math.floor(natural.width * scale);
   canvas.height = Math.floor(natural.height * scale);
-  canvas.style.width = `${natural.width * cssScale}px`;
-  canvas.style.height = `${natural.height * cssScale}px`;
   return scale;
 }
 
@@ -1857,12 +1859,14 @@ async function openPdfDocument(blob) {
     draw(canvas, { page, rotation, width, zoom }) {
       let renderTask = null;
       let cancelled = false;
-      const promise = pdf.getPage(page).then((pdfPage) => {
-        if (cancelled) return undefined;
+      const promise = pdf.getPage(page).then(async (pdfPage) => {
+        if (cancelled) return null;
         const angle = (pdfPage.rotate + rotation) % 360;
-        const scale = fitCanvas(canvas, pdfPage.getViewport({ scale: 1, rotation: angle }), width, zoom);
+        const natural = pdfPage.getViewport({ scale: 1, rotation: angle });
+        const scale = fitCanvas(canvas, natural, width, zoom);
         renderTask = pdfPage.render({ canvas, viewport: pdfPage.getViewport({ scale, rotation: angle }) });
-        return renderTask.promise;
+        await renderTask.promise;
+        return natural;
       });
       return {
         promise,
@@ -1893,7 +1897,7 @@ async function openImageDocument(blob, mime) {
       ctx.rotate((rotation * Math.PI) / 180);
       ctx.scale(scale, scale);
       ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
-      return { promise: Promise.resolve(), cancel() {} };
+      return { promise: Promise.resolve(natural), cancel() {} };
     },
     close: () => bitmap.close(),
   };
@@ -1906,22 +1910,150 @@ async function openDocument(blob) {
   return { ...opened, mime };
 }
 
-function DocumentPreview({ path, file }) {
+// Las marcas viven en su propia tabla y se dibujan encima de la página: el
+// archivo nunca cambia, así que no hay copias y al descargar sale el original.
+// Se guardan en fracciones (0 a 1) de la página sin girar para que no dependan
+// del zoom ni del giro. La migración v15 aplica estos permisos en la base de datos.
+const MARK_LABELS = { highlight: "Resaltado", underline: "Subrayado" };
+const MARK_UNDERLINE_SIDES = { 0: "border-b-2", 90: "border-l-2", 180: "border-t-2", 270: "border-r-2" };
+
+function rotateMark({ x, y, w, h }, rotation) {
+  if (rotation === 90) return { x: 1 - y - h, y: x, w: h, h: w };
+  if (rotation === 180) return { x: 1 - x - w, y: 1 - y - h, w, h };
+  if (rotation === 270) return { x: y, y: 1 - x - w, w: h, h: w };
+  return { x, y, w, h };
+}
+
+function canMarkInvoice(invoice, isAdmin) {
+  return !isInvoiceClosed(invoice) && (isAdmin || (invoice.status || "pending") === "pending");
+}
+
+function useInvoiceMarks(invoice, documentUrl) {
+  const { showToast } = useToast();
+  const [marks, setMarks] = useState([]);
+  const table = invoice ? INVOICE_TABLE_BY_MODULE[invoice.module] : null;
+  const invoiceId = invoice?.id;
+
+  useEffect(() => {
+    setMarks([]);
+    if (!table || !documentUrl) return undefined;
+    let cancelled = false;
+    supabase
+      .from("invoice_marks")
+      .select("*")
+      .eq("invoiceTable", table)
+      .eq("invoiceId", invoiceId)
+      .eq("documentUrl", documentUrl)
+      .order("createdAt", { ascending: true })
+      .then(({ data }) => {
+        if (!cancelled) setMarks(data ?? []);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [table, invoiceId, documentUrl]);
+
+  async function addMark(mark) {
+    const tempId = `nueva-${crypto.randomUUID()}`;
+    setMarks((prev) => [...prev, { ...mark, id: tempId }]);
+    const { data, error } = await supabase
+      .from("invoice_marks")
+      .insert({ invoiceTable: table, invoiceId, documentUrl, ...mark })
+      .select()
+      .single();
+    setMarks((prev) => (error ? prev.filter((m) => m.id !== tempId) : prev.map((m) => (m.id === tempId ? data : m))));
+    if (error) showToast(`No se pudo guardar la marca: ${error.message}`);
+  }
+
+  async function removeMark(id) {
+    const { data, error } = await supabase.from("invoice_marks").delete().eq("id", id).select();
+    if (error || !data?.length) {
+      showToast(`No se pudo borrar la marca${error ? `: ${error.message}` : "."}`);
+      return;
+    }
+    setMarks((prev) => prev.filter((m) => m.id !== id));
+  }
+
+  return { marks, addMark, removeMark };
+}
+
+function MarkBox({ mark, rotation, onErase }) {
+  const box = rotateMark(mark, rotation);
+  const look = mark.kind === "highlight" ? "bg-yellow-300/60 mix-blend-multiply" : `border-rose-600 ${MARK_UNDERLINE_SIDES[rotation]}`;
+  return (
+    <div
+      title={mark.createdByName ? `${MARK_LABELS[mark.kind]} por ${mark.createdByName}` : MARK_LABELS[mark.kind]}
+      onClick={onErase}
+      className={`absolute ${look} ${onErase ? "cursor-pointer hover:ring-2 hover:ring-rose-500" : ""}`}
+      style={{ left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.w * 100}%`, height: `${box.h * 100}%` }}
+    >
+      {onErase && <span className="absolute -inset-1.5" />}
+    </div>
+  );
+}
+
+const clampZoom = (zoom) => Math.min(4, Math.max(0.5, zoom));
+const roundMark = (value) => Math.min(1, Math.max(0, Number(value.toFixed(5))));
+
+function DocumentPreview({ path, file, invoice }) {
+  const { user, profile } = useAuth();
+  const isAdmin = !!(profile?.isSuperAdmin || profile?.companyRole === "admin");
+  const { marks, addMark, removeMark } = useInvoiceMarks(file ? null : invoice, file ? null : path);
+  const canMark = !file && !!invoice && canMarkInvoice(invoice, isAdmin);
   const [state, setState] = useState({ status: "loading" });
   const [attempt, setAttempt] = useState(0);
   const [page, setPage] = useState(1);
   const [zoom, setZoom] = useState(1);
   const [rotation, setRotation] = useState(0);
   const [width, setWidth] = useState(0);
+  // Lo que ya está pintado: las marcas siguen al canvas, no a los botones.
+  const [drawn, setDrawn] = useState(null);
+  const [tool, setTool] = useState(null);
+  const [drag, setDrag] = useState(null);
+  const viewerRef = useRef(null);
   const boxRef = useRef(null);
   const pageRef = useRef(null);
+  const overlayRef = useRef(null);
+  const zoomRef = useRef(1);
+  const zoomAnchorRef = useRef(null);
   const source = state.source;
+  zoomRef.current = zoom;
 
   useEffect(() => {
     const observer = new ResizeObserver(([entry]) => setWidth(Math.floor(entry.contentRect.width)));
     observer.observe(boxRef.current);
     return () => observer.disconnect();
   }, []);
+
+  // Ctrl + rueda acerca el documento, no la página. React registra sus eventos
+  // de rueda como pasivos, y esos no pueden impedir el zoom del navegador.
+  useEffect(() => {
+    if (!source) return undefined;
+    const viewer = viewerRef.current;
+    function handleWheel(e) {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      const delta = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+      const next = clampZoom(zoomRef.current * Math.exp(-delta * 0.002));
+      if (next === zoomRef.current) return;
+      const box = boxRef.current.getBoundingClientRect();
+      zoomAnchorRef.current = { ratio: next / zoomRef.current, x: e.clientX - box.left, y: e.clientY - box.top };
+      zoomRef.current = next;
+      setZoom(next);
+    }
+    viewer.addEventListener("wheel", handleWheel, { passive: false });
+    return () => viewer.removeEventListener("wheel", handleWheel);
+  }, [source]);
+
+  // Mantiene bajo el puntero el mismo punto del documento al acercar con la rueda.
+  useLayoutEffect(() => {
+    const anchor = zoomAnchorRef.current;
+    if (!anchor) return;
+    zoomAnchorRef.current = null;
+    const box = boxRef.current;
+    box.scrollLeft = (box.scrollLeft + anchor.x) * anchor.ratio - anchor.x;
+    box.scrollTop = (box.scrollTop + anchor.y) * anchor.ratio - anchor.y;
+  }, [zoom]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1930,6 +2062,9 @@ function DocumentPreview({ path, file }) {
     setPage(1);
     setZoom(1);
     setRotation(0);
+    setDrawn(null);
+    setTool(null);
+    setDrag(null);
     pageRef.current?.replaceChildren();
     (async () => {
       try {
@@ -1961,15 +2096,20 @@ function DocumentPreview({ path, file }) {
   useEffect(() => {
     if (!source || !width) return undefined;
     const canvas = document.createElement("canvas");
-    canvas.className = "mx-auto block bg-white shadow";
+    canvas.className = "block h-full w-full";
     let cancelled = false;
     const task = source.draw(canvas, { page, rotation, width, zoom });
     task.promise
-      .then(() => {
-        if (!cancelled) pageRef.current?.replaceChildren(canvas);
+      .then((natural) => {
+        if (cancelled || !natural) return;
+        pageRef.current?.replaceChildren(canvas);
+        setDrawn({ page, rotation, aspect: natural.height / natural.width });
       })
       .catch(() => {
-        if (!cancelled) setState({ status: "blocked", message: "Este documento está dañado, así que no se puede mostrar." });
+        if (cancelled) return;
+        pageRef.current?.replaceChildren();
+        setDrawn(null);
+        setState({ status: "blocked", message: "Este documento está dañado, así que no se puede mostrar." });
       });
     return () => {
       cancelled = true;
@@ -1986,21 +2126,55 @@ function DocumentPreview({ path, file }) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
+  function pointerPosition(e) {
+    const box = overlayRef.current.getBoundingClientRect();
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - box.left) / box.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - box.top) / box.height)),
+    };
+  }
+
+  // Pasa lo que se arrastró en pantalla a la página sin girar.
+  function dragToMark({ start, end }) {
+    const onScreen = { x: Math.min(start.x, end.x), y: Math.min(start.y, end.y), w: Math.abs(end.x - start.x), h: Math.abs(end.y - start.y) };
+    return rotateMark(onScreen, (360 - drawn.rotation) % 360);
+  }
+
+  function handlePointerDown(e) {
+    if (tool !== "highlight" && tool !== "underline") return;
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const position = pointerPosition(e);
+    setDrag({ start: position, end: position });
+  }
+
+  function handlePointerUp() {
+    if (!drag) return;
+    const mark = dragToMark(drag);
+    setDrag(null);
+    // Un clic suelto no deja marca; un subrayado sí puede no tener alto.
+    if (Math.max(mark.w, mark.h) < 0.01 || (tool === "highlight" && Math.min(mark.w, mark.h) < 0.005)) return;
+    addMark({ page: drawn.page, kind: tool, x: roundMark(mark.x), y: roundMark(mark.y), w: roundMark(mark.w), h: roundMark(mark.h) });
+  }
+
   const toolClass = "flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 hover:bg-white disabled:opacity-40";
+  const activeToolClass = "flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600 text-white";
   const ready = state.status === "ready";
+  const canErase = (mark) => canMark && typeof mark.id === "number" && (isAdmin || mark.createdBy === user?.id);
+  const markedPages = [...new Set(marks.map((m) => m.page))].sort((a, b) => a - b);
 
   return (
-    <div className="flex h-full flex-col overflow-hidden whitespace-normal rounded-xl border border-slate-200 bg-slate-100">
+    <div ref={viewerRef} className="flex h-full flex-col overflow-hidden whitespace-normal rounded-xl border border-slate-200 bg-slate-100">
       <div className="flex min-h-[2.5rem] shrink-0 flex-wrap items-center gap-1 border-b border-slate-200 px-2 py-1">
         {ready && (
           <>
-            <button type="button" onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))} disabled={zoom <= 0.5} className={toolClass} aria-label="Alejar" title="Alejar">
+            <button type="button" onClick={() => setZoom((z) => clampZoom(z - 0.25))} disabled={zoom <= 0.5} className={toolClass} aria-label="Alejar" title="Alejar (o Ctrl + rueda del ratón)">
               <ZoomOut size={14} />
             </button>
             <button type="button" onClick={() => setZoom(1)} className="w-11 rounded-lg py-1 text-[11px] font-semibold text-slate-500 hover:bg-white" title="Ajustar al ancho">
               {Math.round(zoom * 100)}%
             </button>
-            <button type="button" onClick={() => setZoom((z) => Math.min(4, z + 0.25))} disabled={zoom >= 4} className={toolClass} aria-label="Acercar" title="Acercar">
+            <button type="button" onClick={() => setZoom((z) => clampZoom(z + 0.25))} disabled={zoom >= 4} className={toolClass} aria-label="Acercar" title="Acercar (o Ctrl + rueda del ratón)">
               <ZoomIn size={14} />
             </button>
             <button type="button" onClick={() => setRotation((r) => (r + 90) % 360)} className={toolClass} aria-label="Girar" title="Girar">
@@ -2019,8 +2193,21 @@ function DocumentPreview({ path, file }) {
                 </button>
               </div>
             )}
+            {canMark && (
+              <div className="flex items-center gap-1 border-l border-slate-200 pl-1">
+                <button type="button" onClick={() => setTool((t) => (t === "highlight" ? null : "highlight"))} className={tool === "highlight" ? activeToolClass : toolClass} aria-label="Resaltar" aria-pressed={tool === "highlight"} title="Resaltar: arrastra sobre el documento">
+                  <Highlighter size={14} />
+                </button>
+                <button type="button" onClick={() => setTool((t) => (t === "underline" ? null : "underline"))} className={tool === "underline" ? activeToolClass : toolClass} aria-label="Subrayar" aria-pressed={tool === "underline"} title="Subrayar: arrastra sobre el documento">
+                  <Underline size={14} />
+                </button>
+                <button type="button" onClick={() => setTool((t) => (t === "erase" ? null : "erase"))} disabled={!marks.some(canErase)} className={tool === "erase" ? activeToolClass : toolClass} aria-label="Borrar marca" aria-pressed={tool === "erase"} title="Borrar marca: haz clic sobre ella">
+                  <Eraser size={14} />
+                </button>
+              </div>
+            )}
             {!file && (
-              <button type="button" onClick={handleDownload} className={`${toolClass} ml-auto`} aria-label="Descargar" title="Descargar">
+              <button type="button" onClick={handleDownload} className={`${toolClass} ml-auto`} aria-label="Descargar" title="Descargar el archivo original, sin marcas">
                 <Download size={14} />
               </button>
             )}
@@ -2028,7 +2215,29 @@ function DocumentPreview({ path, file }) {
         )}
       </div>
       <div ref={boxRef} className="relative min-h-0 flex-1 overflow-auto p-2 [scrollbar-gutter:stable]">
-        <div ref={pageRef} />
+        <div
+          className={`relative mx-auto ${drawn ? "bg-white shadow" : ""}`}
+          style={drawn ? { width: width * zoom, height: width * zoom * drawn.aspect } : undefined}
+        >
+          <div ref={pageRef} className="h-full w-full" />
+          {drawn && (
+            <div
+              ref={overlayRef}
+              onPointerDown={handlePointerDown}
+              onPointerMove={(e) => drag && setDrag({ ...drag, end: pointerPosition(e) })}
+              onPointerUp={handlePointerUp}
+              onPointerCancel={() => setDrag(null)}
+              className={`absolute inset-0 ${tool === "highlight" || tool === "underline" ? "cursor-crosshair touch-none" : ""}`}
+            >
+              {marks
+                .filter((mark) => mark.page === drawn.page)
+                .map((mark) => (
+                  <MarkBox key={mark.id} mark={mark} rotation={drawn.rotation} onErase={tool === "erase" && canErase(mark) ? () => removeMark(mark.id) : undefined} />
+                ))}
+              {drag && <MarkBox mark={{ ...dragToMark(drag), kind: tool }} rotation={drawn.rotation} />}
+            </div>
+          )}
+        </div>
         {state.status === "loading" && (
           <div className="absolute inset-0 flex items-center justify-center text-xs font-medium text-slate-400">Cargando documento...</div>
         )}
@@ -2050,20 +2259,24 @@ function DocumentPreview({ path, file }) {
       </div>
       <p className="flex shrink-0 items-center gap-1.5 border-t border-slate-200 px-3 py-1.5 text-[11px] text-slate-500">
         <ShieldCheck size={12} className="shrink-0" />
-        {file ? "Archivo nuevo, todavía sin guardar." : "Vista segura: nada de lo que contenga el archivo se ejecuta."}
+        {file
+          ? "Archivo nuevo, todavía sin guardar."
+          : marks.length > 0
+          ? `${marks.length === 1 ? "1 marca" : `${marks.length} marcas`} (pág. ${markedPages.join(", ")}). No modifican el archivo ni salen al descargar.`
+          : "Vista segura: nada de lo que contenga el archivo se ejecuta."}
       </p>
     </div>
   );
 }
 
 // Pone el documento a un lado del contenido (arriba en pantallas chicas).
-function DocumentSplit({ path, file, children }) {
+function DocumentSplit({ path, file, invoice, children }) {
   const hasDocument = !!(path || file);
   return (
     <div className={hasDocument ? "flex max-h-[72vh] flex-col gap-4 overflow-y-auto lg:max-h-none lg:flex-row lg:overflow-visible" : ""}>
       {hasDocument && (
         <div className="h-[45vh] shrink-0 lg:h-[76vh] lg:w-1/2">
-          <DocumentPreview path={path} file={file} />
+          <DocumentPreview path={path} file={file} invoice={invoice} />
         </div>
       )}
       <div className={hasDocument ? "min-w-0 pr-1 lg:max-h-[76vh] lg:flex-1 lg:overflow-y-auto" : "max-h-[70vh] overflow-y-auto pr-1"}>{children}</div>
@@ -2071,7 +2284,7 @@ function DocumentSplit({ path, file, children }) {
   );
 }
 
-function DocumentCell({ documentUrl }) {
+function DocumentCell({ documentUrl, invoice }) {
   const [open, setOpen] = useState(false);
 
   if (!documentUrl) return <span className="text-[11px] text-slate-300">Sin documento</span>;
@@ -2087,7 +2300,7 @@ function DocumentCell({ documentUrl }) {
       {open && (
         <Modal title="Documento" width="max-w-4xl" onClose={() => setOpen(false)}>
           <div className="h-[76vh]">
-            <DocumentPreview path={documentUrl} />
+            <DocumentPreview path={documentUrl} invoice={invoice} />
           </div>
         </Modal>
       )}
@@ -2606,7 +2819,7 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
       width={file || initial?.documentUrl ? "max-w-6xl" : "max-w-lg"}
       onClose={onClose}
     >
-      <DocumentSplit path={initial?.documentUrl} file={file}>
+      <DocumentSplit path={initial?.documentUrl} file={file} invoice={isInvoiceFlow && initial ? { ...initial, module } : null}>
       <form onSubmit={handleSubmit} className="space-y-3">
         {!fixedModule && (
           <div>
@@ -4435,7 +4648,7 @@ const INVOICE_COLUMNS = [
       return <span title={reason}>{orEmpty(reason)}</span>;
     },
   },
-  { id: "document", label: "Documento", group: "General", render: (inv) => <DocumentCell documentUrl={inv.documentUrl} /> },
+  { id: "document", label: "Documento", group: "General", render: (inv) => <DocumentCell documentUrl={inv.documentUrl} invoice={inv} /> },
 ];
 
 const DEFAULT_INVOICE_COLUMNS = {
@@ -4608,7 +4821,7 @@ function InvoiceDecisionModal({ decision, currency, onSubmit, onClose }) {
 
   return (
     <Modal title={meta.title} width={inv.documentUrl ? "max-w-5xl" : "max-w-md"} onClose={onClose}>
-      <DocumentSplit path={inv.documentUrl}>
+      <DocumentSplit path={inv.documentUrl} invoice={inv}>
       <p className="text-xs text-slate-600">
         ¿{meta.verb} "{inv.description || expenseTypeLabel(inv.expenseType)}" por {formatMoney(inv.amount, inv.cfdi?.moneda || currency)}?
       </p>
@@ -4684,6 +4897,8 @@ function invoiceEventChanges(changes) {
   });
 }
 
+const DETAIL_SECTION_TITLE = "mb-2 rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-white";
+
 function InvoiceHistory({ invoice }) {
   const [events, setEvents] = useState(null);
 
@@ -4705,7 +4920,7 @@ function InvoiceHistory({ invoice }) {
 
   return (
     <section>
-      <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Historial</h4>
+      <h4 className={DETAIL_SECTION_TITLE}>Historial</h4>
       {events === null && <p className="text-xs text-slate-400">Cargando...</p>}
       {events?.length === 0 && <p className="text-xs text-slate-400">Sin movimientos registrados. El historial empieza con los cambios a partir de ahora.</p>}
       {events?.length > 0 && (
@@ -4782,7 +4997,7 @@ function DetailSection({ title, fields }) {
   if (visible.length === 0) return null;
   return (
     <section>
-      <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">{title}</h4>
+      <h4 className={DETAIL_SECTION_TITLE}>{title}</h4>
       <dl className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
         {visible.map(([label, value]) => (
           <div key={label} className="min-w-0">
@@ -4807,7 +5022,7 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
 
   return (
     <Modal title="Detalle de la factura" width={invoice.documentUrl ? "max-w-7xl" : "max-w-3xl"} onClose={onClose}>
-      <DocumentSplit path={invoice.documentUrl}>
+      <DocumentSplit path={invoice.documentUrl} invoice={invoice}>
       <div className="space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2.5">
           <div>
@@ -4913,7 +5128,7 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
 
         {c.conceptos?.length > 0 && (
           <section>
-            <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Partidas</h4>
+            <h4 className={DETAIL_SECTION_TITLE}>Partidas</h4>
             <div className="overflow-x-auto rounded-xl border border-slate-100">
               <table className="w-full min-w-max text-left text-xs">
                 <thead>
