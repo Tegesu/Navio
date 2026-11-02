@@ -98,6 +98,9 @@ import {
   Highlighter,
   Underline,
   Eraser,
+  Hash,
+  BarChart3,
+  Printer,
 } from "lucide-react";
 
 /* ---------------------------------------------------------------------- */
@@ -1694,19 +1697,21 @@ function StatusBadge({ status }) {
   );
 }
 
-function KpiCard({ widget }) {
+function KpiCard({ widget, action = null }) {
   const Icon = widget.icon;
   return (
-    <div className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <span className={`flex h-9 w-9 items-center justify-center rounded-lg ${TONE_CLASSES[widget.tone]}`}>
-        <Icon size={16} />
-      </span>
+    <div className="min-w-0 break-inside-avoid rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex items-start justify-between gap-2">
+        <span className={`flex h-9 w-9 items-center justify-center rounded-lg ${TONE_CLASSES[widget.tone]}`}>
+          <Icon size={16} />
+        </span>
+        {action}
+      </div>
       <p className="mt-3 text-xs font-medium text-slate-500">{widget.label}</p>
       <p className="truncate text-lg font-bold text-slate-800" title={String(widget.value)}>
         {widget.value}
       </p>
       <p className="text-[11px] text-slate-400">{widget.detail}</p>
-      {widget.trend && <SparkBars values={widget.trend} barClass={widget.trendClass} />}
     </div>
   );
 }
@@ -4987,7 +4992,7 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
   );
 }
 
-function InvoiceTableTools({ showVoided, voidedCount, onToggleVoided, onOpenColumns }) {
+function InvoiceTableTools({ showVoided, voidedCount, onToggleVoided, onOpenColumns, onExport }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
       {voidedCount > 0 && (
@@ -4996,6 +5001,12 @@ function InvoiceTableTools({ showVoided, voidedCount, onToggleVoided, onOpenColu
           Mostrar anuladas ({voidedCount})
         </label>
       )}
+      <button
+        onClick={onExport}
+        className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+      >
+        <Download size={13} /> Excel
+      </button>
       <InvoiceColumnsButton onClick={onOpenColumns} />
     </div>
   );
@@ -5587,46 +5598,103 @@ const SUMMARY_PERIODS = [
 ];
 const summaryPeriod = (id) => SUMMARY_PERIODS.find((p) => p.id === id) ?? SUMMARY_PERIODS[0];
 
-function periodAnchor(period) {
+// Fechas que abarca un periodo (ISO, ambas incluidas). Un reporte puede traer
+// su propio rango { from, to }; "Todo" no tiene límites.
+function periodRange(period) {
+  if (period && typeof period === "object") return { from: period.from || null, to: period.to || null };
   const now = new Date();
-  return period === "lastMonth" ? new Date(now.getFullYear(), now.getMonth() - 1, 1) : now;
+  const year = now.getFullYear();
+  if (period === "year") return { from: `${year}-01-01`, to: `${year}-12-31` };
+  if (period === "month" || period === "lastMonth") {
+    const month = now.getMonth() - (period === "lastMonth" ? 1 : 0);
+    return { from: localISODate(new Date(year, month, 1)), to: localISODate(new Date(year, month + 1, 0)) };
+  }
+  return { from: null, to: null };
 }
 
 function inSummaryPeriod(inv, period) {
-  if (period === "all") return true;
-  const date = String(inv.date || "");
-  if (period === "year") return date.slice(0, 4) === String(periodAnchor(period).getFullYear());
-  return date.slice(0, 7) === localISODate(periodAnchor(period)).slice(0, 7);
+  const { from, to } = periodRange(period);
+  const date = String(inv.date || "").slice(0, 10);
+  return (!from || date >= from) && (!to || date <= to);
 }
 
-// Barras de un widget: por día dentro de un mes y por mes en lo demás.
+const TIME_GROUPS = [
+  { id: "auto", label: "Automático" },
+  { id: "day", label: "Por día" },
+  { id: "week", label: "Por semana" },
+  { id: "month", label: "Por mes" },
+];
+const GROUP_ORDER = ["day", "week", "month"];
+const MAX_CHART_BARS = 62;
+const MONTHS_SHORT = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+function bucketKey(iso, group) {
+  const d = parseISODate(iso);
+  if (group === "month") return localISODate(new Date(d.getFullYear(), d.getMonth(), 1));
+  if (group === "week") return localISODate(new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7)));
+  return localISODate(d);
+}
+
+function nextBucketKey(key, group) {
+  const d = parseISODate(key);
+  if (group === "month") return localISODate(new Date(d.getFullYear(), d.getMonth() + 1, 1));
+  return localISODate(new Date(d.getFullYear(), d.getMonth(), d.getDate() + (group === "week" ? 7 : 1)));
+}
+
+function bucketKeys(from, to, group) {
+  const keys = [];
+  for (let key = bucketKey(from, group); key <= to && keys.length <= MAX_CHART_BARS; key = nextBucketKey(key, group)) keys.push(key);
+  return keys;
+}
+
+// Reparte las facturas en barras de tiempo. Si salen demasiadas barras para
+// leerse, se agrupa más grueso (día → semana → mes).
+function timeBuckets(rows, period, group = "auto") {
+  const dates = rows.map((i) => String(i.date || "").slice(0, 10)).filter(Boolean).sort();
+  const range = periodRange(period);
+  const today = localISODate();
+  const from = range.from ?? dates[0];
+  const to = range.to ?? (dates.length && dates[dates.length - 1] > today ? dates[dates.length - 1] : today);
+  if (!from || from > to) return { group: "day", buckets: [] };
+  const spanDays = Math.round((parseISODate(to) - parseISODate(from)) / DAY_MS) + 1;
+  let used = group !== "auto" ? group : spanDays <= 62 ? "day" : spanDays <= 183 ? "week" : "month";
+  let keys = bucketKeys(from, to, used);
+  while (keys.length > MAX_CHART_BARS && used !== "month") {
+    used = GROUP_ORDER[GROUP_ORDER.indexOf(used) + 1];
+    keys = bucketKeys(from, to, used);
+  }
+  if (keys.length > MAX_CHART_BARS) {
+    const end = parseISODate(to);
+    keys = bucketKeys(localISODate(new Date(end.getFullYear(), end.getMonth() - (MAX_CHART_BARS - 1), 1)), to, "month");
+  }
+  const byKey = new Map(keys.map((key) => [key, []]));
+  for (const i of rows) byKey.get(bucketKey(String(i.date || "").slice(0, 10), used))?.push(i);
+  return {
+    group: used,
+    buckets: keys.map((key) => {
+      const d = parseISODate(key);
+      const day = `${d.getDate()} ${MONTHS_SHORT[d.getMonth()]}`;
+      const monthLabel = `${MONTHS_SHORT[d.getMonth()]} ${d.getFullYear()}`;
+      return {
+        key,
+        short: used === "month" ? monthLabel : day,
+        label: used === "month" ? monthLabel : used === "week" ? `Semana del ${day} ${d.getFullYear()}` : `${day} ${d.getFullYear()}`,
+        rows: byKey.get(key),
+      };
+    }),
+  };
+}
+
+// Barras pequeñas del resumen general.
 function summaryTrend(rows, period, get) {
-  const anchor = periodAnchor(period);
-  if (period === "month" || period === "lastMonth") {
-    const days = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0).getDate();
-    const values = Array.from({ length: days }, () => 0);
-    for (const i of rows) {
-      const day = Number(String(i.date).slice(8, 10)) - 1;
-      if (day >= 0 && day < days) values[day] += get(i);
-    }
-    return values;
-  }
-  // El año va de enero a diciembre; "Todo", de los últimos 12 meses.
-  const firstMonth = period === "year" ? 0 : anchor.getMonth() - 11;
-  const byMonth = new Map(
-    Array.from({ length: 12 }, (_, m) => [localISODate(new Date(anchor.getFullYear(), firstMonth + m, 1)).slice(0, 7), 0])
-  );
-  for (const i of rows) {
-    const key = String(i.date).slice(0, 7);
-    if (byMonth.has(key)) byMonth.set(key, byMonth.get(key) + get(i));
-  }
-  return [...byMonth.values()];
+  return timeBuckets(rows, period).buckets.map((b) => sumOf(b.rows, get));
 }
 
 const amountOf = (i) => i.amount;
 const sumOf = (rows, get) => rows.reduce((s, i) => s + (Number(get(i)) || 0), 0);
 const distinctOf = (rows, get) => new Set(rows.map(get).filter(Boolean)).size;
 const countLabel = (n, one, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+const ratio = (num, den) => (den > 0 ? num / den : null);
 
 function topOf(rows, get) {
   const totals = new Map();
@@ -5651,145 +5719,69 @@ function kmTraveled(rows) {
 
 function unitCostOf(rows, quantityOf) {
   const withQuantity = rows.filter((i) => quantityOf(i) > 0);
-  const quantity = sumOf(withQuantity, quantityOf);
-  return quantity > 0 ? sumOf(withQuantity, amountOf) / quantity : null;
+  return ratio(sumOf(withQuantity, amountOf), sumOf(withQuantity, quantityOf));
 }
 
-const topWidget = (id, label, icon, tone, get) => ({
-  id,
-  label,
-  icon,
-  tone,
-  read: (rows, ctx) => {
-    const top = topOf(rows, get);
+const asMoney = (n, ctx) => formatCurrency(n, ctx.currency);
+const asPrice = (n, ctx) => formatMoney(n, ctx.currency);
+const asCount = (n) => Math.round(n).toLocaleString();
+const asAmount = (suffix, digits = 0) => (n) => `${n.toLocaleString(undefined, { maximumFractionDigits: digits })}${suffix ? ` ${suffix}` : ""}`;
+
+// Tres clases de widget:
+//  - metric: "value" da un número (o null si no hay datos); el mismo cálculo
+//    sirve para la tarjeta y para cada barra de su gráfica en el tiempo.
+//  - ranking: el "principal" de algo; su gráfica es el ranking por gasto.
+//  - read: un estado de hoy (órdenes, proyectos), solo como número.
+const metric = (id, label, icon, tone, value, format, detail) => ({ id, label, icon, tone, value, format, detail });
+const ranking = (id, label, icon, tone, rank) => ({ id, label, icon, tone, rank });
+const countWidget = (id, label, icon, tone, filter, detail) => metric(id, label, icon, tone, (rows) => rows.filter(filter).length, asCount, detail);
+const sumWidget = (id, label, icon, tone, filter, detail = (rows) => countLabel(rows.filter(filter).length, "factura")) =>
+  metric(id, label, icon, tone, (rows) => sumOf(rows.filter(filter), amountOf), asMoney, detail);
+const taxWidget = (id, label, field) =>
+  metric(id, label, FileText, "slate", (rows) => sumOf(rows, (i) => i.cfdi?.importes?.[field]), asMoney, () => "Según los datos fiscales");
+const amountDetail = (filter, suffix) => (rows, ctx) => `${asMoney(sumOf(rows.filter(filter), amountOf), ctx)} ${suffix}`;
+const canChartWidget = (w) => !!(w.value || w.rank);
+
+function widgetReading(w, rows, ctx) {
+  if (w.read) return w.read(rows, ctx);
+  if (w.rank) {
+    const top = topOf(rows, w.rank);
     return top ? [top.name, `${formatCurrency(top.total, ctx.currency)} de gasto`] : ["—", "Sin datos en este periodo"];
-  },
-});
-const expenseWidget = (id, label, icon, tone, type) => ({
-  id,
-  label,
-  icon,
-  tone,
-  read: (rows, ctx) => {
-    const match = rows.filter((i) => i.expenseType === type);
-    return [formatCurrency(sumOf(match, amountOf), ctx.currency), countLabel(match.length, "factura")];
-  },
-});
-const taxWidget = (id, label, field) => ({
-  id,
-  label,
-  icon: FileText,
-  tone: "slate",
-  read: (rows, ctx) => [formatCurrency(sumOf(rows, (i) => i.cfdi?.importes?.[field]), ctx.currency), "Según los datos fiscales"],
-});
-const quantityWidget = (label) => ({
-  id: "quantity",
-  label,
-  icon: Layers,
-  tone: "sky",
-  read: (rows) => {
-    const top = topOf(rows, invoiceMeasure);
-    return [sumOf(rows, invoiceQuantity).toLocaleString(), top ? `Principalmente: ${top.name}` : "Capturada o leída de las partidas"];
-  },
-});
-const unitCostWidget = {
-  id: "unitCost",
-  label: "Costo por unidad",
-  icon: DollarSign,
-  tone: "emerald",
-  read: (rows, ctx) => {
-    const cost = unitCostOf(rows, invoiceQuantity);
-    return [cost === null ? "—" : formatMoney(cost, ctx.currency), "Promedio pagado"];
-  },
-};
-const unitsServedWidget = (label) => ({
-  id: "unitsServed",
-  label,
-  icon: Truck,
-  tone: "slate",
-  read: (rows) => [distinctOf(rows, (i) => i.unit).toLocaleString(), "Con vehículo asociado"],
-});
-const litersWidget = {
-  id: "liters",
-  label: "Litros consumidos",
-  icon: Droplet,
-  tone: "sky",
-  trend: (i) => i.liters,
-  trendClass: "bg-sky-500",
-  read: (rows) => [`${sumOf(rows, (i) => i.liters).toLocaleString()} L`, countLabel(rows.filter((i) => i.liters > 0).length, "carga")],
-};
+  }
+  const value = w.value(rows, ctx);
+  return [value === null ? "—" : w.format(value, ctx), w.detail ? w.detail(rows, ctx) : ""];
+}
+
+const isPendingInvoice = (i) => i.status === "pending";
+const isAwaitingApproval = (i) => i.status === "verified" && !i.approved;
 
 // Los que le sirven a cualquier concepto.
 const SHARED_WIDGETS = [
-  {
-    id: "total",
-    label: "Gasto total",
-    icon: DollarSign,
-    tone: "blue",
-    trend: amountOf,
-    read: (rows, ctx) => [formatCurrency(sumOf(rows, amountOf), ctx.currency), `${countLabel(rows.length, "factura")} ${summaryPeriod(ctx.period).phrase}`],
-  },
-  { id: "count", label: "Facturas", icon: Receipt, tone: "slate", read: (rows) => [rows.length.toLocaleString(), "Sin contar rechazadas ni anuladas"] },
-  {
-    id: "average",
-    label: "Promedio por factura",
-    icon: Activity,
-    tone: "sky",
-    read: (rows, ctx) => [rows.length ? formatCurrency(sumOf(rows, amountOf) / rows.length, ctx.currency) : "—", "Gasto total entre facturas"],
-  },
-  {
-    id: "largest",
-    label: "Factura más alta",
-    icon: ChevronUp,
-    tone: "amber",
-    read: (rows, ctx) => {
-      if (rows.length === 0) return ["—", "Sin datos en este periodo"];
+  metric("total", "Gasto total", DollarSign, "blue", (rows) => sumOf(rows, amountOf), asMoney, (rows, ctx) => `${countLabel(rows.length, "factura")} ${ctx.phrase}`),
+  countWidget("count", "Facturas", Receipt, "slate", () => true, () => "Sin contar rechazadas ni anuladas"),
+  metric("average", "Promedio por factura", Activity, "sky", (rows) => ratio(sumOf(rows, amountOf), rows.length), asMoney, () => "Gasto total entre facturas"),
+  metric(
+    "largest",
+    "Factura más alta",
+    ChevronUp,
+    "amber",
+    (rows) => (rows.length ? Math.max(...rows.map(amountOf)) : null),
+    asMoney,
+    (rows) => {
+      if (rows.length === 0) return "Sin datos en este periodo";
       const top = rows.reduce((a, b) => (b.amount > a.amount ? b : a));
-      return [formatCurrency(top.amount, ctx.currency), top.vendor || top.description || expenseTypeLabel(top.expenseType)];
-    },
-  },
-  {
-    id: "toVerify",
-    label: "Sin verificar",
-    icon: AlertTriangle,
-    tone: "rose",
-    read: (rows, ctx) => {
-      const match = rows.filter((i) => i.status === "pending");
-      return [match.length.toLocaleString(), `${formatCurrency(sumOf(match, amountOf), ctx.currency)} por revisar`];
-    },
-  },
-  {
-    id: "toApprove",
-    label: "Por aprobar",
-    icon: ShieldCheck,
-    tone: "blue",
-    read: (rows, ctx) => {
-      const match = rows.filter((i) => i.status === "verified" && !i.approved);
-      return [match.length.toLocaleString(), `${formatCurrency(sumOf(match, amountOf), ctx.currency)} ya verificados`];
-    },
-  },
-  {
-    id: "approved",
-    label: "Aprobadas",
-    icon: CheckCircle2,
-    tone: "emerald",
-    read: (rows, ctx) => {
-      const match = rows.filter((i) => i.approved);
-      return [match.length.toLocaleString(), `${formatCurrency(sumOf(match, amountOf), ctx.currency)} aprobados`];
-    },
-  },
-  { id: "closed", label: "Rechazadas y anuladas", icon: X, tone: "slate", read: (rows, ctx) => [ctx.closed.length.toLocaleString(), "No cuentan en los totales"] },
-  {
-    id: "noDocument",
-    label: "Sin documento",
-    icon: FileText,
-    tone: "amber",
-    read: (rows) => [rows.filter((i) => !i.documentUrl).length.toLocaleString(), "Les falta el comprobante"],
-  },
+      return top.vendor || top.description || expenseTypeLabel(top.expenseType);
+    }
+  ),
+  countWidget("toVerify", "Sin verificar", AlertTriangle, "rose", isPendingInvoice, amountDetail(isPendingInvoice, "por revisar")),
+  countWidget("toApprove", "Por aprobar", ShieldCheck, "blue", isAwaitingApproval, amountDetail(isAwaitingApproval, "ya verificados")),
+  countWidget("approved", "Aprobadas", CheckCircle2, "emerald", (i) => i.approved, amountDetail((i) => i.approved, "aprobados")),
+  metric("closed", "Rechazadas y anuladas", X, "slate", (rows, ctx) => ctx.closed.length, asCount, () => "No cuentan en los totales"),
+  countWidget("noDocument", "Sin documento", FileText, "amber", (i) => !i.documentUrl, () => "Les falta el comprobante"),
   taxWidget("iva", "IVA", "iva"),
-  topWidget("topVendor", "Proveedor principal", Receipt, "slate", (i) => i.vendor || i.cfdi?.emisor?.nombre),
-  topWidget("topUnit", "Unidad con más gasto", Truck, "slate", (i) => i.unit),
-  { id: "telegram", label: "Cargadas por Telegram", icon: Bot, tone: "sky", read: (rows) => [rows.filter((i) => i.origin === "telegram").length.toLocaleString(), "Leídas por el bot"] },
+  ranking("topVendor", "Proveedor principal", Receipt, "slate", (i) => i.vendor || i.cfdi?.emisor?.nombre),
+  ranking("topUnit", "Unidad con más gasto", Truck, "slate", (i) => i.unit),
+  countWidget("telegram", "Cargadas por Telegram", Bot, "sky", (i) => i.origin === "telegram", () => "Leídas por el bot"),
 ];
 
 // Las órdenes reflejan cómo van hoy, sin importar el periodo elegido.
@@ -5827,10 +5819,23 @@ const ORDER_WIDGETS = [
   },
 ];
 
-const conceptCatalog = (own, defaults) => ({ widgets: [...own, ...SHARED_WIDGETS], defaults });
+const litersWidget = metric("liters", "Litros consumidos", Droplet, "sky", (rows) => sumOf(rows, (i) => i.liters), asAmount("L"), (rows) =>
+  countLabel(rows.filter((i) => i.liters > 0).length, "carga")
+);
+const quantityWidget = (label) =>
+  metric("quantity", label, Layers, "sky", (rows) => sumOf(rows, invoiceQuantity), asAmount("", 2), (rows) => {
+    const top = topOf(rows, invoiceMeasure);
+    return top ? `Principalmente: ${top.name}` : "Capturada o leída de las partidas";
+  });
+const unitCostWidget = metric("unitCost", "Costo por unidad", DollarSign, "emerald", (rows) => unitCostOf(rows, invoiceQuantity), asPrice, () => "Promedio pagado");
+const unitsServedWidget = (label) => metric("unitsServed", label, Truck, "slate", (rows) => distinctOf(rows, (i) => i.unit), asCount, () => "Con vehículo asociado");
+
+// "charts": los que arrancan como gráfica hasta que la persona elija otra cosa.
+const conceptCatalog = (own, defaults) => ({ widgets: [...own, ...SHARED_WIDGETS], defaults, charts: ["total"] });
 const scopeCatalog = (own, defaults) => ({
-  widgets: [...own, ...SHARED_WIDGETS, topWidget("topConcept", "Concepto con más gasto", Layers, "blue", (i) => expenseTypeLabel(i.expenseType)), litersWidget, ...ORDER_WIDGETS],
+  widgets: [...own, ...SHARED_WIDGETS, ranking("topConcept", "Concepto con más gasto", Layers, "blue", (i) => expenseTypeLabel(i.expenseType)), litersWidget, ...ORDER_WIDGETS],
   defaults,
+  charts: ["total"],
 });
 
 const GENERAL_WIDGETS = [
@@ -5844,12 +5849,21 @@ const GENERAL_WIDGETS = [
   { id: "pendingApproval", label: "Pendientes de aprobación", icon: ShieldCheck },
 ];
 
+const CONCEPT_ICONS = { fuel: Fuel, travel: Navigation, consumables: Layers, coolant: Droplet, parts: Wrench, tolls: Radio };
+
 const SUMMARY_CATALOGS = {
   general: { widgets: GENERAL_WIDGETS, defaults: GENERAL_WIDGETS.map((w) => w.id) },
+  // Las tarjetas de "Conceptos": cada una es el gasto de un concepto.
+  concepts: {
+    widgets: CONCEPT_CATEGORIES.map((c) =>
+      sumWidget(c.id, c.label, CONCEPT_ICONS[c.id], "blue", (i) => inConcept(i, c.id))
+    ),
+    defaults: CONCEPT_CATEGORIES.map((c) => c.id),
+  },
   projects: scopeCatalog(
     [
       { id: "projectCount", label: "Proyectos", icon: Layers, tone: "slate", read: (rows, ctx) => [ctx.projects.length.toLocaleString(), "Según la vista elegida"] },
-      topWidget("topProject", "Proyecto con más gasto", Layers, "amber", (i) => i.project),
+      ranking("topProject", "Proyecto con más gasto", Layers, "amber", (i) => i.project),
     ],
     ["total", "projectCount", "topProject", "topConcept", "toVerify", "toApprove", "ordersOpen", "ordersExpiring"]
   ),
@@ -5857,39 +5871,23 @@ const SUMMARY_CATALOGS = {
   fuel: conceptCatalog(
     [
       litersWidget,
-      {
-        id: "pricePerLiter",
-        label: "Precio por litro",
-        icon: DollarSign,
-        tone: "emerald",
-        read: (rows, ctx) => {
-          const cost = unitCostOf(rows, (i) => i.liters);
-          return [cost === null ? "—" : formatMoney(cost, ctx.currency), "Promedio pagado"];
-        },
-      },
-      {
-        id: "efficiency",
-        label: "Rendimiento promedio",
-        icon: Gauge,
-        tone: "emerald",
-        read: (rows) => {
+      metric("pricePerLiter", "Precio por litro", DollarSign, "emerald", (rows) => unitCostOf(rows, (i) => i.liters), asPrice, () => "Promedio pagado"),
+      metric(
+        "efficiency",
+        "Rendimiento promedio",
+        Gauge,
+        "emerald",
+        (rows) => {
           const known = rows.filter((i) => i.efficiency > 0);
-          return [known.length ? `${(sumOf(known, (i) => i.efficiency) / known.length).toFixed(1)} km/L` : "—", `${countLabel(known.length, "carga")} con dato`];
+          return ratio(sumOf(known, (i) => i.efficiency), known.length);
         },
-      },
-      { id: "km", label: "Kilómetros recorridos", icon: Navigation, tone: "blue", read: (rows) => [`${kmTraveled(rows).toLocaleString()} km`, "Según el odómetro de cada unidad"] },
-      {
-        id: "costPerKm",
-        label: "Costo por kilómetro",
-        icon: Activity,
-        tone: "amber",
-        read: (rows, ctx) => {
-          const km = kmTraveled(rows);
-          return [km > 0 ? formatMoney(sumOf(rows, amountOf) / km, ctx.currency) : "—", "Gasto entre kilómetros"];
-        },
-      },
-      topWidget("topStation", "Estación principal", Fuel, "slate", (i) => i.station || i.vendor),
-      topWidget("topFuel", "Combustible principal", Droplet, "sky", invoiceFuelType),
+        asAmount("km/L", 1),
+        (rows) => `${countLabel(rows.filter((i) => i.efficiency > 0).length, "carga")} con dato`
+      ),
+      metric("km", "Kilómetros recorridos", Navigation, "blue", kmTraveled, asAmount("km"), () => "Según el odómetro de cada unidad"),
+      metric("costPerKm", "Costo por kilómetro", Activity, "amber", (rows) => ratio(sumOf(rows, amountOf), kmTraveled(rows)), asPrice, () => "Gasto entre kilómetros"),
+      ranking("topStation", "Estación principal", Fuel, "slate", (i) => i.station || i.vendor),
+      ranking("topFuel", "Combustible principal", Droplet, "sky", invoiceFuelType),
       unitsServedWidget("Unidades abastecidas"),
       taxWidget("ieps", "IEPS", "ieps"),
     ],
@@ -5897,89 +5895,66 @@ const SUMMARY_CATALOGS = {
   ),
   travel: conceptCatalog(
     [
-      expenseWidget("hotel", "Hotel", Home, "blue", "hotel"),
-      expenseWidget("food", "Alimentos", Receipt, "emerald", "alimentos"),
-      expenseWidget("transport", "Transporte", Navigation, "sky", "transporte"),
-      expenseWidget("perDiem", "Viáticos", DollarSign, "amber", "viaticos"),
-      { id: "people", label: "Personas", icon: User, tone: "slate", read: (rows) => [distinctOf(rows, (i) => i.driverName).toLocaleString(), "Con nombre registrado"] },
-      {
-        id: "perPerson",
-        label: "Gasto por persona",
-        icon: User,
-        tone: "emerald",
-        read: (rows, ctx) => {
-          const people = distinctOf(rows, (i) => i.driverName);
-          const named = rows.filter((i) => i.driverName);
-          return [people > 0 ? formatCurrency(sumOf(named, amountOf) / people, ctx.currency) : "—", "De las facturas con nombre"];
-        },
-      },
-      { id: "nights", label: "Noches de hotel", icon: Clock, tone: "blue", read: (rows) => [sumOf(rows, (i) => i.details.nights).toLocaleString(), "Capturadas en cada factura"] },
-      {
-        id: "perNight",
-        label: "Costo por noche",
-        icon: DollarSign,
-        tone: "emerald",
-        read: (rows, ctx) => {
-          const cost = unitCostOf(rows, (i) => Number(i.details.nights) || 0);
-          return [cost === null ? "—" : formatMoney(cost, ctx.currency), "De los hoteles con noches"];
-        },
-      },
-      topWidget("topDestination", "Destino principal", MapPin, "slate", (i) => i.details.destination),
+      sumWidget("hotel", "Hotel", Home, "blue", (i) => i.expenseType === "hotel"),
+      sumWidget("food", "Alimentos", Receipt, "emerald", (i) => i.expenseType === "alimentos"),
+      sumWidget("transport", "Transporte", Navigation, "sky", (i) => i.expenseType === "transporte"),
+      sumWidget("perDiem", "Viáticos", DollarSign, "amber", (i) => i.expenseType === "viaticos"),
+      metric("people", "Personas", User, "slate", (rows) => distinctOf(rows, (i) => i.driverName), asCount, () => "Con nombre registrado"),
+      metric(
+        "perPerson",
+        "Gasto por persona",
+        User,
+        "emerald",
+        (rows) => ratio(sumOf(rows.filter((i) => i.driverName), amountOf), distinctOf(rows, (i) => i.driverName)),
+        asMoney,
+        () => "De las facturas con nombre"
+      ),
+      metric("nights", "Noches de hotel", Clock, "blue", (rows) => sumOf(rows, (i) => i.details.nights), asCount, () => "Capturadas en cada factura"),
+      metric("perNight", "Costo por noche", DollarSign, "emerald", (rows) => unitCostOf(rows, (i) => Number(i.details.nights) || 0), asPrice, () => "De los hoteles con noches"),
+      ranking("topDestination", "Destino principal", MapPin, "slate", (i) => i.details.destination),
       taxWidget("ish", "ISH (hospedaje)", "ish"),
       taxWidget("propina", "Propinas", "propina"),
     ],
     ["total", "hotel", "food", "transport", "people", "nights", "toVerify", "toApprove"]
   ),
   consumables: conceptCatalog(
-    [quantityWidget("Cantidad comprada"), unitCostWidget, topWidget("topItem", "Artículo principal", Layers, "amber", (i) => i.description), unitsServedWidget("Unidades atendidas")],
+    [quantityWidget("Cantidad comprada"), unitCostWidget, ranking("topItem", "Artículo principal", Layers, "amber", (i) => i.description), unitsServedWidget("Unidades atendidas")],
     ["total", "quantity", "topItem", "topVendor", "unitsServed", "toVerify", "toApprove", "noDocument"]
   ),
   coolant: conceptCatalog(
-    [quantityWidget("Cantidad cargada"), unitCostWidget, topWidget("coolantType", "Tipo principal", Droplet, "sky", (i) => i.details.coolantType), unitsServedWidget("Unidades atendidas")],
+    [quantityWidget("Cantidad cargada"), unitCostWidget, ranking("coolantType", "Tipo principal", Droplet, "sky", (i) => i.details.coolantType), unitsServedWidget("Unidades atendidas")],
     ["total", "quantity", "unitCost", "coolantType", "unitsServed", "topVendor", "toVerify", "toApprove"]
   ),
   parts: conceptCatalog(
     [
       quantityWidget("Piezas compradas"),
       unitCostWidget,
-      topWidget("topPart", "Refacción principal", Wrench, "amber", (i) => i.details.partNumber || i.description),
-      topWidget("topBrand", "Marca principal", Layers, "slate", (i) => i.details.brand),
-      { id: "withWarranty", label: "Con garantía", icon: ShieldCheck, tone: "emerald", read: (rows) => [rows.filter((i) => i.details.warrantyMonths > 0).length.toLocaleString(), "Tienen meses de garantía"] },
+      ranking("topPart", "Refacción principal", Wrench, "amber", (i) => i.details.partNumber || i.description),
+      ranking("topBrand", "Marca principal", Layers, "slate", (i) => i.details.brand),
+      countWidget("withWarranty", "Con garantía", ShieldCheck, "emerald", (i) => i.details.warrantyMonths > 0, () => "Tienen meses de garantía"),
       unitsServedWidget("Unidades atendidas"),
     ],
     ["total", "quantity", "topPart", "topBrand", "withWarranty", "topVendor", "toVerify", "toApprove"]
   ),
   tolls: conceptCatalog(
     [
-      { id: "crossings", label: "Cruces", icon: Navigation, tone: "sky", read: (rows) => [rows.length.toLocaleString(), "Una factura por cruce"] },
-      {
-        id: "perCrossing",
-        label: "Promedio por cruce",
-        icon: Activity,
-        tone: "emerald",
-        read: (rows, ctx) => [rows.length ? formatMoney(sumOf(rows, amountOf) / rows.length, ctx.currency) : "—", "Gasto entre cruces"],
-      },
-      topWidget("topPlaza", "Caseta principal", MapPin, "amber", (i) => i.details.plaza),
-      topWidget("topRoute", "Ruta principal", Navigation, "slate", (i) => i.details.route),
-      {
-        id: "tag",
-        label: "Pagado con TAG",
-        icon: Radio,
-        tone: "blue",
-        read: (rows, ctx) => [formatCurrency(sumOf(rows.filter((i) => i.details.paymentMethod === "TAG"), amountOf), ctx.currency), "Según la forma de pago capturada"],
-      },
-      {
-        id: "cash",
-        label: "Pagado en efectivo",
-        icon: DollarSign,
-        tone: "amber",
-        read: (rows, ctx) => [formatCurrency(sumOf(rows.filter((i) => i.details.paymentMethod === "Efectivo"), amountOf), ctx.currency), "Según la forma de pago capturada"],
-      },
+      countWidget("crossings", "Cruces", Navigation, "sky", () => true, () => "Una factura por cruce"),
+      metric("perCrossing", "Promedio por cruce", Activity, "emerald", (rows) => ratio(sumOf(rows, amountOf), rows.length), asPrice, () => "Gasto entre cruces"),
+      ranking("topPlaza", "Caseta principal", MapPin, "amber", (i) => i.details.plaza),
+      ranking("topRoute", "Ruta principal", Navigation, "slate", (i) => i.details.route),
+      sumWidget("tag", "Pagado con TAG", Radio, "blue", (i) => i.details.paymentMethod === "TAG", () => "Según la forma de pago capturada"),
+      sumWidget("cash", "Pagado en efectivo", DollarSign, "amber", (i) => i.details.paymentMethod === "Efectivo", () => "Según la forma de pago capturada"),
       unitsServedWidget("Unidades con casetas"),
     ],
     ["total", "crossings", "perCrossing", "topPlaza", "tag", "cash", "toVerify", "toApprove"]
   ),
 };
+
+// Qué widgets ve la persona, en qué orden y cuáles como gráfica.
+function widgetEntries(saved, catalog) {
+  const list = saved ?? catalog.defaults.map((id) => ({ id, chart: (catalog.charts ?? []).includes(id) }));
+  return list.map((e) => (typeof e === "string" ? { id: e, chart: false } : e)).filter((e) => catalog.widgets.some((w) => w.id === e.id));
+}
 
 function SegmentedControl({ options, value, onChange, label }) {
   return (
@@ -5989,8 +5964,10 @@ function SegmentedControl({ options, value, onChange, label }) {
           key={option.id}
           onClick={() => onChange(option.id)}
           aria-pressed={value === option.id}
-          className={`whitespace-nowrap rounded-md px-2 py-1 transition ${value === option.id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
+          title={option.title}
+          className={`flex items-center gap-1 whitespace-nowrap rounded-md px-2 py-1 transition ${value === option.id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
         >
+          {option.icon && <option.icon size={12} />}
           {option.label}
         </button>
       ))}
@@ -5998,60 +5975,72 @@ function SegmentedControl({ options, value, onChange, label }) {
   );
 }
 
-function SummaryWidgetsModal({ widgets, selected, defaults, onChange, onClose }) {
-  const shown = selected.map((id) => widgets.find((w) => w.id === id)).filter(Boolean);
-  const hidden = widgets.filter((w) => !selected.includes(w.id));
-  const shownIds = shown.map((w) => w.id);
+const DISPLAY_OPTIONS = [
+  { id: "number", label: "Número", icon: Hash },
+  { id: "chart", label: "Gráfica", icon: BarChart3 },
+];
+
+function SummaryWidgetsModal({ title = "Personalizar widgets", hint, widgets, entries, defaults, onChange, onClose }) {
+  const shown = entries.map((e) => ({ entry: e, widget: widgets.find((w) => w.id === e.id) })).filter((x) => x.widget);
+  const hidden = widgets.filter((w) => !entries.some((e) => e.id === w.id));
 
   function move(index, delta) {
-    const next = [...shownIds];
+    const next = [...entries];
     [next[index], next[index + delta]] = [next[index + delta], next[index]];
     onChange(next);
   }
 
-  const row = (w, index) => {
+  const arrow = "flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-30 disabled:hover:bg-transparent";
+  const label = (w, checked, toggle) => {
     const Icon = w.icon;
-    const isShown = index !== null;
-    const arrow = "flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-30 disabled:hover:bg-transparent";
     return (
-      <div key={w.id} className="flex items-center gap-2 rounded-xl border border-slate-100 px-3 py-2 hover:bg-slate-50">
-        <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs font-medium text-slate-600">
-          <input
-            type="checkbox"
-            checked={isShown}
-            onChange={() => onChange(isShown ? shownIds.filter((id) => id !== w.id) : [...shownIds, w.id])}
-            className="h-4 w-4 shrink-0 accent-blue-600"
-          />
-          <Icon size={15} className="shrink-0 text-blue-600" />
-          <span className="min-w-0">{w.label}</span>
-        </label>
-        {isShown && (
-          <div className="flex shrink-0 gap-0.5">
-            <button type="button" onClick={() => move(index, -1)} disabled={index === 0} className={arrow} aria-label={`Subir ${w.label}`}>
-              <ChevronUp size={14} />
-            </button>
-            <button type="button" onClick={() => move(index, 1)} disabled={index === shown.length - 1} className={arrow} aria-label={`Bajar ${w.label}`}>
-              <ChevronDown size={14} />
-            </button>
-          </div>
-        )}
-      </div>
+      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs font-medium text-slate-600">
+        <input type="checkbox" checked={checked} onChange={toggle} className="h-4 w-4 shrink-0 accent-blue-600" />
+        <Icon size={15} className="shrink-0 text-blue-600" />
+        <span className="min-w-0">{w.label}</span>
+      </label>
     );
   };
 
   return (
-    <Modal title="Personalizar widgets" width="max-w-lg" onClose={onClose}>
+    <Modal title={title} width="max-w-xl" onClose={onClose}>
       <div className="mb-3 flex items-center justify-between gap-3">
-        <p className="text-xs text-slate-400">Elige qué contadores ver en esta sección y en qué orden. Se guarda en este navegador.</p>
+        <p className="text-xs text-slate-400">{hint ?? "Elige qué ver, en qué orden y cuáles como gráfica. Se guarda en este navegador."}</p>
         <button onClick={() => onChange(defaults)} className="shrink-0 text-[11px] font-semibold text-blue-600">
           Restablecer
         </button>
       </div>
       <div className="max-h-[60vh] space-y-1.5 overflow-y-auto pr-1">
-        {shown.length === 0 && <p className="py-2 text-center text-xs text-slate-400">Ningún widget visible.</p>}
-        {shown.map((w, index) => row(w, index))}
+        {shown.length === 0 && <p className="py-2 text-center text-xs text-slate-400">Nada visible.</p>}
+        {shown.map(({ entry, widget }, index) => (
+          <div key={widget.id} className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-100 px-3 py-2 hover:bg-slate-50">
+            {label(widget, true, () => onChange(entries.filter((e) => e.id !== widget.id)))}
+            {canChartWidget(widget) ? (
+              <SegmentedControl
+                label={`Mostrar ${widget.label} como`}
+                options={DISPLAY_OPTIONS}
+                value={entry.chart ? "chart" : "number"}
+                onChange={(mode) => onChange(entries.map((e) => (e.id === widget.id ? { ...e, chart: mode === "chart" } : e)))}
+              />
+            ) : (
+              <span className="text-[10px] text-slate-400">Solo número</span>
+            )}
+            <div className="flex shrink-0 gap-0.5">
+              <button type="button" onClick={() => move(index, -1)} disabled={index === 0} className={arrow} aria-label={`Subir ${widget.label}`}>
+                <ChevronUp size={14} />
+              </button>
+              <button type="button" onClick={() => move(index, 1)} disabled={index === shown.length - 1} className={arrow} aria-label={`Bajar ${widget.label}`}>
+                <ChevronDown size={14} />
+              </button>
+            </div>
+          </div>
+        ))}
         {hidden.length > 0 && <p className="pb-0.5 pt-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Disponibles</p>}
-        {hidden.map((w) => row(w, null))}
+        {hidden.map((w) => (
+          <div key={w.id} className="flex items-center gap-2 rounded-xl border border-slate-100 px-3 py-2 hover:bg-slate-50">
+            {label(w, false, () => onChange([...entries, { id: w.id, chart: false }]))}
+          </div>
+        ))}
       </div>
       <button onClick={onClose} className="mt-4 w-full rounded-lg bg-blue-600 py-2 text-xs font-semibold text-white hover:bg-blue-700">
         Listo
@@ -6060,10 +6049,22 @@ function SummaryWidgetsModal({ widgets, selected, defaults, onChange, onClose })
   );
 }
 
-function SummaryControls({ period, onPeriodChange, onCustomize }) {
+function SummaryControls({ period, onPeriodChange, group, onGroupChange, onCustomize }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
       <SegmentedControl label="Periodo del resumen" options={SUMMARY_PERIODS} value={period} onChange={onPeriodChange} />
+      {onGroupChange && (
+        <label className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-500">
+          Gráficas
+          <select value={group} onChange={(e) => onGroupChange(e.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 focus:border-blue-400 focus:outline-none">
+            {TIME_GROUPS.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       <button onClick={onCustomize} className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50">
         <Settings size={13} /> Personalizar widgets
       </button>
@@ -6085,40 +6086,245 @@ function PeriodEmptyNote({ total, period, onShowAll }) {
   );
 }
 
-function InvoiceSummary({ catalogId, invoices, orders = [], projects = [], currency, period, onPeriodChange, widgetPrefs, onWidgetPrefsChange }) {
+const compactNumber = (n) => new Intl.NumberFormat("es-MX", { notation: "compact", maximumFractionDigits: 1 }).format(n);
+
+// Techo "redondo" del eje, cercano al valor más alto para que las barras usen la altura.
+function niceCeiling(max) {
+  if (!(max > 0)) return 1;
+  const magnitude = 10 ** Math.floor(Math.log10(max));
+  return [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].map((f) => f * magnitude).find((v) => v >= max);
+}
+
+// Una sola serie en columnas: el valor de cada barra sale al pasar el cursor
+// o con el teclado, y "Ver tabla" muestra todos los números.
+function TimeBarChart({ points, format, caption }) {
+  const [active, setActive] = useState(null);
+  const [asTable, setAsTable] = useState(false);
+  if (points.length === 0) return <p className="mt-3 py-6 text-center text-[11px] text-slate-400">Sin datos para graficar en este periodo.</p>;
+  const top = niceCeiling(Math.max(0, ...points.map((p) => p.value ?? 0)));
+  const every = Math.ceil(points.length / 6);
+  const current = active === null ? null : points[active];
+  const tipLeft = active === null ? 0 : Math.min(85, Math.max(15, ((active + 0.5) / points.length) * 100));
+
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center justify-between text-[10px] font-medium text-slate-400">
+        <span>{caption}</span>
+        <button type="button" onClick={() => setAsTable((v) => !v)} className="font-semibold text-blue-600 hover:text-blue-700 print:hidden">
+          {asTable ? "Ver gráfica" : "Ver tabla"}
+        </button>
+      </div>
+      {asTable ? (
+        <div className="max-h-48 overflow-y-auto rounded-lg border border-slate-100">
+          <table className="w-full text-left text-[11px]">
+            <thead>
+              <tr className="text-slate-400">
+                <th className="px-2 py-1 font-semibold">Periodo</th>
+                <th className="px-2 py-1 text-right font-semibold">Valor</th>
+              </tr>
+            </thead>
+            <tbody>
+              {points.map((p) => (
+                <tr key={p.key} className="border-t border-slate-50 text-slate-600">
+                  <td className="px-2 py-1">{p.label}</td>
+                  <td className="px-2 py-1 text-right font-medium">{p.value === null ? "—" : format(p.value)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="flex gap-2">
+          <div className="flex h-32 w-9 shrink-0 flex-col justify-between text-right text-[10px] leading-none text-slate-400">
+            <span>{compactNumber(top)}</span>
+            <span>{compactNumber(top / 2)}</span>
+            <span>0</span>
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="relative h-32">
+              <div className="absolute inset-x-0 top-0 border-t border-slate-100" />
+              <div className="absolute inset-x-0 top-1/2 border-t border-slate-100" />
+              <div className="absolute inset-0 flex items-end gap-[2px] border-b border-slate-200">
+                {points.map((p, i) => (
+                  <button
+                    key={p.key}
+                    type="button"
+                    onMouseEnter={() => setActive(i)}
+                    onMouseLeave={() => setActive(null)}
+                    onFocus={() => setActive(i)}
+                    onBlur={() => setActive(null)}
+                    aria-label={`${p.label}: ${p.value === null ? "sin datos" : format(p.value)}`}
+                    className="flex h-full min-w-0 flex-1 items-end justify-center rounded-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
+                  >
+                    <span
+                      className={`block w-full max-w-[24px] rounded-t ${active === i ? "bg-blue-400" : "bg-blue-600"}`}
+                      style={{ height: p.value > 0 ? `${Math.max(2, (p.value / top) * 100)}%` : 0 }}
+                    />
+                  </button>
+                ))}
+              </div>
+              {current && (
+                <div
+                  className="pointer-events-none absolute top-0 z-10 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-lg bg-slate-900 px-2 py-1 text-[11px] shadow"
+                  style={{ left: `${tipLeft}%` }}
+                >
+                  <p className="font-semibold text-white">{current.value === null ? "Sin datos" : format(current.value)}</p>
+                  <p className="text-slate-300">{current.label}</p>
+                </div>
+              )}
+            </div>
+            <div className="mt-1 flex gap-[2px] text-[10px] text-slate-400">
+              {points.map((p, i) => (
+                <span key={p.key} className="min-w-0 flex-1 whitespace-nowrap text-center">
+                  {i % every === 0 ? p.short : ""}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Gráfica de un widget "principal": quiénes concentran el gasto.
+function RankingBars({ rows, rank, currency }) {
+  const totals = new Map();
+  for (const i of rows) {
+    const key = rank(i);
+    if (key) totals.set(key, (totals.get(key) ?? 0) + i.amount);
+  }
+  let items = [...totals].map(([name, total]) => ({ name, total })).sort((a, b) => b.total - a.total);
+  if (items.length === 0) return <p className="mt-3 py-6 text-center text-[11px] text-slate-400">Sin datos en este periodo.</p>;
+  if (items.length > 6) {
+    const rest = items.slice(5);
+    items = [...items.slice(0, 5), { name: `Otros (${rest.length})`, total: sumOf(rest, (r) => r.total) }];
+  }
+  const max = Math.max(...items.map((it) => it.total));
+  return (
+    <div className="mt-3 space-y-2">
+      {items.map((it) => (
+        <div key={it.name} className="flex items-center gap-2 text-[11px]">
+          <span className="w-28 shrink-0 truncate text-slate-600" title={it.name}>
+            {it.name}
+          </span>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <div className="h-3 shrink-0 rounded-r bg-blue-600" style={{ width: `${max > 0 ? Math.max(1, (it.total / max) * 70) : 0}%` }} />
+            <span className="shrink-0 font-semibold text-slate-700">{formatCurrency(it.total, currency)}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Una tarjeta del resumen: número o gráfica. "rows" son las facturas del
+// periodo, incluidas rechazadas y anuladas (solo las cuenta "Rechazadas").
+function WidgetCard({ widget, chart, rows, ctx, period, group, label = widget.label, onToggleChart, onOpen }) {
+  const countable = rows.filter((i) => !isInvoiceClosed(i));
+  const fullCtx = { ...ctx, closed: rows.filter(isInvoiceClosed) };
+  const [value, detail] = widgetReading(widget, countable, fullCtx);
+  const chartable = canChartWidget(widget);
+  const toggle =
+    onToggleChart && chartable ? (
+      <button
+        type="button"
+        onClick={onToggleChart}
+        title={chart ? "Ver como número" : "Ver como gráfica"}
+        aria-label={chart ? `Ver ${label} como número` : `Ver ${label} como gráfica`}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600 print:hidden"
+      >
+        {chart ? <Hash size={14} /> : <BarChart3 size={14} />}
+      </button>
+    ) : null;
+
+  if (!chart || !chartable) return <KpiCard widget={{ ...widget, label, value, detail }} action={toggle} />;
+
+  const Icon = widget.icon;
+  let body;
+  if (widget.rank) {
+    body = <RankingBars rows={countable} rank={widget.rank} currency={ctx.currency} />;
+  } else {
+    const { group: used, buckets } = timeBuckets(rows, period, group);
+    const points = buckets.map((b) => ({
+      key: b.key,
+      short: b.short,
+      label: b.label,
+      value: widget.value(
+        b.rows.filter((i) => !isInvoiceClosed(i)),
+        { ...ctx, closed: b.rows.filter(isInvoiceClosed) }
+      ),
+    }));
+    body = <TimeBarChart points={points} format={(n) => widget.format(n, ctx)} caption={TIME_GROUPS.find((g) => g.id === used).label} />;
+  }
+
+  return (
+    <div className="min-w-0 break-inside-avoid rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:col-span-2">
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${TONE_CLASSES[widget.tone]}`}>
+            <Icon size={16} />
+          </span>
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-slate-500">{label}</p>
+            <p className="truncate text-lg font-bold text-slate-800" title={String(value)}>
+              {value}
+            </p>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {onOpen && (
+            <button type="button" onClick={onOpen} className="rounded-lg px-2 py-1 text-[11px] font-semibold text-blue-600 hover:bg-blue-50 print:hidden">
+              Ver concepto
+            </button>
+          )}
+          {toggle}
+        </div>
+      </div>
+      {detail && <p className="mt-0.5 text-[11px] text-slate-400">{detail}</p>}
+      {body}
+    </div>
+  );
+}
+
+function InvoiceSummary({ catalogId, invoices, orders = [], projects = [], currency, period, onPeriodChange, group, onGroupChange, widgetPrefs, onWidgetPrefsChange }) {
   const [customizing, setCustomizing] = useState(false);
   const catalog = SUMMARY_CATALOGS[catalogId];
+  const entries = widgetEntries(widgetPrefs[catalogId], catalog);
+  const setEntries = (next) => onWidgetPrefsChange({ ...widgetPrefs, [catalogId]: next });
   const inPeriod = invoices.filter((i) => inSummaryPeriod(i, period));
-  const rows = inPeriod.filter((i) => !isInvoiceClosed(i));
-  const ctx = { currency, period, closed: inPeriod.filter(isInvoiceClosed), orders, projects };
-  const selected = widgetPrefs[catalogId] ?? catalog.defaults;
-  const shown = selected
-    .map((id) => catalog.widgets.find((w) => w.id === id))
-    .filter(Boolean)
-    .map((w) => {
-      const [value, detail] = w.read(rows, ctx);
-      return { ...w, value, detail, trend: w.trend ? summaryTrend(rows, period, w.trend) : null };
-    });
+  const ctx = { currency, period, orders, projects, phrase: summaryPeriod(period).phrase };
 
   return (
     <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-sm font-bold text-slate-800">{summaryPeriod(period).title}</h2>
-        <SummaryControls period={period} onPeriodChange={onPeriodChange} onCustomize={() => setCustomizing(true)} />
+        <SummaryControls period={period} onPeriodChange={onPeriodChange} group={group} onGroupChange={onGroupChange} onCustomize={() => setCustomizing(true)} />
       </div>
-      {rows.length === 0 && <PeriodEmptyNote total={invoices.filter((i) => !isInvoiceClosed(i)).length} period={period} onShowAll={() => onPeriodChange("all")} />}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {shown.map((w) => (
-          <KpiCard key={w.id} widget={w} />
+      {!inPeriod.some((i) => !isInvoiceClosed(i)) && (
+        <PeriodEmptyNote total={invoices.filter((i) => !isInvoiceClosed(i)).length} period={period} onShowAll={() => onPeriodChange("all")} />
+      )}
+      <div className="grid grid-flow-row-dense grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {entries.map((entry) => (
+          <WidgetCard
+            key={entry.id}
+            widget={catalog.widgets.find((w) => w.id === entry.id)}
+            chart={entry.chart}
+            rows={inPeriod}
+            ctx={ctx}
+            period={period}
+            group={group}
+            onToggleChart={() => setEntries(entries.map((e) => (e.id === entry.id ? { ...e, chart: !e.chart } : e)))}
+          />
         ))}
-        {shown.length === 0 && <p className="col-span-full py-4 text-center text-xs text-slate-400">No hay widgets visibles. Actívalos desde "Personalizar widgets".</p>}
+        {entries.length === 0 && <p className="col-span-full py-4 text-center text-xs text-slate-400">No hay widgets visibles. Actívalos desde "Personalizar widgets".</p>}
       </div>
       {customizing && (
         <SummaryWidgetsModal
           widgets={catalog.widgets}
-          selected={selected}
-          defaults={catalog.defaults}
-          onChange={(ids) => onWidgetPrefsChange({ ...widgetPrefs, [catalogId]: ids })}
+          entries={entries}
+          defaults={widgetEntries(undefined, catalog)}
+          onChange={setEntries}
           onClose={() => setCustomizing(false)}
         />
       )}
@@ -6126,37 +6332,829 @@ function InvoiceSummary({ catalogId, invoices, orders = [], projects = [], curre
   );
 }
 
-function ConceptBreakdown({ invoices, period, currency, onOpen }) {
-  const rows = invoices.filter((i) => !isInvoiceClosed(i) && inSummaryPeriod(i, period));
+// Cada concepto como tarjeta (gasto y su parte del total) o como gráfica de su
+// gasto en el tiempo. La persona elige cuáles ver y en qué orden.
+function ConceptBreakdown({ invoices, period, group, currency, widgetPrefs, onWidgetPrefsChange, onOpen }) {
+  const [customizing, setCustomizing] = useState(false);
+  const catalog = SUMMARY_CATALOGS.concepts;
+  const entries = widgetEntries(widgetPrefs.concepts, catalog);
+  const setEntries = (next) => onWidgetPrefsChange({ ...widgetPrefs, concepts: next });
+  const toggleChart = (id) => setEntries(entries.map((e) => (e.id === id ? { ...e, chart: !e.chart } : e)));
+  const inPeriod = invoices.filter((i) => inSummaryPeriod(i, period));
+  const rows = inPeriod.filter((i) => !isInvoiceClosed(i));
   const grandTotal = sumOf(rows, amountOf);
+  const ctx = { currency, period, orders: [], projects: [], phrase: summaryPeriod(period).phrase };
+
   return (
     <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div>
-        <h2 className="text-sm font-bold text-slate-800">Conceptos</h2>
-        <p className="text-[11px] text-slate-400">Entra a un concepto para ver su propio resumen ({summaryPeriod(period).phrase}).</p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-bold text-slate-800">Conceptos</h2>
+          <p className="text-[11px] text-slate-400">Entra a un concepto para ver su propio resumen ({summaryPeriod(period).phrase}).</p>
+        </div>
+        <button onClick={() => setCustomizing(true)} className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50">
+          <Settings size={13} /> Elegir conceptos
+        </button>
       </div>
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-        {CONCEPT_CATEGORIES.map((c) => {
-          const conceptRows = rows.filter((i) => inConcept(i, c.id));
-          const total = sumOf(conceptRows, amountOf);
+      <div className="grid grid-flow-row-dense grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {entries.map((entry) => {
+          const widget = catalog.widgets.find((w) => w.id === entry.id);
+          const conceptRows = inPeriod.filter((i) => inConcept(i, entry.id));
+          if (entry.chart) {
+            return (
+              <WidgetCard
+                key={entry.id}
+                widget={widget}
+                chart
+                rows={conceptRows}
+                ctx={ctx}
+                period={period}
+                group={group}
+                onToggleChart={() => toggleChart(entry.id)}
+                onOpen={() => onOpen(entry.id)}
+              />
+            );
+          }
+          const counted = conceptRows.filter((i) => !isInvoiceClosed(i));
+          const total = sumOf(counted, amountOf);
           const share = grandTotal > 0 ? total / grandTotal : 0;
           return (
-            <button key={c.id} onClick={() => onOpen(c.id)} className="min-w-0 rounded-xl border border-slate-200 px-3 py-2.5 text-left transition hover:border-blue-300 hover:bg-blue-50/40">
-              <div className="flex items-center justify-between gap-2">
-                <span className="min-w-0 truncate text-xs font-semibold text-slate-700">{c.label}</span>
-                <span className="shrink-0 text-xs font-bold text-slate-800">{formatCurrency(total, currency)}</span>
+            <div key={entry.id} className="relative min-w-0">
+              <button
+                onClick={() => onOpen(entry.id)}
+                className="w-full rounded-xl border border-slate-200 px-3 py-2.5 pr-11 text-left transition hover:border-blue-300 hover:bg-blue-50/40"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate text-xs font-semibold text-slate-700">{widget.label}</span>
+                  <span className="shrink-0 text-xs font-bold text-slate-800">{formatCurrency(total, currency)}</span>
+                </div>
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                  <div className="h-full rounded-full bg-blue-600" style={{ width: `${Math.round(share * 100)}%` }} />
+                </div>
+                <p className="mt-1.5 text-[11px] text-slate-400">
+                  {countLabel(counted.length, "factura")} · {Math.round(share * 100)}% del gasto
+                </p>
+              </button>
+              <button
+                type="button"
+                onClick={() => toggleChart(entry.id)}
+                title="Ver como gráfica"
+                aria-label={`Ver ${widget.label} como gráfica`}
+                className="absolute right-1.5 top-1.5 flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600 print:hidden"
+              >
+                <BarChart3 size={14} />
+              </button>
+            </div>
+          );
+        })}
+        {entries.length === 0 && <p className="col-span-full py-4 text-center text-xs text-slate-400">No hay conceptos visibles. Actívalos desde "Elegir conceptos".</p>}
+      </div>
+      {customizing && (
+        <SummaryWidgetsModal
+          title="Elegir conceptos"
+          hint="Elige qué conceptos ver, en qué orden y cuáles como gráfica de su gasto. Se guarda en este navegador."
+          widgets={catalog.widgets}
+          entries={entries}
+          defaults={widgetEntries(undefined, catalog)}
+          onChange={setEntries}
+          onClose={() => setCustomizing(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Reportes — los datos que la persona elige, como número o gráfica      */
+/* ---------------------------------------------------------------------- */
+
+const REPORT_CONCEPTS = [{ id: "all", label: "Todos los conceptos" }, ...CONCEPT_CATEGORIES];
+const REPORT_PERIODS = [...SUMMARY_PERIODS, { id: "custom", label: "Elegir fechas" }];
+const reportCatalog = (concept) => SUMMARY_CATALOGS[concept === "all" ? "projects" : concept];
+
+const DEFAULT_REPORT = {
+  title: "Reporte de facturas",
+  period: "month",
+  from: "",
+  to: "",
+  items: [
+    { concept: "all", widget: "total", chart: true, group: "auto" },
+    { concept: "all", widget: "toVerify", chart: false, group: "auto" },
+    { concept: "all", widget: "toApprove", chart: false, group: "auto" },
+    { concept: "all", widget: "topConcept", chart: true, group: "auto" },
+    { concept: "fuel", widget: "liters", chart: false, group: "auto" },
+    { concept: "travel", widget: "total", chart: false, group: "auto" },
+  ],
+};
+
+function reportScopeOptions(projects) {
+  return [
+    { id: "all", label: "Todas las facturas" },
+    { id: "projects-active", label: "Proyectos activos" },
+    { id: "projects-all", label: "Todos los proyectos" },
+    ...projects.filter((p) => p.name).map((p) => ({ id: `project:${p.name}`, label: `Proyecto: ${p.name}${p.closed ? " (cerrado)" : ""}` })),
+    { id: "loose", label: "Facturas sin proyecto" },
+  ];
+}
+
+// Facturas, órdenes y proyectos que abarca el alcance de un reporte.
+function reportScopeData(scope, invoices, orders, projects) {
+  const named = projects.filter((p) => p.name);
+  if (scope === "all") return { invoices, orders, projects: named };
+  if (scope === "loose") return { invoices: invoices.filter((i) => !i.project), orders: orders.filter((o) => !o.project), projects: [] };
+  const chosen =
+    scope === "projects-active" ? named.filter((p) => !p.closed) : scope === "projects-all" ? named : named.filter((p) => `project:${p.name}` === scope);
+  return { invoices: chosen.flatMap((p) => p.invoices), orders: chosen.flatMap((p) => p.orders), projects: chosen };
+}
+
+const reportPeriodValue = (report) => (report.period === "custom" ? { from: report.from, to: report.to } : report.period);
+
+function ReportBuilderModal({ initial, projects, onGenerate, onClose }) {
+  const [draft, setDraft] = useState(initial);
+  const set = (patch) => setDraft((prev) => ({ ...prev, ...patch }));
+  const setItem = (index, patch) => set({ items: draft.items.map((item, i) => (i === index ? { ...item, ...patch } : item)) });
+  const moveItem = (index, delta) => {
+    const items = [...draft.items];
+    [items[index], items[index + delta]] = [items[index + delta], items[index]];
+    set({ items });
+  };
+  const badRange = draft.period === "custom" && draft.from && draft.to && draft.from > draft.to;
+  const canGenerate = draft.items.length > 0 && !badRange;
+  const inputClass = "rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
+  const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
+  const arrow = "flex h-7 w-7 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-30 disabled:hover:bg-transparent";
+
+  return (
+    <Modal title="Crear reporte" width="max-w-3xl" onClose={onClose}>
+      <div className="max-h-[70vh] space-y-4 overflow-y-auto pr-1">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <label className={labelClass}>Título</label>
+            <input value={draft.title} onChange={(e) => set({ title: e.target.value })} className={`w-full ${inputClass}`} />
+          </div>
+          <div>
+            <label className={labelClass}>Alcance</label>
+            <select value={draft.scope} onChange={(e) => set({ scope: e.target.value })} className={`w-full ${inputClass}`}>
+              {reportScopeOptions(projects).map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={labelClass}>Periodo</label>
+            <select value={draft.period} onChange={(e) => set({ period: e.target.value })} className={`w-full ${inputClass}`}>
+              {REPORT_PERIODS.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          {draft.period === "custom" && (
+            <>
+              <div>
+                <label className={labelClass}>Desde</label>
+                <input type="date" value={draft.from} onChange={(e) => set({ from: e.target.value })} className={`w-full ${inputClass}`} />
               </div>
-              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100">
-                <div className="h-full rounded-full bg-blue-600" style={{ width: `${Math.round(share * 100)}%` }} />
+              <div>
+                <label className={labelClass}>Hasta</label>
+                <input type="date" value={draft.to} onChange={(e) => set({ to: e.target.value })} className={`w-full ${inputClass}`} />
               </div>
-              <p className="mt-1.5 text-[11px] text-slate-400">
-                {countLabel(conceptRows.length, "factura")} · {Math.round(share * 100)}% del gasto
-              </p>
+              {badRange && <p className="text-[11px] font-medium text-rose-600 sm:col-span-2">La fecha "Desde" va después de "Hasta".</p>}
+            </>
+          )}
+        </div>
+
+        <div>
+          <p className="mb-1 text-[11px] font-semibold text-slate-500">Qué incluir</p>
+          <p className="mb-2 text-[11px] text-slate-400">
+            Elige el concepto y el dato. Cada uno puede salir como número o como gráfica; en las gráficas eliges cómo se reparte en el tiempo.
+          </p>
+          <div className="space-y-1.5">
+            {draft.items.map((item, index) => {
+              const catalog = reportCatalog(item.concept);
+              const widget = catalog.widgets.find((w) => w.id === item.widget) ?? catalog.widgets[0];
+              return (
+                <div key={index} className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-100 px-2.5 py-2">
+                  <select
+                    aria-label="Concepto"
+                    value={item.concept}
+                    onChange={(e) => {
+                      const next = reportCatalog(e.target.value);
+                      setItem(index, { concept: e.target.value, widget: next.widgets.some((w) => w.id === item.widget) ? item.widget : "total" });
+                    }}
+                    className={inputClass}
+                  >
+                    {REPORT_CONCEPTS.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.label}
+                      </option>
+                    ))}
+                  </select>
+                  <select aria-label="Dato" value={widget.id} onChange={(e) => setItem(index, { widget: e.target.value })} className={`min-w-0 flex-1 ${inputClass}`}>
+                    {catalog.widgets.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.label}
+                      </option>
+                    ))}
+                  </select>
+                  {canChartWidget(widget) ? (
+                    <SegmentedControl
+                      label="Mostrar como"
+                      options={DISPLAY_OPTIONS}
+                      value={item.chart ? "chart" : "number"}
+                      onChange={(mode) => setItem(index, { chart: mode === "chart" })}
+                    />
+                  ) : (
+                    <span className="text-[10px] text-slate-400">Solo número</span>
+                  )}
+                  {item.chart && widget.value && (
+                    <select aria-label="Reparto en el tiempo" value={item.group} onChange={(e) => setItem(index, { group: e.target.value })} className={inputClass}>
+                      {TIME_GROUPS.map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <div className="ml-auto flex shrink-0 gap-0.5">
+                    <button type="button" onClick={() => moveItem(index, -1)} disabled={index === 0} className={arrow} aria-label="Subir">
+                      <ChevronUp size={14} />
+                    </button>
+                    <button type="button" onClick={() => moveItem(index, 1)} disabled={index === draft.items.length - 1} className={arrow} aria-label="Bajar">
+                      <ChevronDown size={14} />
+                    </button>
+                    <button type="button" onClick={() => set({ items: draft.items.filter((_, i) => i !== index) })} className={`${arrow} hover:text-rose-600`} aria-label="Quitar">
+                      <X size={14} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            {draft.items.length === 0 && <p className="py-2 text-center text-xs text-slate-400">Agrega al menos un dato.</p>}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={() => set({ items: [...draft.items, { concept: "all", widget: "total", chart: false, group: "auto" }] })}
+              className="flex items-center gap-1 text-[11px] font-semibold text-blue-600 hover:text-blue-700"
+            >
+              <Plus size={13} /> Agregar dato
             </button>
+            <button type="button" onClick={() => set({ items: DEFAULT_REPORT.items })} className="text-[11px] font-semibold text-slate-500 hover:text-slate-700">
+              Restablecer datos
+            </button>
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+          Cancelar
+        </button>
+        <button
+          onClick={() => onGenerate({ ...draft, title: draft.title.trim() || DEFAULT_REPORT.title })}
+          disabled={!canGenerate}
+          className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+        >
+          Generar reporte
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function InvoiceReport({ report, invoices, orders, projects, currency, userName, onEdit, onBack }) {
+  const { format } = useDateFormat();
+  const scope = reportScopeData(report.scope, invoices, orders, projects);
+  const period = reportPeriodValue(report);
+  const inPeriod = scope.invoices.filter((i) => inSummaryPeriod(i, period));
+  const dates = inPeriod.map((i) => String(i.date || "").slice(0, 10)).filter(Boolean).sort();
+  const range = periodRange(period);
+  const from = range.from ?? dates[0];
+  const to = range.to ?? localISODate();
+  const rangeText = from ? `Del ${formatDate(from, format)} al ${formatDate(to, format)}` : "Sin facturas en el periodo";
+  const scopeLabel = reportScopeOptions(projects).find((o) => o.id === report.scope)?.label ?? "Todas las facturas";
+  const phrase = report.period === "custom" ? "en el periodo" : summaryPeriod(report.period).phrase;
+  const ctx = { currency, period, orders: scope.orders, projects: scope.projects, phrase };
+  const generatedAt = new Date().toLocaleString("es-MX", { dateStyle: "medium", timeStyle: "short" });
+
+  return (
+    // Sin "print-color-adjust", el navegador no imprime el color de las barras.
+    <div className="space-y-4" style={{ printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-600">Reporte</p>
+          <h1 className="break-words text-xl font-bold text-slate-900">{report.title}</h1>
+          <p className="mt-1 text-sm text-slate-500">
+            {scopeLabel} · {rangeText}
+          </p>
+          <p className="text-[11px] text-slate-400">
+            Generado el {generatedAt} por {userName}. Las facturas rechazadas y anuladas no cuentan en los totales.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2 print:hidden">
+          <button onClick={onBack} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+            Volver
+          </button>
+          <button onClick={onEdit} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+            Editar reporte
+          </button>
+          <button onClick={() => window.print()} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700">
+            <Printer size={14} /> Imprimir o guardar PDF
+          </button>
+        </div>
+      </div>
+      <div className="grid grid-flow-row-dense grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {report.items.map((item, index) => {
+          const catalog = reportCatalog(item.concept);
+          const widget = catalog.widgets.find((w) => w.id === item.widget);
+          if (!widget) return null;
+          const conceptLabel = REPORT_CONCEPTS.find((c) => c.id === item.concept)?.label ?? "";
+          const rows = item.concept === "all" ? inPeriod : inPeriod.filter((i) => inConcept(i, item.concept));
+          return (
+            <WidgetCard
+              key={index}
+              widget={widget}
+              label={`${conceptLabel} · ${widget.label}`}
+              chart={item.chart}
+              rows={rows}
+              ctx={ctx}
+              period={period}
+              group={item.group}
+            />
           );
         })}
       </div>
     </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Excel — descarga de facturas con los datos que la persona elige       */
+/* ---------------------------------------------------------------------- */
+
+// Cada columna posible del Excel. "type" decide cómo se guarda la celda para
+// que Excel la pueda ordenar, filtrar y sumar: money, number, date, datetime
+// o texto.
+const excelField = (id, label, group, get, type = "text") => ({ id, label, group, get, type });
+const yesNo = (value) => (value ? "Sí" : "No");
+const cfdiOf = (inv) => inv.cfdi ?? {};
+const importeOf = (key) => (inv) => cfdiOf(inv).importes?.[key];
+const paramOf = (id) => (inv) => inv.details[id];
+
+const EXCEL_FIELDS = [
+  excelField("date", "Fecha", "Registro", (inv) => inv.date, "date"),
+  excelField("expenseType", "Concepto", "Registro", (inv) => expenseTypeLabel(inv.expenseType)),
+  excelField("description", "Descripción", "Registro", (inv) => inv.description),
+  excelField("amount", "Monto", "Registro", (inv) => inv.amount, "money"),
+  excelField("currency", "Moneda", "Registro", (inv, ctx) => cfdiOf(inv).moneda || ctx.currency),
+  excelField("project", "Proyecto", "Registro", (inv) => inv.project),
+  excelField("workOrder", "Orden de trabajo", "Registro", (inv) => inv.workOrder),
+  excelField("unit", "Unidad", "Registro", (inv) => inv.unit),
+  excelField("plate", "Matrícula", "Registro", (inv) => inv.plate),
+  excelField("driver", "Conductor / Huésped", "Registro", (inv) => inv.driverName),
+  excelField("vendor", "Proveedor", "Registro", (inv) => inv.vendor || cfdiOf(inv).emisor?.nombre),
+  excelField("folio", "Folio", "Registro", (inv) => inv.invoiceFolio || cfdiOf(inv).folio),
+  excelField("status", "Estado", "Registro", (inv) => STATUS_BADGE_STYLES[inv.status]?.label ?? inv.status),
+  excelField("approved", "Aprobada", "Registro", (inv) => yesNo(inv.approved)),
+  excelField("approvedBy", "Aprobada por", "Registro", (inv) => inv.approvedByName),
+  excelField("statusReason", "Motivo de rechazo o anulación", "Registro", (inv) => (isInvoiceClosed(inv) ? inv.statusReason : "")),
+  excelField("origin", "Origen", "Registro", (inv) => ORIGIN_STYLES[inv.origin]?.label ?? inv.origin),
+  excelField("uploadedBy", "Subida por", "Registro", (inv) => inv.uploadedByName),
+  excelField("createdAt", "Fecha de carga", "Registro", (inv) => inv.createdAt, "datetime"),
+  excelField("hasDocument", "Documento adjunto", "Registro", (inv) => yesNo(inv.documentUrl)),
+  excelField("notes", "Notas", "Registro", (inv) => inv.notes),
+
+  excelField("station", "Estación de servicio", "Datos del concepto", (inv) => inv.station),
+  excelField("fuelType", "Tipo de combustible", "Datos del concepto", invoiceFuelType),
+  excelField("liters", "Litros", "Datos del concepto", (inv) => (inv.module === "fuel" ? inv.liters : null), "number"),
+  excelField("pricePerLiter", "Precio por litro", "Datos del concepto", (inv) => (inv.module === "fuel" ? invoiceUnitCost(inv) : null), "money"),
+  excelField("odometer", "Odómetro (km)", "Datos del concepto", (inv) => inv.odometer || inv.details.odometerKm, "number"),
+  excelField("efficiency", "Rendimiento (km/L)", "Datos del concepto", (inv) => inv.efficiency || null, "number"),
+  excelField("destination", "Destino", "Datos del concepto", paramOf("destination")),
+  excelField("route", "Ruta", "Datos del concepto", paramOf("route")),
+  excelField("plaza", "Caseta o plaza", "Datos del concepto", paramOf("plaza")),
+  excelField("transportType", "Tipo de transporte", "Datos del concepto", paramOf("transportType")),
+  excelField("tripDays", "Días del viaje", "Datos del concepto", paramOf("tripDays"), "number"),
+  excelField("nights", "Noches", "Datos del concepto", paramOf("nights"), "number"),
+  excelField("people", "Personas", "Datos del concepto", paramOf("people"), "number"),
+  excelField("paymentMethod", "Forma de pago de la caseta", "Datos del concepto", paramOf("paymentMethod")),
+  excelField("axles", "Ejes", "Datos del concepto", paramOf("axles"), "number"),
+  excelField("coolantType", "Tipo de refrigerante", "Datos del concepto", paramOf("coolantType")),
+  excelField("partNumber", "Número de parte", "Datos del concepto", paramOf("partNumber")),
+  excelField("brand", "Marca", "Datos del concepto", paramOf("brand")),
+  excelField("quantity", "Cantidad", "Datos del concepto", (inv) => (inv.module === "misc" ? invoiceQuantity(inv) || null : null), "number"),
+  excelField("measure", "Unidad de medida", "Datos del concepto", (inv) => (inv.module === "misc" ? invoiceMeasure(inv) : "")),
+  excelField("unitCost", "Costo por unidad", "Datos del concepto", (inv) => (inv.module === "misc" ? invoiceUnitCost(inv) : null), "money"),
+  excelField("warrantyMonths", "Garantía (meses)", "Datos del concepto", paramOf("warrantyMonths"), "number"),
+
+  excelField("uuid", "Folio fiscal (UUID)", "Comprobante fiscal", (inv) => cfdiOf(inv).uuid),
+  excelField("serie", "Serie", "Comprobante fiscal", (inv) => cfdiOf(inv).serie),
+  excelField("tipoComprobante", "Tipo de comprobante", "Comprobante fiscal", (inv) => decodeSat(SAT_TIPO_COMPROBANTE, cfdiOf(inv).tipoComprobante)),
+  excelField("fechaEmision", "Fecha de emisión", "Comprobante fiscal", (inv) => cfdiOf(inv).fechaEmision, "datetime"),
+  excelField("fechaCertificacion", "Fecha de certificación", "Comprobante fiscal", (inv) => cfdiOf(inv).fechaCertificacion, "datetime"),
+  excelField("metodoPago", "Método de pago", "Comprobante fiscal", (inv) => decodeSat(SAT_METODO_PAGO, cfdiOf(inv).metodoPago)),
+  excelField("formaPago", "Forma de pago", "Comprobante fiscal", (inv) => decodeSat(SAT_FORMA_PAGO, cfdiOf(inv).formaPago)),
+  excelField("usoCfdi", "Uso de CFDI", "Comprobante fiscal", (inv) => decodeSat(SAT_USO_CFDI, cfdiOf(inv).receptor?.usoCFDI)),
+  excelField("tipoCambio", "Tipo de cambio", "Comprobante fiscal", (inv) => cfdiOf(inv).tipoCambio, "number"),
+  excelField("exportacion", "Exportación", "Comprobante fiscal", (inv) => cfdiOf(inv).exportacion),
+  excelField("lugarExpedicion", "Lugar de expedición", "Comprobante fiscal", (inv) => cfdiOf(inv).lugarExpedicion),
+  excelField("certificadoEmisor", "Certificado del emisor", "Comprobante fiscal", (inv) => cfdiOf(inv).certificadoEmisor),
+  excelField("certificadoSAT", "Certificado del SAT", "Comprobante fiscal", (inv) => cfdiOf(inv).certificadoSAT),
+
+  excelField("emisorNombre", "Razón social del emisor", "Emisor", (inv) => cfdiOf(inv).emisor?.nombre),
+  excelField("emisorComercial", "Nombre comercial del emisor", "Emisor", (inv) => cfdiOf(inv).emisor?.nombreComercial),
+  excelField("emisorRfc", "RFC del emisor", "Emisor", (inv) => cfdiOf(inv).emisor?.rfc),
+  excelField("emisorRegimen", "Régimen fiscal del emisor", "Emisor", (inv) => decodeSat(SAT_REGIMEN, cfdiOf(inv).emisor?.regimenFiscal)),
+  excelField("emisorDomicilio", "Domicilio del emisor", "Emisor", (inv) => cfdiOf(inv).emisor?.domicilio),
+
+  excelField("receptorNombre", "Razón social del receptor", "Receptor", (inv) => cfdiOf(inv).receptor?.nombre),
+  excelField("receptorRfc", "RFC del receptor", "Receptor", (inv) => cfdiOf(inv).receptor?.rfc),
+  excelField("receptorRegimen", "Régimen fiscal del receptor", "Receptor", (inv) => decodeSat(SAT_REGIMEN, cfdiOf(inv).receptor?.regimenFiscal)),
+  excelField("receptorDomicilio", "Domicilio fiscal del receptor", "Receptor", (inv) => cfdiOf(inv).receptor?.domicilioFiscal),
+
+  excelField("subtotal", "Subtotal", "Importes", importeOf("subtotal"), "money"),
+  excelField("descuento", "Descuento", "Importes", importeOf("descuento"), "money"),
+  excelField("iva", "IVA", "Importes", importeOf("iva"), "money"),
+  excelField("ieps", "IEPS", "Importes", importeOf("ieps"), "money"),
+  excelField("ish", "ISH (hospedaje)", "Importes", importeOf("ish"), "money"),
+  excelField("otrosImpuestos", "Otros impuestos", "Importes", importeOf("otrosImpuestos"), "money"),
+  excelField("retencionIVA", "Retención de IVA", "Importes", importeOf("retencionIVA"), "money"),
+  excelField("retencionISR", "Retención de ISR", "Importes", importeOf("retencionISR"), "money"),
+  excelField("propina", "Propina", "Importes", importeOf("propina"), "money"),
+  excelField("total", "Total del comprobante", "Importes", importeOf("total"), "money"),
+  excelField("totalConLetra", "Total con letra", "Importes", importeOf("totalConLetra")),
+
+  excelField("partidas", "Partidas", "Otros", invoiceConcepts),
+  excelField("otros", "Otros datos del comprobante", "Otros", (inv) => (cfdiOf(inv).otros ?? []).map((o) => `${o.campo}: ${o.valor}`).join("; ")),
+];
+
+const EXCEL_EPOCH = Date.UTC(1899, 11, 30);
+const EXCEL_STYLE = { header: 1, money: 2, date: 3, datetime: 4 };
+
+// Fecha local → número de serie de Excel (días desde 1899-12-30).
+function excelSerial(d) {
+  return (Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds()) - EXCEL_EPOCH) / DAY_MS;
+}
+
+// Una celda: número (con su formato) o texto. Vacía si no hay dato.
+function excelCell(value, type) {
+  if (value === undefined || value === null || value === "") return null;
+  if (type === "money" || type === "number") {
+    const n = Number(value);
+    return Number.isFinite(n) ? { number: n, style: type === "money" ? EXCEL_STYLE.money : 0 } : { text: String(value) };
+  }
+  if (type === "date" && /^\d{4}-\d{2}-\d{2}/.test(value)) return { number: excelSerial(parseISODate(value)), style: EXCEL_STYLE.date };
+  if (type === "datetime") {
+    const d = new Date(value);
+    if (!Number.isNaN(d.getTime())) return { number: excelSerial(d), style: EXCEL_STYLE.datetime };
+  }
+  return { text: String(value) };
+}
+
+// Excel no acepta caracteres de control en el XML y corta las celdas en 32,767.
+const xmlText = (value) =>
+  String(value)
+    .slice(0, 32767)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g, "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+function excelColumn(index) {
+  let n = index + 1;
+  let name = "";
+  while (n > 0) {
+    name = String.fromCharCode(65 + ((n - 1) % 26)) + name;
+    n = Math.floor((n - 1) / 26);
+  }
+  return name;
+}
+
+const XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+const SHEET_NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
+
+// Los textos van como "inlineStr": Excel nunca los interpreta como fórmula,
+// aunque empiecen con "=".
+function excelSheetXml({ header, rows }) {
+  const cellXml = (cell, ref) => {
+    if (!cell) return "";
+    const style = cell.style ? ` s="${cell.style}"` : "";
+    if (cell.number !== undefined) return `<c r="${ref}"${style}><v>${cell.number}</v></c>`;
+    return `<c r="${ref}" t="inlineStr"${style}><is><t xml:space="preserve">${xmlText(cell.text)}</t></is></c>`;
+  };
+  const allRows = [header.map((label) => ({ text: label, style: EXCEL_STYLE.header })), ...rows];
+  const widths = header.map((_, c) =>
+    Math.min(50, Math.max(10, ...allRows.map((row) => (row[c]?.text !== undefined ? String(row[c].text).length + 2 : row[c] ? 14 : 0))))
+  );
+  const lastRef = `${excelColumn(header.length - 1)}${allRows.length}`;
+  return (
+    `${XML_HEAD}<worksheet ${SHEET_NS}>` +
+    `<dimension ref="A1:${lastRef}"/>` +
+    '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>' +
+    '<sheetFormatPr defaultRowHeight="15"/>' +
+    `<cols>${widths.map((w, c) => `<col min="${c + 1}" max="${c + 1}" width="${w}" customWidth="1"/>`).join("")}</cols>` +
+    `<sheetData>${allRows
+      .map((row, r) => `<row r="${r + 1}">${row.map((cell, c) => cellXml(cell, `${excelColumn(c)}${r + 1}`)).join("")}</row>`)
+      .join("")}</sheetData>` +
+    `<autoFilter ref="A1:${lastRef}"/>` +
+    "</worksheet>"
+  );
+}
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Un .xlsx es un zip de archivos XML. Se arma aquí, sin comprimir, para no
+// pasar los datos de las facturas por una librería externa.
+function zipFiles(files, type) {
+  const encoder = new TextEncoder();
+  const now = new Date();
+  const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const parts = [];
+  const directory = [];
+  let offset = 0;
+  for (const file of files) {
+    const name = encoder.encode(file.name);
+    const data = encoder.encode(file.data);
+    const crc = crc32(data);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0x0800, true);
+    local.setUint16(10, dosTime, true);
+    local.setUint16(12, dosDate, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true);
+    local.setUint32(22, data.length, true);
+    local.setUint16(26, name.length, true);
+    parts.push(new Uint8Array(local.buffer), name, data);
+    const entry = new DataView(new ArrayBuffer(46));
+    entry.setUint32(0, 0x02014b50, true);
+    entry.setUint16(4, 20, true);
+    entry.setUint16(6, 20, true);
+    entry.setUint16(8, 0x0800, true);
+    entry.setUint16(12, dosTime, true);
+    entry.setUint16(14, dosDate, true);
+    entry.setUint32(16, crc, true);
+    entry.setUint32(20, data.length, true);
+    entry.setUint32(24, data.length, true);
+    entry.setUint16(28, name.length, true);
+    entry.setUint32(42, offset, true);
+    directory.push(new Uint8Array(entry.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const directorySize = directory.reduce((s, part) => s + part.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, files.length, true);
+  end.setUint16(10, files.length, true);
+  end.setUint32(12, directorySize, true);
+  end.setUint32(16, offset, true);
+  return new Blob([...parts, ...directory, new Uint8Array(end.buffer)], { type });
+}
+
+function buildXlsx(sheets, dateFormat) {
+  const dateCode = dateFormat === "MM/DD/AAAA" ? "mm/dd/yyyy" : "dd/mm/yyyy";
+  const rel = (id, type, target) => `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" Target="${target}"/>`;
+  const files = [
+    {
+      name: "[Content_Types].xml",
+      data:
+        `${XML_HEAD}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+        sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("") +
+        "</Types>",
+    },
+    {
+      name: "_rels/.rels",
+      data: `${XML_HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rel("rId1", "officeDocument", "xl/workbook.xml")}</Relationships>`,
+    },
+    {
+      name: "xl/workbook.xml",
+      data:
+        `${XML_HEAD}<workbook ${SHEET_NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
+        `<sheets>${sheets.map((s, i) => `<sheet name="${xmlText(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets>` +
+        `<definedNames>${sheets
+          .map((s, i) => `<definedName name="_xlnm._FilterDatabase" localSheetId="${i}" hidden="1">'${xmlText(s.name)}'!$A$1:$${excelColumn(s.header.length - 1)}$${s.rows.length + 1}</definedName>`)
+          .join("")}</definedNames>` +
+        "</workbook>",
+    },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      data:
+        `${XML_HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        sheets.map((_, i) => rel(`rId${i + 1}`, "worksheet", `worksheets/sheet${i + 1}.xml`)).join("") +
+        rel(`rId${sheets.length + 1}`, "styles", "styles.xml") +
+        "</Relationships>",
+    },
+    {
+      name: "xl/styles.xml",
+      data:
+        `${XML_HEAD}<styleSheet ${SHEET_NS}>` +
+        `<numFmts count="3"><numFmt numFmtId="164" formatCode="#,##0.00"/><numFmt numFmtId="165" formatCode="${dateCode}"/><numFmt numFmtId="166" formatCode="${dateCode} hh:mm"/></numFmts>` +
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>' +
+        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF2563EB"/><bgColor indexed="64"/></patternFill></fill></fills>' +
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+        '<cellXfs count="5">' +
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
+        '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' +
+        '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' +
+        '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' +
+        "</cellXfs>" +
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
+        "</styleSheet>",
+    },
+    ...sheets.map((sheet, i) => ({ name: `xl/worksheets/sheet${i + 1}.xml`, data: excelSheetXml(sheet) })),
+  ];
+  return zipFiles(files, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+}
+
+// Una fila por partida del comprobante. Para ubicar cada una se repiten los
+// datos de su factura que la persona dejó incluidos.
+function excelLineItemsSheet(rows, fieldIds, ctx) {
+  const reference = EXCEL_FIELDS.filter((f) => ["date", "vendor", "folio", "uuid"].includes(f.id) && fieldIds.includes(f.id));
+  const taxText = (tax) =>
+    [tax.tipo, tax.tasa !== undefined ? `${+(Number(tax.tasa) * 100).toFixed(4)}%` : null, tax.importe !== undefined ? formatMoney(tax.importe, ctx.currency) : null]
+      .filter(Boolean)
+      .join(" ");
+  const lineColumns = [
+    ["Cantidad", (l) => l.cantidad, "number"],
+    ["Unidad", (l) => l.unidad],
+    ["Clave SAT", (l) => l.claveProdServ],
+    ["Descripción", (l) => l.descripcion],
+    ["Valor unitario", (l) => l.valorUnitario, "money"],
+    ["Importe", (l) => l.importe, "money"],
+    ["Impuestos", (l) => (l.impuestos ?? []).map(taxText).join(", ")],
+  ];
+  return {
+    name: "Partidas",
+    header: [...reference.map((f) => f.label), ...lineColumns.map(([label]) => label)],
+    rows: rows.flatMap((inv) =>
+      (cfdiOf(inv).conceptos ?? []).map((line) => [
+        ...reference.map((f) => excelCell(f.get(inv, ctx), f.type)),
+        ...lineColumns.map(([, get, type]) => excelCell(get(line), type)),
+      ])
+    ),
+  };
+}
+
+const EXCEL_PERIODS = [{ id: "all", label: "Todas las fechas" }, ...SUMMARY_PERIODS.filter((p) => p.id !== "all"), { id: "custom", label: "Elegir fechas" }];
+const DEFAULT_EXCEL = { excluded: [], period: "all", from: "", to: "", includeClosed: false, lineItems: true };
+
+function ExcelExportModal({ invoices, sectionLabel, currency, onClose }) {
+  const { format } = useDateFormat();
+  // Lo que se quita se recuerda en este navegador; un dato nuevo entra marcado.
+  const [saved, setSaved] = usePersistentState("navio.invoices.excel.v1", DEFAULT_EXCEL);
+  const options = { ...DEFAULT_EXCEL, ...saved };
+  const set = (patch) => setSaved((prev) => ({ ...DEFAULT_EXCEL, ...prev, ...patch }));
+  const period = options.period === "custom" ? { from: options.from, to: options.to } : options.period;
+  const badRange = options.period === "custom" && options.from && options.to && options.from > options.to;
+  const rows = invoices
+    .filter((i) => inSummaryPeriod(i, period) && (options.includeClosed || !isInvoiceClosed(i)))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const fields = EXCEL_FIELDS.filter((f) => !options.excluded.includes(f.id));
+  const groups = [...new Set(EXCEL_FIELDS.map((f) => f.group))];
+  const lineCount = rows.reduce((s, i) => s + (cfdiOf(i).conceptos?.length ?? 0), 0);
+  const canDownload = rows.length > 0 && fields.length > 0 && !badRange;
+  const inputClass = "rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
+  const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
+
+  function toggleField(id) {
+    set({ excluded: options.excluded.includes(id) ? options.excluded.filter((x) => x !== id) : [...options.excluded, id] });
+  }
+  function setGroup(group, on) {
+    const ids = EXCEL_FIELDS.filter((f) => f.group === group).map((f) => f.id);
+    set({ excluded: on ? options.excluded.filter((id) => !ids.includes(id)) : [...new Set([...options.excluded, ...ids])] });
+  }
+
+  function download() {
+    const ctx = { currency };
+    const sheets = [{ name: "Facturas", header: fields.map((f) => f.label), rows: rows.map((inv) => fields.map((f) => excelCell(f.get(inv, ctx), f.type))) }];
+    if (options.lineItems && lineCount > 0) sheets.push(excelLineItemsSheet(rows, fields.map((f) => f.id), ctx));
+    const url = URL.createObjectURL(buildXlsx(sheets, format));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `Facturas - ${sectionLabel} - ${localISODate()}.xlsx`.replace(/[\\/:*?"<>|]+/g, "-");
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    onClose();
+  }
+
+  return (
+    <Modal title="Descargar Excel" width="max-w-3xl" onClose={onClose}>
+      <div className="max-h-[70vh] space-y-4 overflow-y-auto pr-1">
+        <p className="text-xs text-slate-500">
+          Facturas de: <b className="text-slate-700">{sectionLabel}</b>. Cada factura es una fila y cada dato marcado, una columna.
+        </p>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div>
+            <label className={labelClass}>Periodo</label>
+            <select value={options.period} onChange={(e) => set({ period: e.target.value })} className={`w-full ${inputClass}`}>
+              {EXCEL_PERIODS.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          {options.period === "custom" && (
+            <>
+              <div>
+                <label className={labelClass}>Desde</label>
+                <input type="date" value={options.from} onChange={(e) => set({ from: e.target.value })} className={`w-full ${inputClass}`} />
+              </div>
+              <div>
+                <label className={labelClass}>Hasta</label>
+                <input type="date" value={options.to} onChange={(e) => set({ to: e.target.value })} className={`w-full ${inputClass}`} />
+              </div>
+            </>
+          )}
+        </div>
+        {badRange && <p className="text-[11px] font-medium text-rose-600">La fecha "Desde" va después de "Hasta".</p>}
+        <div className="space-y-1.5">
+          <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-600">
+            <input type="checkbox" checked={options.includeClosed} onChange={(e) => set({ includeClosed: e.target.checked })} className="h-4 w-4 accent-blue-600" />
+            Incluir facturas rechazadas y anuladas
+          </label>
+          <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-600">
+            <input type="checkbox" checked={options.lineItems} onChange={(e) => set({ lineItems: e.target.checked })} className="h-4 w-4 accent-blue-600" />
+            Agregar una hoja con las partidas de cada factura ({countLabel(lineCount, "partida")})
+          </label>
+        </div>
+
+        <div>
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-[11px] font-semibold text-slate-500">Datos a incluir (desmarca los que no quieras en el Excel)</p>
+            <div className="flex gap-3 text-[11px] font-semibold text-blue-600">
+              <button onClick={() => set({ excluded: [] })}>Todos</button>
+              <button onClick={() => set({ excluded: EXCEL_FIELDS.map((f) => f.id) })}>Ninguno</button>
+            </div>
+          </div>
+          <div className="space-y-3">
+            {groups.map((group) => {
+              const groupFields = EXCEL_FIELDS.filter((f) => f.group === group);
+              const allOn = groupFields.every((f) => !options.excluded.includes(f.id));
+              return (
+                <div key={group}>
+                  <label className="mb-1.5 flex cursor-pointer items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                    <input type="checkbox" checked={allOn} onChange={() => setGroup(group, !allOn)} className="h-3.5 w-3.5 accent-blue-600" />
+                    {group}
+                  </label>
+                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+                    {groupFields.map((f) => (
+                      <label key={f.id} className="flex cursor-pointer items-center justify-between gap-2 rounded-lg border border-slate-100 px-2.5 py-1.5 hover:bg-slate-50">
+                        <span className="text-xs font-medium text-slate-600">{f.label}</span>
+                        <input type="checkbox" checked={!options.excluded.includes(f.id)} onChange={() => toggleField(f.id)} className="h-4 w-4 shrink-0 accent-blue-600" />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[11px] text-slate-400">
+          {countLabel(rows.length, "factura")} · {countLabel(fields.length, "columna")}
+        </p>
+        <div className="flex gap-2">
+          <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+            Cancelar
+          </button>
+          <button
+            onClick={download}
+            disabled={!canDownload}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            <Download size={13} /> Descargar Excel
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -6268,7 +7266,7 @@ function InvoiceOverview({
   const countable = invoices.filter((i) => !isInvoiceClosed(i));
   const periodInvoices = countable.filter((i) => inSummaryPeriod(i, period));
   const periodPhrase = summaryPeriod(period).phrase;
-  const selectedWidgets = widgetPrefs.general ?? SUMMARY_CATALOGS.general.defaults;
+  const generalEntries = widgetEntries(widgetPrefs.general, SUMMARY_CATALOGS.general);
 
   const ordersMissingDocs = orders.filter((o) => o.missingDocs);
   const unverifiedCount = invoices.filter((i) => i.status === "pending").length;
@@ -6527,7 +7525,7 @@ function InvoiceOverview({
           </div>
         </div>
 
-        {selectedWidgets.filter((id) => generalCards[id]).map((id) => (
+        {generalEntries.map(({ id }) => (
           <React.Fragment key={id}>{generalCards[id]}</React.Fragment>
         ))}
       </div>
@@ -6620,9 +7618,9 @@ function InvoiceOverview({
       {customizing && (
         <SummaryWidgetsModal
           widgets={SUMMARY_CATALOGS.general.widgets}
-          selected={selectedWidgets}
-          defaults={SUMMARY_CATALOGS.general.defaults}
-          onChange={(ids) => onWidgetPrefsChange({ ...widgetPrefs, general: ids })}
+          entries={generalEntries}
+          defaults={widgetEntries(undefined, SUMMARY_CATALOGS.general)}
+          onChange={(entries) => onWidgetPrefsChange({ ...widgetPrefs, general: entries })}
           onClose={() => setCustomizing(false)}
         />
       )}
@@ -6630,9 +7628,10 @@ function InvoiceOverview({
   );
 }
 
-// Dónde está la persona dentro de Facturas y Gastos:
-// Resumen general o un concepto, o bien Proyectos → un proyecto → un concepto.
-const INVOICE_NAV_START = { inProjects: false, project: null, concept: "overview" };
+// Dónde está la persona dentro de Facturas y Gastos: el resumen general, o
+// Proyectos → un proyecto → un concepto. "report" muestra el reporte armado.
+const INVOICE_NAV_START = { inProjects: false, project: null, concept: "overview", report: false };
+const INVOICE_NAV_PROJECTS = { inProjects: true, project: null, concept: "overview", report: false };
 const PROJECT_SCOPES = [
   { id: "active", label: "Activos" },
   { id: "all", label: "Totales" },
@@ -6641,7 +7640,7 @@ const PROJECT_SCOPES = [
 function FuelPage({
   invoices,
   orders,
-  projectSettings,
+  projects,
   deadlineDays,
   reminders,
   isAdmin,
@@ -6662,6 +7661,10 @@ function FuelPage({
   // Un concepto se revisa mes a mes; un proyecto se mide completo.
   const [periods, setPeriods] = usePersistentState("navio.invoices.periods.v1", { general: "month", projects: "all" });
   const [projectScope, setProjectScope] = usePersistentState("navio.invoices.projectScope.v1", "active");
+  const [chartGroup, setChartGroup] = usePersistentState("navio.invoices.chartGroup.v1", "auto");
+  const [savedReport, setSavedReport] = usePersistentState("navio.invoices.report.v1", DEFAULT_REPORT);
+  const [reportDraft, setReportDraft] = useState(null);
+  const [excelOpen, setExcelOpen] = useState(false);
   const [columnPickerView, setColumnPickerView] = useState(null);
   const [detailKey, setDetailKey] = useState(null);
   const detailInvoice = invoices.find((i) => i.key === detailKey) ?? null;
@@ -6671,7 +7674,6 @@ function FuelPage({
   const [showVoided, setShowVoided] = usePersistentState("navio.invoices.showVoided", false);
 
   const { inProjects, project: projectName, concept } = nav;
-  const projects = useMemo(() => buildProjects(invoices, orders, projectSettings), [invoices, orders, projectSettings]);
   const namedProjects = projects.filter((p) => p.name);
   const activeProjects = namedProjects.filter((p) => !p.closed);
   const scopedProjects = projectScope === "active" ? activeProjects : namedProjects;
@@ -6684,8 +7686,19 @@ function FuelPage({
   const periodKey = inProjects ? "projects" : "general";
   const period = periods[periodKey] ?? "month";
   const setPeriod = (id) => setPeriods((prev) => ({ ...prev, [periodKey]: id }));
-  const openProject = (name) => onNavChange({ inProjects: true, project: name, concept: "overview" });
+  const openProject = (name) => onNavChange({ ...INVOICE_NAV_PROJECTS, project: name });
   const conceptLabel = (id) => CONCEPT_CATEGORIES.find((c) => c.id === id)?.label ?? "";
+  // El reporte arranca con el alcance de la pantalla donde se pidió.
+  const currentScopeId = currentProject
+    ? currentProject.name
+      ? `project:${currentProject.name}`
+      : "loose"
+    : inProjects
+    ? projectScope === "active"
+      ? "projects-active"
+      : "projects-all"
+    : "all";
+  const openReportBuilder = () => setReportDraft({ ...DEFAULT_REPORT, ...savedReport, scope: nav.report ? savedReport.scope : currentScopeId });
 
   const view = concept !== "overview" ? concept : inProjects ? "project" : "overview";
   // Dentro de un proyecto no hace falta repetir de qué proyecto es cada factura.
@@ -6704,8 +7717,21 @@ function FuelPage({
   const voidedCount = conceptInvoices.filter((i) => i.status === "voided").length;
   const categoryRows = conceptInvoices.filter((i) => showVoided || i.status !== "voided");
   const tableTools = (
-    <InvoiceTableTools showVoided={showVoided} voidedCount={voidedCount} onToggleVoided={setShowVoided} onOpenColumns={() => setColumnPickerView(view)} />
+    <InvoiceTableTools
+      showVoided={showVoided}
+      voidedCount={voidedCount}
+      onToggleVoided={setShowVoided}
+      onOpenColumns={() => setColumnPickerView(view)}
+      onExport={() => setExcelOpen(true)}
+    />
   );
+  // Lo que cubre el Excel: la sección donde está la persona.
+  const excelSection = [
+    !inProjects ? "Todas las facturas" : currentProject ? currentProject.name || "Sin proyecto" : projectScope === "active" ? "Proyectos activos" : "Todos los proyectos",
+    concept !== "overview" ? conceptLabel(concept) : null,
+  ]
+    .filter(Boolean)
+    .join(" - ");
   const emptyLabel = currentProject
     ? concept === "overview"
       ? "Este proyecto todavía no tiene facturas."
@@ -6716,7 +7742,41 @@ function FuelPage({
     ? "Sin viáticos registrados todavía."
     : `Sin registros de ${conceptLabel(concept).toLowerCase()} todavía.`;
 
-  const summaryProps = { currency, period, onPeriodChange: setPeriod, widgetPrefs, onWidgetPrefsChange: setWidgetPrefs };
+  const summaryProps = { currency, period, onPeriodChange: setPeriod, group: chartGroup, onGroupChange: setChartGroup, widgetPrefs, onWidgetPrefsChange: setWidgetPrefs };
+  const conceptProps = { period, group: chartGroup, currency, widgetPrefs, onWidgetPrefsChange: setWidgetPrefs, onOpen: (id) => onNavChange({ ...nav, concept: id }) };
+  const reportBuilder = reportDraft && (
+    <ReportBuilderModal
+      initial={reportDraft}
+      projects={projects}
+      onGenerate={(report) => {
+        setSavedReport(report);
+        setReportDraft(null);
+        onNavChange({ ...nav, report: true });
+      }}
+      onClose={() => setReportDraft(null)}
+    />
+  );
+
+  if (nav.report) {
+    return (
+      <div className="space-y-5">
+        <div className="print:hidden">
+          <InvoiceBreadcrumb items={[{ label: "Facturas y Gastos", onClick: () => onNavChange({ ...nav, report: false }) }, { label: "Reporte" }]} />
+        </div>
+        <InvoiceReport
+          report={{ ...DEFAULT_REPORT, scope: "all", ...savedReport }}
+          invoices={invoices}
+          orders={orders}
+          projects={projects}
+          currency={currency}
+          userName={userName}
+          onEdit={openReportBuilder}
+          onBack={() => onNavChange({ ...nav, report: false })}
+        />
+        {reportBuilder}
+      </div>
+    );
+  }
   const invoiceTable = (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -6733,7 +7793,7 @@ function FuelPage({
   const projectLabel = currentProject ? currentProject.name || "Sin proyecto" : "";
   const breadcrumb = inProjects && [
     { label: "Facturas y Gastos", onClick: () => onNavChange(INVOICE_NAV_START) },
-    currentProject || concept !== "overview" ? { label: "Proyectos", onClick: () => onNavChange({ inProjects: true, project: null, concept: "overview" }) } : { label: "Proyectos" },
+    currentProject || concept !== "overview" ? { label: "Proyectos", onClick: () => onNavChange(INVOICE_NAV_PROJECTS) } : { label: "Proyectos" },
     ...(currentProject ? [concept !== "overview" ? { label: projectLabel, onClick: () => openProject(currentProject.name) } : { label: projectLabel }] : []),
     ...(concept !== "overview" ? [{ label: conceptLabel(concept) }] : []),
   ];
@@ -6771,6 +7831,12 @@ function FuelPage({
             </button>
           )}
           <button
+            onClick={openReportBuilder}
+            className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+          >
+            <BarChart3 size={14} /> Crear reporte
+          </button>
+          <button
             onClick={() => onAddInvoice(INVOICE_CATEGORY_TYPE[concept], currentProject?.name ?? "")}
             className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
           >
@@ -6780,6 +7846,7 @@ function FuelPage({
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-2">
+        {/* Los conceptos se ven dentro de Proyectos; el resumen general no los separa. */}
         {inProjects ? (
           <PillTabs
             tabs={[{ id: "overview", label: currentProject ? "Resumen del proyecto" : "Resumen de proyectos" }, ...CONCEPT_CATEGORIES]}
@@ -6788,9 +7855,9 @@ function FuelPage({
           />
         ) : (
           <PillTabs
-            tabs={[INVOICE_CATEGORIES[0], { id: "projects", label: "Proyectos" }, ...CONCEPT_CATEGORIES]}
+            tabs={[INVOICE_CATEGORIES[0], { id: "projects", label: "Proyectos" }]}
             active={concept}
-            onSelect={(id) => onNavChange(id === "projects" ? { inProjects: true, project: null, concept: "overview" } : { ...INVOICE_NAV_START, concept: id })}
+            onSelect={(id) => onNavChange(id === "projects" ? INVOICE_NAV_PROJECTS : INVOICE_NAV_START)}
           />
         )}
         {inProjects && !currentProject && (
@@ -6831,7 +7898,7 @@ function FuelPage({
       {view === "project" && !currentProject && (
         <>
           <InvoiceSummary catalogId="projects" invoices={scopeInvoices} orders={scopeOrders} projects={scopedProjects} {...summaryProps} />
-          <ConceptBreakdown invoices={scopeInvoices} period={period} currency={currency} onOpen={(id) => onNavChange({ ...nav, concept: id })} />
+          <ConceptBreakdown invoices={scopeInvoices} {...conceptProps} />
           <div className="space-y-3">
             <h2 className="text-sm font-bold text-slate-800">Proyectos</h2>
             {scopedProjects.length === 0 && (
@@ -6860,7 +7927,7 @@ function FuelPage({
       {view === "project" && currentProject && (
         <>
           <InvoiceSummary catalogId="project" invoices={scopeInvoices} orders={scopeOrders} {...summaryProps} />
-          <ConceptBreakdown invoices={scopeInvoices} period={period} currency={currency} onOpen={(id) => onNavChange({ ...nav, concept: id })} />
+          <ConceptBreakdown invoices={scopeInvoices} {...conceptProps} />
           {invoiceTable}
         </>
       )}
@@ -6872,6 +7939,8 @@ function FuelPage({
         </>
       )}
 
+      {reportBuilder}
+      {excelOpen && <ExcelExportModal invoices={conceptInvoices} sectionLabel={excelSection} currency={currency} onClose={() => setExcelOpen(false)} />}
       {columnPickerView && (
         <ColumnPickerModal
           view={columnPickerView}
@@ -9432,8 +10501,47 @@ function BotFeedPanel() {
   );
 }
 
-function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLogoClick, isSuperAdmin }) {
-  const [expanded, setExpanded] = useState({ maintenance: true, compliance: true });
+// Minisecciones de Facturas y Gastos: General, Proyectos y cada proyecto activo.
+function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggleProjects, onNav }) {
+  const item = (isActive) =>
+    `block w-full truncate rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition ${
+      isActive ? "bg-blue-50 text-blue-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+    }`;
+  const inReport = nav.report;
+  return (
+    <div className="ml-[22px] mt-1 space-y-0.5 border-l border-slate-100 pl-3">
+      <button onClick={() => onNav(INVOICE_NAV_START)} className={item(active && !inReport && !nav.inProjects)}>
+        General
+      </button>
+      <div className="flex items-center gap-0.5">
+        <button onClick={() => onNav(INVOICE_NAV_PROJECTS)} className={`${item(active && !inReport && nav.inProjects && nav.project === null)} flex-1`}>
+          Proyectos
+        </button>
+        <button
+          onClick={onToggleProjects}
+          aria-label={expanded ? "Ocultar proyectos" : "Mostrar proyectos"}
+          aria-expanded={expanded}
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-50 hover:text-slate-600"
+        >
+          {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+        </button>
+      </div>
+      {expanded && (
+        <div className="ml-2 space-y-0.5 border-l border-slate-100 pl-2">
+          {projects.map((name) => (
+            <button key={name} title={name} onClick={() => onNav({ ...INVOICE_NAV_PROJECTS, project: name })} className={item(active && !inReport && nav.project === name)}>
+              {name}
+            </button>
+          ))}
+          {projects.length === 0 && <p className="px-2.5 py-1 text-[11px] text-slate-400">Sin proyectos activos</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLogoClick, isSuperAdmin, invoiceMenu }) {
+  const [expanded, setExpanded] = useState({ maintenance: true, compliance: true, fuel: true, invoiceProjects: true });
 
   function toggleExpanded(id) {
     setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -9441,7 +10549,7 @@ function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLo
 
   return (
     <aside
-      className={`sticky top-0 flex h-screen shrink-0 flex-col border-r border-slate-200 bg-white transition-all duration-200 ${
+      className={`sticky top-0 flex h-screen shrink-0 flex-col border-r border-slate-200 bg-white transition-all duration-200 print:hidden ${
         open ? "w-64" : "w-[72px]"
       }`}
     >
@@ -9458,13 +10566,15 @@ function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLo
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
           const active = activeTab === item.id;
-          const hasChildren = !!item.children;
+          const isInvoices = item.id === "fuel" && !!invoiceMenu;
+          const hasChildren = !!item.children || isInvoices;
           return (
             <div key={item.id}>
               <button
                 onClick={() => {
                   onNavigate(item.id);
-                  if (hasChildren) toggleExpanded(item.id);
+                  // Al llegar desde otra sección se abre; estando ahí, se pliega o despliega.
+                  if (hasChildren) setExpanded((prev) => ({ ...prev, [item.id]: active ? !prev[item.id] : true }));
                 }}
                 title={item.label}
                 className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
@@ -9477,7 +10587,17 @@ function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLo
                   expanded[item.id] ? <ChevronUp size={14} className="shrink-0" /> : <ChevronDown size={14} className="shrink-0" />
                 )}
               </button>
-              {open && hasChildren && expanded[item.id] && (
+              {open && isInvoices && expanded.fuel && (
+                <InvoiceSidebarMenu
+                  active={active}
+                  nav={invoiceMenu.nav}
+                  projects={invoiceMenu.projects}
+                  expanded={expanded.invoiceProjects}
+                  onToggleProjects={() => toggleExpanded("invoiceProjects")}
+                  onNav={invoiceMenu.onNav}
+                />
+              )}
+              {open && item.children && expanded[item.id] && (
                 <div className="ml-[22px] mt-1 space-y-0.5 border-l border-slate-100 pl-3">
                   {item.children.map((child) => {
                     const childActive = active && activeSubId === child.id;
@@ -10221,6 +11341,11 @@ function NavioApp() {
   const countableFuelRecords = useMemo(() => fuelRecords.filter((r) => r.status !== "rejected" && r.status !== "voided"), [fuelRecords]);
   const deadlineDays = useMemo(() => getDeadlineDays(deadlineRows), [deadlineRows]);
   const invoiceOrders = useMemo(() => buildOrders(invoices, workOrderRows, deadlineDays), [invoices, workOrderRows, deadlineDays]);
+  const invoiceProjects = useMemo(() => buildProjects(invoices, invoiceOrders, projectSettings), [invoices, invoiceOrders, projectSettings]);
+  const sidebarProjects = useMemo(
+    () => invoiceProjects.filter((p) => p.name && !p.closed).map((p) => p.name).sort((a, b) => a.localeCompare(b, "es")),
+    [invoiceProjects]
+  );
   const projectOptions = useMemo(
     () =>
       [...new Set([...invoices.map((i) => i.project), ...workOrderRows.map((w) => (w.project || "").trim())].filter(Boolean))].sort(),
@@ -10546,10 +11671,18 @@ function NavioApp() {
             onNavigateSub={(parentId, childId) => goToTab(parentId, childId)}
             onLogoClick={goHome}
             isSuperAdmin={!!profile?.isSuperAdmin}
+            invoiceMenu={{
+              nav: invoiceNav,
+              projects: sidebarProjects,
+              onNav: (nav) => {
+                goToTab("fuel");
+                setInvoiceNav(nav);
+              },
+            }}
           />
 
           <div className="flex min-h-screen min-w-0 flex-1 flex-col">
-            <div data-keep-open>
+            <div data-keep-open className="print:hidden">
               <Header
                 toggleSidebar={() => setSidebarOpen((v) => !v)}
                 title={headerTitle}
@@ -10649,7 +11782,7 @@ function NavioApp() {
                     <FuelPage
                       invoices={invoices}
                       orders={invoiceOrders}
-                      projectSettings={projectSettings}
+                      projects={invoiceProjects}
                       nav={invoiceNav}
                       onNavChange={setInvoiceNav}
                       deadlineDays={deadlineDays}
