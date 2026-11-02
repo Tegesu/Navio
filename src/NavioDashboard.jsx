@@ -1592,22 +1592,6 @@ const COMPLIANCE_RECORDS_SEED = [
 /*  Mock data — Fuel                                                      */
 /* ---------------------------------------------------------------------- */
 
-function getFuelWidgets(records, currency = "MXN") {
-  const totalSpend = records.reduce((s, r) => s + (r.amount || 0), 0);
-  const totalLiters = records.reduce((s, r) => s + (r.liters || 0), 0);
-  const withEfficiency = records.filter((r) => r.efficiency);
-  const avgEfficiency = withEfficiency.length
-    ? withEfficiency.reduce((s, r) => s + r.efficiency, 0) / withEfficiency.length
-    : null;
-  const ocrCount = records.filter((r) => r.origin === "whatsapp").length;
-  return [
-    { id: "totalSpend", label: "Gasto Total del Mes", icon: DollarSign, value: formatCurrency(totalSpend, currency), detail: `${records.length} registro${records.length === 1 ? "" : "s"}`, tone: "blue" },
-    { id: "liters", label: "Litros Consumidos", icon: Droplet, value: `${totalLiters.toLocaleString()} L`, detail: "Total registrado", tone: "sky" },
-    { id: "efficiency", label: "Rendimiento Promedio", icon: Activity, value: avgEfficiency ? `${avgEfficiency.toFixed(1)} km/L` : "—", detail: "Flota completa", tone: "emerald" },
-    { id: "ocr", label: "Tickets Procesados por OCR", icon: Camera, value: `${ocrCount} ticket${ocrCount === 1 ? "" : "s"}`, detail: "Vía WhatsApp", tone: "slate" },
-  ];
-}
-
 const FUEL_RECORDS_SEED = [
   { id: 301, unit: "Unidad 07", plate: "XKT-880-A", station: "Pemex Nanchital", liters: 180, amount: 3960, odometer: 208900, efficiency: 3.4, date: "2026-08-12", vendor: "Pemex Nanchital", invoiceFolio: "T-99021", origin: "whatsapp", status: "pending", notes: "Ticket foto procesado por OCR" },
   { id: 302, unit: "Unidad 12", plate: "YZA-142-B", station: "Pemex Coatzacoalcos Centro", liters: 210, amount: 4620, odometer: 152400, efficiency: 3.8, date: "2026-08-11", vendor: "Pemex Coatzacoalcos Centro", invoiceFolio: "T-98884", origin: "whatsapp", status: "verified", notes: "" },
@@ -1675,13 +1659,16 @@ function StatusBadge({ status }) {
 function KpiCard({ widget }) {
   const Icon = widget.icon;
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
       <span className={`flex h-9 w-9 items-center justify-center rounded-lg ${TONE_CLASSES[widget.tone]}`}>
         <Icon size={16} />
       </span>
       <p className="mt-3 text-xs font-medium text-slate-500">{widget.label}</p>
-      <p className="text-lg font-bold text-slate-800">{widget.value}</p>
+      <p className="truncate text-lg font-bold text-slate-800" title={String(widget.value)}>
+        {widget.value}
+      </p>
       <p className="text-[11px] text-slate-400">{widget.detail}</p>
+      {widget.trend && <SparkBars values={widget.trend} barClass={widget.trendClass} />}
     </div>
   );
 }
@@ -2366,6 +2353,57 @@ function expenseTypesForEdit(module, category) {
   return EXPENSE_TYPES.filter((t) => t.module === module && (module !== "misc" || t.category === category));
 }
 
+// Datos propios de cada concepto. Viven en la columna "details" (migración
+// v16); los de combustible que ya tenían columna (litros, odómetro...) siguen
+// en la suya.
+const DESTINATION_PARAM = { id: "destination", label: "Destino", placeholder: "Ej. Mérida" };
+const PEOPLE_PARAM = { id: "people", label: "Personas", number: true };
+const DRIVER_PARAM = { id: "driver", label: "Conductor", placeholder: "Nombre del conductor" };
+const ROUTE_PARAM = { id: "route", label: "Ruta", placeholder: "Ej. Coatzacoalcos - Mérida" };
+const QUANTITY_PARAM = { id: "quantity", label: "Cantidad", number: true };
+const ODOMETER_PARAM = { id: "odometerKm", label: "Odómetro (km)", number: true };
+const EXPENSE_PARAMS = {
+  gasolina: [{ id: "fuelType", label: "Tipo de combustible", options: ["Magna", "Premium", "Diésel", "Otro"] }, DRIVER_PARAM],
+  viaticos: [DESTINATION_PARAM, { id: "tripDays", label: "Días del viaje", number: true }, PEOPLE_PARAM],
+  hotel: [DESTINATION_PARAM, { id: "nights", label: "Noches", number: true }, PEOPLE_PARAM],
+  alimentos: [DESTINATION_PARAM, PEOPLE_PARAM],
+  transporte: [{ id: "transportType", label: "Tipo de transporte", options: ["Avión", "Autobús", "Taxi o app", "Renta de auto", "Otro"] }, ROUTE_PARAM, PEOPLE_PARAM],
+  otro: [DESTINATION_PARAM],
+  casetas: [
+    { id: "plaza", label: "Caseta o plaza", placeholder: "Ej. Cosoleacaque" },
+    ROUTE_PARAM,
+    { id: "paymentMethod", label: "Forma de pago", options: ["TAG", "Efectivo", "Tarjeta"] },
+    { id: "axles", label: "Ejes", number: true },
+    DRIVER_PARAM,
+  ],
+  consumibles: [QUANTITY_PARAM, { id: "measure", label: "Unidad de medida", options: ["Pieza", "Litro", "Kilo", "Caja", "Paquete", "Servicio"] }],
+  refrigerante: [
+    { id: "coolantType", label: "Tipo de refrigerante", placeholder: "Ej. R-134a" },
+    QUANTITY_PARAM,
+    { id: "measure", label: "Unidad de medida", options: ["Litro", "Kilo", "Galón", "Pieza"] },
+    ODOMETER_PARAM,
+  ],
+  refacciones: [
+    { id: "partNumber", label: "Número de parte" },
+    { id: "brand", label: "Marca" },
+    QUANTITY_PARAM,
+    { id: "warrantyMonths", label: "Garantía (meses)", number: true },
+    ODOMETER_PARAM,
+  ],
+};
+
+// Conserva solo los datos del concepto elegido; números como número.
+function cleanExpenseParams(expenseType, values) {
+  const out = {};
+  for (const param of EXPENSE_PARAMS[expenseType] ?? []) {
+    const raw = String(values[param.id] ?? "").trim();
+    if (!raw) continue;
+    if (!param.number) out[param.id] = raw;
+    else if (Number(raw) >= 0) out[param.id] = Number(raw);
+  }
+  return out;
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ORDER_WARN_DAYS = 2;
 
@@ -2418,7 +2456,8 @@ function normalizeInvoices({ fuel = [], travel = [], misc = [] }) {
     invoiceFolio: r.invoiceFolio || "",
     unit: r.unit || "",
     plate: r.plate || "",
-    driverName: r.driverName || "",
+    driverName: r.driverName || r.details?.driver || "",
+    details: r.details || {},
     station: r.station || "",
     odometer: Number(r.odometer) || 0,
     efficiency: Number(r.efficiency) || 0,
@@ -2452,6 +2491,32 @@ function isInvoiceClosed(inv) {
 
 function isInvoiceLocked(inv) {
   return isInvoiceClosed(inv) || inv.approved;
+}
+
+// Lo capturado a mano o, si no hay, la suma de las partidas que leyó el bot.
+function invoiceQuantity(inv) {
+  if (inv.details.quantity !== undefined) return Number(inv.details.quantity) || 0;
+  return (inv.cfdi?.conceptos ?? []).reduce((s, c) => s + (Number(c.cantidad) || 0), 0);
+}
+
+function invoiceMeasure(inv) {
+  return inv.details.measure || (inv.details.quantity === undefined ? inv.cfdi?.conceptos?.[0]?.unidad : "") || "";
+}
+
+// Las facturas que llegan por el bot traen el combustible en la descripción.
+function invoiceFuelType(inv) {
+  if (inv.module !== "fuel") return "";
+  if (inv.details.fuelType) return inv.details.fuelType;
+  const text = (inv.cfdi?.conceptos ?? []).map((c) => c.descripcion).join(" ");
+  if (/di[eé]sel/i.test(text)) return "Diésel";
+  if (/magna|regular/i.test(text)) return "Magna";
+  if (/premium/i.test(text)) return "Premium";
+  return "";
+}
+
+function invoiceUnitCost(inv) {
+  const quantity = inv.module === "fuel" ? inv.liters : invoiceQuantity(inv);
+  return quantity > 0 ? inv.amount / quantity : null;
 }
 
 // Las órdenes de trabajo se arman agrupando facturas por (proyecto, orden);
@@ -2494,6 +2559,22 @@ function buildOrders(invoices, workOrderRows = [], deadlineDays = getDeadlineDay
     }
     return { ...o, createdAt: created[0] ?? null, missingDocs, pendingVerification, complete, deadline, daysLeft };
   });
+}
+
+// Los proyectos salen del nombre escrito en facturas y órdenes. Todos están
+// activos salvo los que un administrador cerró. El nombre vacío agrupa lo que
+// todavía no tiene proyecto.
+function buildProjects(invoices, orders, settingsRows = []) {
+  const closed = new Set(settingsRows.filter((row) => row.closed).map((row) => row.project));
+  const map = new Map();
+  const ensure = (name) => {
+    if (!map.has(name)) map.set(name, { name, closed: closed.has(name), invoices: [], orders: [] });
+    return map.get(name);
+  };
+  for (const inv of invoices) ensure(inv.project).invoices.push(inv);
+  for (const order of orders) ensure(order.project).orders.push(order);
+  const spent = (p) => p.invoices.reduce((s, i) => s + (isInvoiceClosed(i) ? 0 : i.amount), 0);
+  return [...map.values()].sort((a, b) => Number(a.closed) - Number(b.closed) || spent(b) - spent(a));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -2667,7 +2748,7 @@ function cfdiWarnings(cfdi) {
   return warnings;
 }
 
-function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpenseType, initial, vehicles, orders = [], projectOptions = [], onSave, onClose }) {
+function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpenseType, presetProject = "", initial, vehicles, orders = [], projectOptions = [], onSave, onClose }) {
   const { profile } = useAuth();
   const { showToast } = useToast();
   const [moduleState, setModule] = useState(fixedModule ?? initial?.module ?? "maintenance");
@@ -2680,7 +2761,8 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
   // al editar, se queda en la tabla donde ya vive.
   const module = isInvoiceFlow && !initial ? typeTarget.module : moduleState;
   const typeOptions = initial ? expenseTypesForEdit(module, initial.category) : EXPENSE_TYPES;
-  const [project, setProject] = useState(initial?.project ?? "");
+  const [project, setProject] = useState(initial?.project ?? presetProject);
+  const [params, setParams] = useState(initial?.details ?? {});
   const [cfdi, setCfdi] = useState(initial?.cfdi ?? {});
   const [workOrder, setWorkOrder] = useState(initial?.workOrder ?? "");
   const [orderDueDate, setOrderDueDate] = useState(
@@ -2793,6 +2875,9 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
         const fiscal = buildCfdiFromForm(cfdi, base.amount);
         if (fiscal) base.cfdi = fiscal;
         else if (initial?.cfdi) base.cfdi = null;
+        const details = cleanExpenseParams(expenseType, params);
+        if (Object.keys(details).length > 0) base.details = details;
+        else if (initial?.details) base.details = null;
       }
       onSave(module, base, { orderDueDate: orderDueDate || null });
     } catch (err) {
@@ -3005,6 +3090,42 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
             <div>
               <label className={labelClass}>Rendimiento (km/L)</label>
               <input type="number" min="0" step="any" value={efficiency} onChange={(e) => setEfficiency(e.target.value)} placeholder="Ej. 3.6" className={inputClass} />
+            </div>
+          </div>
+        )}
+
+        {isInvoiceFlow && EXPENSE_PARAMS[expenseType] && (
+          <div className="rounded-xl border border-slate-200 px-3 py-2.5">
+            <p className="mb-2 text-[11px] font-semibold text-slate-600">Datos de {expenseTypeLabel(expenseType).toLowerCase()} (opcional)</p>
+            <div className="grid grid-cols-2 gap-3">
+              {EXPENSE_PARAMS[expenseType].map((param) => {
+                const setParam = (e) => setParams((prev) => ({ ...prev, [param.id]: e.target.value }));
+                return (
+                  <div key={param.id}>
+                    <label className={labelClass}>{param.label}</label>
+                    {param.options ? (
+                      <select value={params[param.id] ?? ""} onChange={setParam} className={inputClass}>
+                        <option value="">Sin indicar</option>
+                        {param.options.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type={param.number ? "number" : "text"}
+                        min={param.number ? "0" : undefined}
+                        step={param.number ? "any" : undefined}
+                        value={params[param.id] ?? ""}
+                        onChange={setParam}
+                        placeholder={param.placeholder}
+                        className={inputClass}
+                      />
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
@@ -4486,6 +4607,11 @@ const INVOICE_CATEGORIES = [
   { id: "parts", label: "Refacciones" },
   { id: "tolls", label: "Casetas" },
 ];
+const CONCEPT_CATEGORIES = INVOICE_CATEGORIES.filter((c) => c.id !== "overview");
+
+function inConcept(inv, concept) {
+  return inv.module === "misc" ? inv.raw.category === concept : inv.module === concept;
+}
 
 // Concepto que se preselecciona al darle "Cargar Factura" desde cada pestaña.
 const INVOICE_CATEGORY_TYPE = {
@@ -4550,6 +4676,17 @@ const importeColumn = (id, label, get) => ({
   },
 });
 const invoiceConcepts = (inv) => (inv.cfdi?.conceptos ?? []).map((c) => c.descripcion).filter(Boolean).join(", ");
+const paramColumn = (id, label, group, align) => ({ id, label, group, align, render: (inv) => orEmpty(inv.details[id]) });
+const unitCostColumn = (id, label, group, module) => ({
+  id,
+  label,
+  group,
+  align: "right",
+  render: (inv, ctx) => {
+    const cost = inv.module === module ? invoiceUnitCost(inv) : null;
+    return cost === null ? EMPTY_CELL : formatMoney(cost, invoiceCurrency(inv, ctx));
+  },
+});
 
 // Columnas disponibles en los desgloses, en el orden en que se muestran.
 const INVOICE_COLUMNS = [
@@ -4586,7 +4723,18 @@ const INVOICE_COLUMNS = [
     render: (inv, ctx) => <span className="font-semibold text-slate-700">{formatMoney(inv.amount, invoiceCurrency(inv, ctx))}</span>,
   },
   { id: "liters", label: "Litros", group: "Combustible", align: "right", render: (inv) => (inv.module === "fuel" ? `${inv.liters.toLocaleString()} L` : EMPTY_CELL) },
-  { id: "odometer", label: "Odómetro", group: "Combustible", align: "right", render: (inv) => (inv.module === "fuel" ? `${inv.odometer.toLocaleString()} km` : EMPTY_CELL) },
+  unitCostColumn("pricePerLiter", "Precio por litro", "Combustible", "fuel"),
+  { id: "fuelType", label: "Tipo de combustible", group: "Combustible", render: (inv) => orEmpty(invoiceFuelType(inv)) },
+  {
+    id: "odometer",
+    label: "Odómetro",
+    group: "Recorrido",
+    align: "right",
+    render: (inv) => {
+      const km = inv.odometer || Number(inv.details.odometerKm) || 0;
+      return km ? `${km.toLocaleString()} km` : EMPTY_CELL;
+    },
+  },
   { id: "efficiency", label: "Rendimiento", group: "Combustible", align: "right", render: (inv) => (inv.efficiency ? `${inv.efficiency} km/L` : EMPTY_CELL) },
   { id: "expenseType", label: "Concepto", group: "General", render: (inv) => expenseTypeLabel(inv.expenseType) },
   {
@@ -4595,6 +4743,33 @@ const INVOICE_COLUMNS = [
     group: "General",
     cellClass: "max-w-[16rem] truncate",
     render: (inv) => <span title={inv.description}>{orEmpty(inv.description)}</span>,
+  },
+  paramColumn("destination", "Destino", "Viáticos"),
+  paramColumn("route", "Ruta", "Recorrido"),
+  paramColumn("plaza", "Caseta o plaza", "Casetas"),
+  paramColumn("transportType", "Tipo de transporte", "Viáticos"),
+  paramColumn("tripDays", "Días del viaje", "Viáticos", "right"),
+  paramColumn("nights", "Noches", "Viáticos", "right"),
+  paramColumn("people", "Personas", "Viáticos", "right"),
+  paramColumn("paymentMethod", "Forma de pago de la caseta", "Casetas"),
+  paramColumn("axles", "Ejes", "Casetas", "right"),
+  paramColumn("coolantType", "Tipo de refrigerante", "Refrigerante"),
+  paramColumn("partNumber", "Número de parte", "Refacciones"),
+  paramColumn("brand", "Marca", "Refacciones"),
+  {
+    id: "quantity",
+    label: "Cantidad",
+    group: "Cantidades",
+    align: "right",
+    render: (inv) => orEmpty(invoiceQuantity(inv) ? invoiceQuantity(inv).toLocaleString() : ""),
+  },
+  { id: "measure", label: "Unidad de medida", group: "Cantidades", render: (inv) => orEmpty(invoiceMeasure(inv)) },
+  unitCostColumn("unitCost", "Costo por unidad", "Cantidades", "misc"),
+  {
+    id: "warranty",
+    label: "Garantía",
+    group: "Refacciones",
+    render: (inv) => (inv.details.warrantyMonths ? `${inv.details.warrantyMonths} meses` : EMPTY_CELL),
   },
   { id: "vendor", label: "Proveedor", group: "Emisor y receptor", render: (inv) => orEmpty(inv.vendor || inv.cfdi?.emisor?.nombre) },
   { id: "emisorRfc", label: "RFC emisor", group: "Emisor y receptor", render: (inv) => orEmpty(inv.cfdi?.emisor?.rfc) },
@@ -4653,10 +4828,28 @@ const INVOICE_COLUMNS = [
 
 const DEFAULT_INVOICE_COLUMNS = {
   overview: ["project", "workOrder", "date", "amount", "expenseType", "vendor", "emisorRfc", "origin", "user", "status", "approved", "approvedBy", "document"],
-  fuel: ["unit", "project", "workOrder", "station", "date", "amount", "liters", "odometer", "efficiency", "document", "origin", "status"],
-  travel: ["unit", "project", "workOrder", "date", "amount", "expenseType", "description", "vendor", "document", "origin", "status"],
-  misc: ["unit", "project", "workOrder", "date", "amount", "expenseType", "description", "vendor", "document", "origin", "status"],
+  project: ["workOrder", "date", "amount", "expenseType", "description", "vendor", "unit", "origin", "user", "status", "approved", "document"],
+  fuel: ["unit", "driver", "project", "workOrder", "station", "date", "amount", "liters", "pricePerLiter", "fuelType", "odometer", "efficiency", "document", "origin", "status"],
+  travel: ["unit", "project", "workOrder", "date", "amount", "expenseType", "description", "destination", "nights", "people", "vendor", "document", "origin", "status"],
+  consumables: ["unit", "project", "workOrder", "date", "amount", "description", "quantity", "measure", "unitCost", "vendor", "document", "origin", "status"],
+  coolant: ["unit", "project", "workOrder", "date", "amount", "coolantType", "quantity", "measure", "unitCost", "odometer", "vendor", "document", "origin", "status"],
+  parts: ["unit", "project", "workOrder", "date", "amount", "description", "partNumber", "brand", "quantity", "warranty", "odometer", "vendor", "document", "origin", "status"],
+  tolls: ["unit", "driver", "project", "workOrder", "date", "amount", "plaza", "route", "paymentMethod", "axles", "document", "origin", "status"],
 };
+
+// En la pestaña de un concepto solo se ofrecen las columnas que le aplican.
+const PARAM_COLUMN_GROUPS = ["Combustible", "Viáticos", "Recorrido", "Casetas", "Cantidades", "Refrigerante", "Refacciones"];
+const CONCEPT_COLUMN_GROUPS = {
+  fuel: ["Combustible", "Recorrido"],
+  travel: ["Viáticos", "Recorrido"],
+  consumables: ["Cantidades"],
+  coolant: ["Refrigerante", "Cantidades", "Recorrido"],
+  parts: ["Refacciones", "Cantidades", "Recorrido"],
+  tolls: ["Casetas", "Recorrido"],
+};
+
+// La tabla se desplaza por dentro; las acciones quedan siempre a la vista.
+const STICKY_ACTIONS_CELL = "xl:sticky xl:right-0 xl:bg-white xl:shadow-[-8px_0_8px_-8px_rgba(15,23,42,0.15)]";
 
 function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onConfirm, onDecide, onDetail, emptyLabel }) {
   const { format } = useDateFormat();
@@ -4672,7 +4865,7 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
                 {c.label}
               </th>
             ))}
-            <th className="px-3 py-3 text-right font-semibold">Acciones</th>
+            <th className={`px-3 py-3 text-right font-semibold ${STICKY_ACTIONS_CELL}`}>Acciones</th>
           </tr>
         </thead>
         <tbody>
@@ -4683,7 +4876,7 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
                   {c.render(inv, ctx)}
                 </td>
               ))}
-              <td className="px-3 py-3">
+              <td className={`px-3 py-3 ${STICKY_ACTIONS_CELL}`}>
                 <div className="flex justify-end gap-1.5">
                   <button
                     onClick={() => onDetail(inv)}
@@ -4891,6 +5084,7 @@ const INVOICE_FIELD_LABELS = {
 function invoiceEventChanges(changes) {
   return Object.entries(changes ?? {}).map(([field, change]) => {
     if (field === "cfdi") return "Datos fiscales actualizados";
+    if (field === "details") return "Datos del concepto actualizados";
     if (field === "documentUrl") return "Documento reemplazado";
     const shown = (value) => (value === null || value === undefined || value === "" ? "vacío" : String(value));
     return `${INVOICE_FIELD_LABELS[field] ?? field}: ${shown(change.de)} → ${shown(change.a)}`;
@@ -4956,8 +5150,10 @@ function InvoiceColumnsButton({ onClick }) {
   );
 }
 
-function ColumnPickerModal({ selected, defaults, onChange, onClose }) {
-  const groups = [...new Set(INVOICE_COLUMNS.map((c) => c.group))];
+function ColumnPickerModal({ view, selected, defaults, onChange, onClose }) {
+  const ownGroups = CONCEPT_COLUMN_GROUPS[view];
+  const columns = INVOICE_COLUMNS.filter((c) => !ownGroups || !PARAM_COLUMN_GROUPS.includes(c.group) || ownGroups.includes(c.group));
+  const groups = [...new Set(columns.map((c) => c.group))];
   function toggle(id) {
     onChange(selected.includes(id) ? selected.filter((c) => c !== id) : [...selected, id]);
   }
@@ -4966,7 +5162,7 @@ function ColumnPickerModal({ selected, defaults, onChange, onClose }) {
       <div className="mb-3 flex items-center justify-between gap-3">
         <p className="text-xs text-slate-400">Elige qué datos quieres ver en esta tabla. Se guarda en este navegador.</p>
         <div className="flex shrink-0 gap-3 text-[11px] font-semibold text-blue-600">
-          <button onClick={() => onChange(INVOICE_COLUMNS.map((c) => c.id))}>Todas</button>
+          <button onClick={() => onChange(columns.map((c) => c.id))}>Todas</button>
           <button onClick={() => onChange(defaults)}>Restablecer</button>
         </div>
       </div>
@@ -4975,7 +5171,7 @@ function ColumnPickerModal({ selected, defaults, onChange, onClose }) {
           <div key={group}>
             <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">{group}</p>
             <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
-              {INVOICE_COLUMNS.filter((c) => c.group === group).map((c) => (
+              {columns.filter((c) => c.group === group).map((c) => (
                 <label key={c.id} className="flex cursor-pointer items-center justify-between gap-2 rounded-lg border border-slate-100 px-2.5 py-1.5 hover:bg-slate-50">
                   <span className="text-xs font-medium text-slate-600">{c.label}</span>
                   <input type="checkbox" checked={selected.includes(c.id)} onChange={() => toggle(c.id)} className="h-4 w-4 shrink-0 accent-blue-600" />
@@ -5008,6 +5204,25 @@ function DetailSection({ title, fields }) {
       </dl>
     </section>
   );
+}
+
+// Lo propio del concepto de la factura, para el "Detalle".
+function invoiceParamFields(invoice, money) {
+  const cost = invoiceUnitCost(invoice);
+  if (invoice.module === "fuel") {
+    return [
+      ["Estación de servicio", invoice.station],
+      ["Tipo de combustible", invoiceFuelType(invoice)],
+      ["Litros", `${invoice.liters.toLocaleString()} L`],
+      ["Precio por litro", cost === null ? "" : money(cost)],
+      ["Odómetro", invoice.odometer ? `${invoice.odometer.toLocaleString()} km` : ""],
+      ["Rendimiento", invoice.efficiency ? `${invoice.efficiency} km/L` : ""],
+    ];
+  }
+  const params = EXPENSE_PARAMS[invoice.expenseType] ?? [];
+  const shown = { quantity: invoiceQuantity(invoice) || "", measure: invoiceMeasure(invoice) };
+  const fields = params.filter((param) => param.id !== "driver").map((param) => [param.label, shown[param.id] ?? invoice.details[param.id]]);
+  return params.some((param) => param.id === "quantity") && cost !== null ? [...fields, ["Costo por unidad", money(cost)]] : fields;
 }
 
 function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
@@ -5077,13 +5292,13 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
             ["Fecha", invoice.date ? formatDate(invoice.date, format) : ""],
             ["Unidad", invoice.unit && `${invoice.unit}${invoice.plate ? ` — ${invoice.plate}` : ""}`],
             ["Conductor / Huésped", invoice.driverName],
-            ["Estación de servicio", invoice.station],
-            ["Litros", invoice.module === "fuel" ? `${invoice.liters.toLocaleString()} L` : ""],
             ["Usuario", invoice.uploadedByName],
             ["Aprobado por", invoice.approvedByName],
             ["Notas", invoice.notes],
           ]}
         />
+
+        <DetailSection title={`Datos de ${expenseTypeLabel(invoice.expenseType).toLowerCase()}`} fields={invoiceParamFields(invoice, money)} />
 
         <DetailSection
           title="Comprobante fiscal"
@@ -5322,6 +5537,652 @@ function DeadlinesModal({ days, isAdmin, onSave, onClose }) {
   );
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Resúmenes — periodos y widgets de cada concepto                       */
+/* ---------------------------------------------------------------------- */
+
+const SUMMARY_PERIODS = [
+  { id: "month", label: "Este mes", title: "Resumen del mes", phrase: "este mes" },
+  { id: "lastMonth", label: "Mes pasado", title: "Resumen del mes pasado", phrase: "el mes pasado" },
+  { id: "year", label: "Este año", title: "Resumen del año", phrase: "este año" },
+  { id: "all", label: "Todo", title: "Resumen de todas las fechas", phrase: "en total" },
+];
+const summaryPeriod = (id) => SUMMARY_PERIODS.find((p) => p.id === id) ?? SUMMARY_PERIODS[0];
+
+function periodAnchor(period) {
+  const now = new Date();
+  return period === "lastMonth" ? new Date(now.getFullYear(), now.getMonth() - 1, 1) : now;
+}
+
+function inSummaryPeriod(inv, period) {
+  if (period === "all") return true;
+  const date = String(inv.date || "");
+  if (period === "year") return date.slice(0, 4) === String(periodAnchor(period).getFullYear());
+  return date.slice(0, 7) === localISODate(periodAnchor(period)).slice(0, 7);
+}
+
+// Barras de un widget: por día dentro de un mes y por mes en lo demás.
+function summaryTrend(rows, period, get) {
+  const anchor = periodAnchor(period);
+  if (period === "month" || period === "lastMonth") {
+    const days = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0).getDate();
+    const values = Array.from({ length: days }, () => 0);
+    for (const i of rows) {
+      const day = Number(String(i.date).slice(8, 10)) - 1;
+      if (day >= 0 && day < days) values[day] += get(i);
+    }
+    return values;
+  }
+  // El año va de enero a diciembre; "Todo", de los últimos 12 meses.
+  const firstMonth = period === "year" ? 0 : anchor.getMonth() - 11;
+  const byMonth = new Map(
+    Array.from({ length: 12 }, (_, m) => [localISODate(new Date(anchor.getFullYear(), firstMonth + m, 1)).slice(0, 7), 0])
+  );
+  for (const i of rows) {
+    const key = String(i.date).slice(0, 7);
+    if (byMonth.has(key)) byMonth.set(key, byMonth.get(key) + get(i));
+  }
+  return [...byMonth.values()];
+}
+
+const amountOf = (i) => i.amount;
+const sumOf = (rows, get) => rows.reduce((s, i) => s + (Number(get(i)) || 0), 0);
+const distinctOf = (rows, get) => new Set(rows.map(get).filter(Boolean)).size;
+const countLabel = (n, one, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+function topOf(rows, get) {
+  const totals = new Map();
+  for (const i of rows) {
+    const key = get(i);
+    if (key) totals.set(key, (totals.get(key) ?? 0) + i.amount);
+  }
+  const [name, total] = [...totals].sort((a, b) => b[1] - a[1])[0] ?? [];
+  return name ? { name, total } : null;
+}
+
+// Kilómetros según el odómetro: de la primera a la última carga de cada unidad.
+function kmTraveled(rows) {
+  const byUnit = new Map();
+  for (const i of rows) {
+    if (!i.unit || !i.odometer) continue;
+    const [low, high] = byUnit.get(i.unit) ?? [i.odometer, i.odometer];
+    byUnit.set(i.unit, [Math.min(low, i.odometer), Math.max(high, i.odometer)]);
+  }
+  return [...byUnit.values()].reduce((s, [low, high]) => s + high - low, 0);
+}
+
+function unitCostOf(rows, quantityOf) {
+  const withQuantity = rows.filter((i) => quantityOf(i) > 0);
+  const quantity = sumOf(withQuantity, quantityOf);
+  return quantity > 0 ? sumOf(withQuantity, amountOf) / quantity : null;
+}
+
+const topWidget = (id, label, icon, tone, get) => ({
+  id,
+  label,
+  icon,
+  tone,
+  read: (rows, ctx) => {
+    const top = topOf(rows, get);
+    return top ? [top.name, `${formatCurrency(top.total, ctx.currency)} de gasto`] : ["—", "Sin datos en este periodo"];
+  },
+});
+const expenseWidget = (id, label, icon, tone, type) => ({
+  id,
+  label,
+  icon,
+  tone,
+  read: (rows, ctx) => {
+    const match = rows.filter((i) => i.expenseType === type);
+    return [formatCurrency(sumOf(match, amountOf), ctx.currency), countLabel(match.length, "factura")];
+  },
+});
+const taxWidget = (id, label, field) => ({
+  id,
+  label,
+  icon: FileText,
+  tone: "slate",
+  read: (rows, ctx) => [formatCurrency(sumOf(rows, (i) => i.cfdi?.importes?.[field]), ctx.currency), "Según los datos fiscales"],
+});
+const quantityWidget = (label) => ({
+  id: "quantity",
+  label,
+  icon: Layers,
+  tone: "sky",
+  read: (rows) => {
+    const top = topOf(rows, invoiceMeasure);
+    return [sumOf(rows, invoiceQuantity).toLocaleString(), top ? `Principalmente: ${top.name}` : "Capturada o leída de las partidas"];
+  },
+});
+const unitCostWidget = {
+  id: "unitCost",
+  label: "Costo por unidad",
+  icon: DollarSign,
+  tone: "emerald",
+  read: (rows, ctx) => {
+    const cost = unitCostOf(rows, invoiceQuantity);
+    return [cost === null ? "—" : formatMoney(cost, ctx.currency), "Promedio pagado"];
+  },
+};
+const unitsServedWidget = (label) => ({
+  id: "unitsServed",
+  label,
+  icon: Truck,
+  tone: "slate",
+  read: (rows) => [distinctOf(rows, (i) => i.unit).toLocaleString(), "Con vehículo asociado"],
+});
+const litersWidget = {
+  id: "liters",
+  label: "Litros consumidos",
+  icon: Droplet,
+  tone: "sky",
+  trend: (i) => i.liters,
+  trendClass: "bg-sky-500",
+  read: (rows) => [`${sumOf(rows, (i) => i.liters).toLocaleString()} L`, countLabel(rows.filter((i) => i.liters > 0).length, "carga")],
+};
+
+// Los que le sirven a cualquier concepto.
+const SHARED_WIDGETS = [
+  {
+    id: "total",
+    label: "Gasto total",
+    icon: DollarSign,
+    tone: "blue",
+    trend: amountOf,
+    read: (rows, ctx) => [formatCurrency(sumOf(rows, amountOf), ctx.currency), `${countLabel(rows.length, "factura")} ${summaryPeriod(ctx.period).phrase}`],
+  },
+  { id: "count", label: "Facturas", icon: Receipt, tone: "slate", read: (rows) => [rows.length.toLocaleString(), "Sin contar rechazadas ni anuladas"] },
+  {
+    id: "average",
+    label: "Promedio por factura",
+    icon: Activity,
+    tone: "sky",
+    read: (rows, ctx) => [rows.length ? formatCurrency(sumOf(rows, amountOf) / rows.length, ctx.currency) : "—", "Gasto total entre facturas"],
+  },
+  {
+    id: "largest",
+    label: "Factura más alta",
+    icon: ChevronUp,
+    tone: "amber",
+    read: (rows, ctx) => {
+      if (rows.length === 0) return ["—", "Sin datos en este periodo"];
+      const top = rows.reduce((a, b) => (b.amount > a.amount ? b : a));
+      return [formatCurrency(top.amount, ctx.currency), top.vendor || top.description || expenseTypeLabel(top.expenseType)];
+    },
+  },
+  {
+    id: "toVerify",
+    label: "Sin verificar",
+    icon: AlertTriangle,
+    tone: "rose",
+    read: (rows, ctx) => {
+      const match = rows.filter((i) => i.status === "pending");
+      return [match.length.toLocaleString(), `${formatCurrency(sumOf(match, amountOf), ctx.currency)} por revisar`];
+    },
+  },
+  {
+    id: "toApprove",
+    label: "Por aprobar",
+    icon: ShieldCheck,
+    tone: "blue",
+    read: (rows, ctx) => {
+      const match = rows.filter((i) => i.status === "verified" && !i.approved);
+      return [match.length.toLocaleString(), `${formatCurrency(sumOf(match, amountOf), ctx.currency)} ya verificados`];
+    },
+  },
+  {
+    id: "approved",
+    label: "Aprobadas",
+    icon: CheckCircle2,
+    tone: "emerald",
+    read: (rows, ctx) => {
+      const match = rows.filter((i) => i.approved);
+      return [match.length.toLocaleString(), `${formatCurrency(sumOf(match, amountOf), ctx.currency)} aprobados`];
+    },
+  },
+  { id: "closed", label: "Rechazadas y anuladas", icon: X, tone: "slate", read: (rows, ctx) => [ctx.closed.length.toLocaleString(), "No cuentan en los totales"] },
+  {
+    id: "noDocument",
+    label: "Sin documento",
+    icon: FileText,
+    tone: "amber",
+    read: (rows) => [rows.filter((i) => !i.documentUrl).length.toLocaleString(), "Les falta el comprobante"],
+  },
+  taxWidget("iva", "IVA", "iva"),
+  topWidget("topVendor", "Proveedor principal", Receipt, "slate", (i) => i.vendor || i.cfdi?.emisor?.nombre),
+  topWidget("topUnit", "Unidad con más gasto", Truck, "slate", (i) => i.unit),
+  { id: "telegram", label: "Cargadas por Telegram", icon: Bot, tone: "sky", read: (rows) => [rows.filter((i) => i.origin === "telegram").length.toLocaleString(), "Leídas por el bot"] },
+];
+
+// Las órdenes reflejan cómo van hoy, sin importar el periodo elegido.
+const ORDER_WIDGETS = [
+  {
+    id: "ordersOpen",
+    label: "Órdenes abiertas",
+    icon: Clock,
+    tone: "blue",
+    read: (rows, ctx) => [ctx.orders.filter((o) => !o.complete).length.toLocaleString(), `${ctx.orders.length.toLocaleString()} en total, a la fecha`],
+  },
+  {
+    id: "ordersMissingDocs",
+    label: "Órdenes sin documentación",
+    icon: FileText,
+    tone: "amber",
+    read: (rows, ctx) => [ctx.orders.filter((o) => o.missingDocs).length.toLocaleString(), "Les falta un documento o el monto"],
+  },
+  {
+    id: "ordersDone",
+    label: "Órdenes completadas",
+    icon: CheckCircle2,
+    tone: "emerald",
+    read: (rows, ctx) => [ctx.orders.filter((o) => o.complete).length.toLocaleString(), "Con documentos y todo verificado"],
+  },
+  {
+    id: "ordersExpiring",
+    label: "Órdenes por expirar",
+    icon: AlertTriangle,
+    tone: "rose",
+    read: (rows, ctx) => {
+      const open = ctx.orders.filter((o) => !o.complete && o.daysLeft !== null);
+      return [open.filter((o) => o.daysLeft >= 0 && o.daysLeft <= ORDER_WARN_DAYS).length.toLocaleString(), countLabel(open.filter((o) => o.daysLeft < 0).length, "ya vencida", "ya vencidas")];
+    },
+  },
+];
+
+const conceptCatalog = (own, defaults) => ({ widgets: [...own, ...SHARED_WIDGETS], defaults });
+const scopeCatalog = (own, defaults) => ({
+  widgets: [...own, ...SHARED_WIDGETS, topWidget("topConcept", "Concepto con más gasto", Layers, "blue", (i) => expenseTypeLabel(i.expenseType)), litersWidget, ...ORDER_WIDGETS],
+  defaults,
+});
+
+const GENERAL_WIDGETS = [
+  { id: "totalSpend", label: "Gasto total", icon: DollarSign },
+  { id: "liters", label: "Litros consumidos", icon: Droplet },
+  { id: "ordersMissingDocs", label: "Órdenes sin documentación completa", icon: FileText },
+  { id: "unverified", label: "Servicios sin verificar", icon: AlertTriangle },
+  { id: "newOrders", label: "Nuevas órdenes de trabajo", icon: Plus },
+  { id: "completedOrders", label: "Órdenes completadas", icon: CheckCircle2 },
+  { id: "expiring", label: "Próximas a expirar", icon: Clock },
+  { id: "pendingApproval", label: "Pendientes de aprobación", icon: ShieldCheck },
+];
+
+const SUMMARY_CATALOGS = {
+  general: { widgets: GENERAL_WIDGETS, defaults: GENERAL_WIDGETS.map((w) => w.id) },
+  projects: scopeCatalog(
+    [
+      { id: "projectCount", label: "Proyectos", icon: Layers, tone: "slate", read: (rows, ctx) => [ctx.projects.length.toLocaleString(), "Según la vista elegida"] },
+      topWidget("topProject", "Proyecto con más gasto", Layers, "amber", (i) => i.project),
+    ],
+    ["total", "projectCount", "topProject", "topConcept", "toVerify", "toApprove", "ordersOpen", "ordersExpiring"]
+  ),
+  project: scopeCatalog([], ["total", "count", "topConcept", "topVendor", "toVerify", "toApprove", "ordersOpen", "ordersExpiring"]),
+  fuel: conceptCatalog(
+    [
+      litersWidget,
+      {
+        id: "pricePerLiter",
+        label: "Precio por litro",
+        icon: DollarSign,
+        tone: "emerald",
+        read: (rows, ctx) => {
+          const cost = unitCostOf(rows, (i) => i.liters);
+          return [cost === null ? "—" : formatMoney(cost, ctx.currency), "Promedio pagado"];
+        },
+      },
+      {
+        id: "efficiency",
+        label: "Rendimiento promedio",
+        icon: Gauge,
+        tone: "emerald",
+        read: (rows) => {
+          const known = rows.filter((i) => i.efficiency > 0);
+          return [known.length ? `${(sumOf(known, (i) => i.efficiency) / known.length).toFixed(1)} km/L` : "—", `${countLabel(known.length, "carga")} con dato`];
+        },
+      },
+      { id: "km", label: "Kilómetros recorridos", icon: Navigation, tone: "blue", read: (rows) => [`${kmTraveled(rows).toLocaleString()} km`, "Según el odómetro de cada unidad"] },
+      {
+        id: "costPerKm",
+        label: "Costo por kilómetro",
+        icon: Activity,
+        tone: "amber",
+        read: (rows, ctx) => {
+          const km = kmTraveled(rows);
+          return [km > 0 ? formatMoney(sumOf(rows, amountOf) / km, ctx.currency) : "—", "Gasto entre kilómetros"];
+        },
+      },
+      topWidget("topStation", "Estación principal", Fuel, "slate", (i) => i.station || i.vendor),
+      topWidget("topFuel", "Combustible principal", Droplet, "sky", invoiceFuelType),
+      unitsServedWidget("Unidades abastecidas"),
+      taxWidget("ieps", "IEPS", "ieps"),
+    ],
+    ["total", "liters", "pricePerLiter", "efficiency", "km", "topStation", "toVerify", "toApprove"]
+  ),
+  travel: conceptCatalog(
+    [
+      expenseWidget("hotel", "Hotel", Home, "blue", "hotel"),
+      expenseWidget("food", "Alimentos", Receipt, "emerald", "alimentos"),
+      expenseWidget("transport", "Transporte", Navigation, "sky", "transporte"),
+      expenseWidget("perDiem", "Viáticos", DollarSign, "amber", "viaticos"),
+      { id: "people", label: "Personas", icon: User, tone: "slate", read: (rows) => [distinctOf(rows, (i) => i.driverName).toLocaleString(), "Con nombre registrado"] },
+      {
+        id: "perPerson",
+        label: "Gasto por persona",
+        icon: User,
+        tone: "emerald",
+        read: (rows, ctx) => {
+          const people = distinctOf(rows, (i) => i.driverName);
+          const named = rows.filter((i) => i.driverName);
+          return [people > 0 ? formatCurrency(sumOf(named, amountOf) / people, ctx.currency) : "—", "De las facturas con nombre"];
+        },
+      },
+      { id: "nights", label: "Noches de hotel", icon: Clock, tone: "blue", read: (rows) => [sumOf(rows, (i) => i.details.nights).toLocaleString(), "Capturadas en cada factura"] },
+      {
+        id: "perNight",
+        label: "Costo por noche",
+        icon: DollarSign,
+        tone: "emerald",
+        read: (rows, ctx) => {
+          const cost = unitCostOf(rows, (i) => Number(i.details.nights) || 0);
+          return [cost === null ? "—" : formatMoney(cost, ctx.currency), "De los hoteles con noches"];
+        },
+      },
+      topWidget("topDestination", "Destino principal", MapPin, "slate", (i) => i.details.destination),
+      taxWidget("ish", "ISH (hospedaje)", "ish"),
+      taxWidget("propina", "Propinas", "propina"),
+    ],
+    ["total", "hotel", "food", "transport", "people", "nights", "toVerify", "toApprove"]
+  ),
+  consumables: conceptCatalog(
+    [quantityWidget("Cantidad comprada"), unitCostWidget, topWidget("topItem", "Artículo principal", Layers, "amber", (i) => i.description), unitsServedWidget("Unidades atendidas")],
+    ["total", "quantity", "topItem", "topVendor", "unitsServed", "toVerify", "toApprove", "noDocument"]
+  ),
+  coolant: conceptCatalog(
+    [quantityWidget("Cantidad cargada"), unitCostWidget, topWidget("coolantType", "Tipo principal", Droplet, "sky", (i) => i.details.coolantType), unitsServedWidget("Unidades atendidas")],
+    ["total", "quantity", "unitCost", "coolantType", "unitsServed", "topVendor", "toVerify", "toApprove"]
+  ),
+  parts: conceptCatalog(
+    [
+      quantityWidget("Piezas compradas"),
+      unitCostWidget,
+      topWidget("topPart", "Refacción principal", Wrench, "amber", (i) => i.details.partNumber || i.description),
+      topWidget("topBrand", "Marca principal", Layers, "slate", (i) => i.details.brand),
+      { id: "withWarranty", label: "Con garantía", icon: ShieldCheck, tone: "emerald", read: (rows) => [rows.filter((i) => i.details.warrantyMonths > 0).length.toLocaleString(), "Tienen meses de garantía"] },
+      unitsServedWidget("Unidades atendidas"),
+    ],
+    ["total", "quantity", "topPart", "topBrand", "withWarranty", "topVendor", "toVerify", "toApprove"]
+  ),
+  tolls: conceptCatalog(
+    [
+      { id: "crossings", label: "Cruces", icon: Navigation, tone: "sky", read: (rows) => [rows.length.toLocaleString(), "Una factura por cruce"] },
+      {
+        id: "perCrossing",
+        label: "Promedio por cruce",
+        icon: Activity,
+        tone: "emerald",
+        read: (rows, ctx) => [rows.length ? formatMoney(sumOf(rows, amountOf) / rows.length, ctx.currency) : "—", "Gasto entre cruces"],
+      },
+      topWidget("topPlaza", "Caseta principal", MapPin, "amber", (i) => i.details.plaza),
+      topWidget("topRoute", "Ruta principal", Navigation, "slate", (i) => i.details.route),
+      {
+        id: "tag",
+        label: "Pagado con TAG",
+        icon: Radio,
+        tone: "blue",
+        read: (rows, ctx) => [formatCurrency(sumOf(rows.filter((i) => i.details.paymentMethod === "TAG"), amountOf), ctx.currency), "Según la forma de pago capturada"],
+      },
+      {
+        id: "cash",
+        label: "Pagado en efectivo",
+        icon: DollarSign,
+        tone: "amber",
+        read: (rows, ctx) => [formatCurrency(sumOf(rows.filter((i) => i.details.paymentMethod === "Efectivo"), amountOf), ctx.currency), "Según la forma de pago capturada"],
+      },
+      unitsServedWidget("Unidades con casetas"),
+    ],
+    ["total", "crossings", "perCrossing", "topPlaza", "tag", "cash", "toVerify", "toApprove"]
+  ),
+};
+
+function SegmentedControl({ options, value, onChange, label }) {
+  return (
+    <div role="group" aria-label={label} className="flex items-center rounded-lg border border-slate-200 bg-white p-0.5 text-[11px] font-semibold">
+      {options.map((option) => (
+        <button
+          key={option.id}
+          onClick={() => onChange(option.id)}
+          aria-pressed={value === option.id}
+          className={`whitespace-nowrap rounded-md px-2 py-1 transition ${value === option.id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SummaryWidgetsModal({ widgets, selected, defaults, onChange, onClose }) {
+  const shown = selected.map((id) => widgets.find((w) => w.id === id)).filter(Boolean);
+  const hidden = widgets.filter((w) => !selected.includes(w.id));
+  const shownIds = shown.map((w) => w.id);
+
+  function move(index, delta) {
+    const next = [...shownIds];
+    [next[index], next[index + delta]] = [next[index + delta], next[index]];
+    onChange(next);
+  }
+
+  const row = (w, index) => {
+    const Icon = w.icon;
+    const isShown = index !== null;
+    const arrow = "flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-30 disabled:hover:bg-transparent";
+    return (
+      <div key={w.id} className="flex items-center gap-2 rounded-xl border border-slate-100 px-3 py-2 hover:bg-slate-50">
+        <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs font-medium text-slate-600">
+          <input
+            type="checkbox"
+            checked={isShown}
+            onChange={() => onChange(isShown ? shownIds.filter((id) => id !== w.id) : [...shownIds, w.id])}
+            className="h-4 w-4 shrink-0 accent-blue-600"
+          />
+          <Icon size={15} className="shrink-0 text-blue-600" />
+          <span className="min-w-0">{w.label}</span>
+        </label>
+        {isShown && (
+          <div className="flex shrink-0 gap-0.5">
+            <button type="button" onClick={() => move(index, -1)} disabled={index === 0} className={arrow} aria-label={`Subir ${w.label}`}>
+              <ChevronUp size={14} />
+            </button>
+            <button type="button" onClick={() => move(index, 1)} disabled={index === shown.length - 1} className={arrow} aria-label={`Bajar ${w.label}`}>
+              <ChevronDown size={14} />
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <Modal title="Personalizar widgets" width="max-w-lg" onClose={onClose}>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-xs text-slate-400">Elige qué contadores ver en esta sección y en qué orden. Se guarda en este navegador.</p>
+        <button onClick={() => onChange(defaults)} className="shrink-0 text-[11px] font-semibold text-blue-600">
+          Restablecer
+        </button>
+      </div>
+      <div className="max-h-[60vh] space-y-1.5 overflow-y-auto pr-1">
+        {shown.length === 0 && <p className="py-2 text-center text-xs text-slate-400">Ningún widget visible.</p>}
+        {shown.map((w, index) => row(w, index))}
+        {hidden.length > 0 && <p className="pb-0.5 pt-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Disponibles</p>}
+        {hidden.map((w) => row(w, null))}
+      </div>
+      <button onClick={onClose} className="mt-4 w-full rounded-lg bg-blue-600 py-2 text-xs font-semibold text-white hover:bg-blue-700">
+        Listo
+      </button>
+    </Modal>
+  );
+}
+
+function SummaryControls({ period, onPeriodChange, onCustomize }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <SegmentedControl label="Periodo del resumen" options={SUMMARY_PERIODS} value={period} onChange={onPeriodChange} />
+      <button onClick={onCustomize} className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50">
+        <Settings size={13} /> Personalizar widgets
+      </button>
+    </div>
+  );
+}
+
+// Sin esto, un periodo vacío parecería un error: las facturas se cuentan por
+// la fecha del documento, no por el día en que se subieron.
+function PeriodEmptyNote({ total, period, onShowAll }) {
+  if (total === 0 || period === "all") return null;
+  return (
+    <p className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
+      No hay facturas con fecha en este periodo, pero hay {countLabel(total, "factura")} en otras fechas.{" "}
+      <button onClick={onShowAll} className="font-semibold text-blue-600 hover:text-blue-700">
+        Ver todas las fechas
+      </button>
+    </p>
+  );
+}
+
+function InvoiceSummary({ catalogId, invoices, orders = [], projects = [], currency, period, onPeriodChange, widgetPrefs, onWidgetPrefsChange }) {
+  const [customizing, setCustomizing] = useState(false);
+  const catalog = SUMMARY_CATALOGS[catalogId];
+  const inPeriod = invoices.filter((i) => inSummaryPeriod(i, period));
+  const rows = inPeriod.filter((i) => !isInvoiceClosed(i));
+  const ctx = { currency, period, closed: inPeriod.filter(isInvoiceClosed), orders, projects };
+  const selected = widgetPrefs[catalogId] ?? catalog.defaults;
+  const shown = selected
+    .map((id) => catalog.widgets.find((w) => w.id === id))
+    .filter(Boolean)
+    .map((w) => {
+      const [value, detail] = w.read(rows, ctx);
+      return { ...w, value, detail, trend: w.trend ? summaryTrend(rows, period, w.trend) : null };
+    });
+
+  return (
+    <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-bold text-slate-800">{summaryPeriod(period).title}</h2>
+        <SummaryControls period={period} onPeriodChange={onPeriodChange} onCustomize={() => setCustomizing(true)} />
+      </div>
+      {rows.length === 0 && <PeriodEmptyNote total={invoices.filter((i) => !isInvoiceClosed(i)).length} period={period} onShowAll={() => onPeriodChange("all")} />}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {shown.map((w) => (
+          <KpiCard key={w.id} widget={w} />
+        ))}
+        {shown.length === 0 && <p className="col-span-full py-4 text-center text-xs text-slate-400">No hay widgets visibles. Actívalos desde "Personalizar widgets".</p>}
+      </div>
+      {customizing && (
+        <SummaryWidgetsModal
+          widgets={catalog.widgets}
+          selected={selected}
+          defaults={catalog.defaults}
+          onChange={(ids) => onWidgetPrefsChange({ ...widgetPrefs, [catalogId]: ids })}
+          onClose={() => setCustomizing(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConceptBreakdown({ invoices, period, currency, onOpen }) {
+  const rows = invoices.filter((i) => !isInvoiceClosed(i) && inSummaryPeriod(i, period));
+  const grandTotal = sumOf(rows, amountOf);
+  return (
+    <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div>
+        <h2 className="text-sm font-bold text-slate-800">Conceptos</h2>
+        <p className="text-[11px] text-slate-400">Entra a un concepto para ver su propio resumen ({summaryPeriod(period).phrase}).</p>
+      </div>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {CONCEPT_CATEGORIES.map((c) => {
+          const conceptRows = rows.filter((i) => inConcept(i, c.id));
+          const total = sumOf(conceptRows, amountOf);
+          const share = grandTotal > 0 ? total / grandTotal : 0;
+          return (
+            <button key={c.id} onClick={() => onOpen(c.id)} className="min-w-0 rounded-xl border border-slate-200 px-3 py-2.5 text-left transition hover:border-blue-300 hover:bg-blue-50/40">
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate text-xs font-semibold text-slate-700">{c.label}</span>
+                <span className="shrink-0 text-xs font-bold text-slate-800">{formatCurrency(total, currency)}</span>
+              </div>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full rounded-full bg-blue-600" style={{ width: `${Math.round(share * 100)}%` }} />
+              </div>
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                {countLabel(conceptRows.length, "factura")} · {Math.round(share * 100)}% del gasto
+              </p>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ProjectCard({ project, period, currency, onOpen }) {
+  const rows = project.invoices.filter((i) => !isInvoiceClosed(i) && inSummaryPeriod(i, period));
+  const toVerify = rows.filter((i) => i.status === "pending").length;
+  const toApprove = rows.filter((i) => i.status === "verified" && !i.approved).length;
+  const openOrders = project.orders.filter((o) => !o.complete).length;
+  return (
+    <button onClick={() => onOpen(project.name)} className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:border-blue-300 hover:bg-blue-50/40">
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate text-sm font-bold text-slate-800" title={project.name}>
+          {project.name || "Sin proyecto"}
+        </span>
+        {project.closed && <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">Cerrado</span>}
+      </div>
+      <p className="mt-2 text-lg font-bold text-slate-800">{formatCurrency(sumOf(rows, amountOf), currency)}</p>
+      <p className="text-[11px] text-slate-400">
+        {countLabel(rows.length, "factura")} · {summaryPeriod(period).phrase}
+      </p>
+      <p className="mt-2 text-[11px] text-slate-500">
+        {toVerify} sin verificar · {toApprove} por aprobar · {countLabel(openOrders, "orden abierta", "órdenes abiertas")}
+      </p>
+    </button>
+  );
+}
+
+function PillTabs({ tabs, active, onSelect }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          onClick={() => onSelect(tab.id)}
+          className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
+            active === tab.id ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+          }`}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function InvoiceBreadcrumb({ items }) {
+  return (
+    <nav aria-label="Ubicación" className="flex flex-wrap items-center gap-1 text-xs font-semibold text-slate-400">
+      {items.map((item, index) => (
+        <React.Fragment key={index}>
+          {index > 0 && <ChevronRight size={13} />}
+          {item.onClick ? (
+            <button onClick={item.onClick} className="text-blue-600 hover:text-blue-700">
+              {item.label}
+            </button>
+          ) : (
+            <span className="text-slate-600">{item.label}</span>
+          )}
+        </React.Fragment>
+      ))}
+    </nav>
+  );
+}
+
 function InvoiceOverview({
   invoices,
   orders,
@@ -5333,6 +6194,11 @@ function InvoiceOverview({
   columnIds,
   tableTools,
   showVoided,
+  period,
+  onPeriodChange,
+  widgetPrefs,
+  onWidgetPrefsChange,
+  onOpenProject,
   onDetail,
   onEditInvoice,
   onConfirmInvoice,
@@ -5345,6 +6211,7 @@ function InvoiceOverview({
   });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deadlinesOpen, setDeadlinesOpen] = useState(false);
+  const [customizing, setCustomizing] = useState(false);
   const [ordersPeriod, setOrdersPeriod] = useState("week");
   const [explore, setExplore] = useState(null);
   const [reminderDraft, setReminderDraft] = useState("");
@@ -5360,20 +6227,10 @@ function InvoiceOverview({
   };
 
   const now = new Date();
-  const monthKey = localISODate(now).slice(0, 7);
-  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  const monthInvoices = invoices.filter((i) => !isInvoiceClosed(i) && String(i.date || "").slice(0, 7) === monthKey);
-  const monthTotal = monthInvoices.reduce((s, i) => s + i.amount, 0);
-  const monthLiters = monthInvoices.reduce((s, i) => s + i.liters, 0);
-  const dailySpend = Array.from({ length: daysInMonth }, () => 0);
-  const dailyLiters = Array.from({ length: daysInMonth }, () => 0);
-  for (const i of monthInvoices) {
-    const day = Number(String(i.date).slice(8, 10)) - 1;
-    if (day >= 0 && day < daysInMonth) {
-      dailySpend[day] += i.amount;
-      dailyLiters[day] += i.liters;
-    }
-  }
+  const countable = invoices.filter((i) => !isInvoiceClosed(i));
+  const periodInvoices = countable.filter((i) => inSummaryPeriod(i, period));
+  const periodPhrase = summaryPeriod(period).phrase;
+  const selectedWidgets = widgetPrefs.general ?? SUMMARY_CATALOGS.general.defaults;
 
   const ordersMissingDocs = orders.filter((o) => o.missingDocs);
   const unverifiedCount = invoices.filter((i) => i.status === "pending").length;
@@ -5425,6 +6282,115 @@ function InvoiceOverview({
   const byProject = groupInvoices((i) => i.project);
   const byUser = groupInvoices((i) => i.uploadedByName);
 
+  const generalCards = {
+    totalSpend: (
+      <OverviewCard icon={DollarSign} tone="blue" label="Gasto total">
+        <p className="mt-3 text-2xl font-bold text-slate-800">{formatCurrency(sumOf(periodInvoices, amountOf), currency)}</p>
+        <p className="text-[11px] text-slate-400">
+          {countLabel(periodInvoices.length, "factura")} {periodPhrase}
+        </p>
+        <SparkBars values={summaryTrend(periodInvoices, period, amountOf)} />
+      </OverviewCard>
+    ),
+    liters: (
+      <OverviewCard icon={Droplet} tone="sky" label="Litros consumidos">
+        <p className="mt-3 text-2xl font-bold text-slate-800">{sumOf(periodInvoices, (i) => i.liters).toLocaleString()} L</p>
+        <p className="text-[11px] text-slate-400">Cargas de combustible {periodPhrase}</p>
+        <SparkBars values={summaryTrend(periodInvoices, period, (i) => i.liters)} barClass="bg-sky-500" />
+      </OverviewCard>
+    ),
+    ordersMissingDocs: (
+      <OverviewCard icon={FileText} tone="amber" label="Órdenes sin documentación completa">
+        <p className="mt-3 text-3xl font-bold text-slate-800">{ordersMissingDocs.length}</p>
+        <p className="text-[11px] text-slate-400">Les falta un documento o el monto</p>
+      </OverviewCard>
+    ),
+    unverified: (
+      <OverviewCard icon={AlertTriangle} tone="rose" label="Servicios sin verificar">
+        <p className="mt-3 text-3xl font-bold text-slate-800">{unverifiedCount}</p>
+        <p className="text-[11px] text-slate-400">Facturas pendientes de validación</p>
+      </OverviewCard>
+    ),
+    newOrders: (
+      <OverviewCard
+        icon={Plus}
+        tone="emerald"
+        label="Nuevas órdenes de trabajo"
+        right={
+          <div className="flex items-center rounded-lg border border-slate-200 p-0.5 text-[10px] font-semibold">
+            {[
+              ["day", "Día"],
+              ["week", "Semana"],
+              ["month", "Mes"],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                onClick={() => setOrdersPeriod(id)}
+                className={`rounded-md px-1.5 py-0.5 transition ${ordersPeriod === id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        }
+      >
+        <p className="mt-3 text-3xl font-bold text-slate-800">{newOrdersCount}</p>
+        <p className="text-[11px] text-slate-400">Creadas {periodLabel}</p>
+      </OverviewCard>
+    ),
+    completedOrders: (
+      <OverviewCard icon={CheckCircle2} tone="emerald" label="Órdenes completadas">
+        <p className="mt-3 text-3xl font-bold text-slate-800">{completedOrders.length}</p>
+        <p className="text-[11px] text-slate-400">Con documentos y todo verificado</p>
+      </OverviewCard>
+    ),
+    expiring: (
+      <OverviewCard
+        icon={Clock}
+        tone="amber"
+        label="Próximas a expirar"
+        className="sm:col-span-2"
+        right={
+          <button
+            onClick={() => setDeadlinesOpen(true)}
+            className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+            aria-label="Plazos por concepto"
+            title="Plazos por concepto"
+          >
+            <Settings size={14} />
+          </button>
+        }
+      >
+        <div className="mt-3 flex flex-wrap items-end gap-x-6 gap-y-2">
+          <div>
+            <p className="text-3xl font-bold text-slate-800">{expiringOrders.length}</p>
+            <p className="text-[11px] text-slate-400">Vencen en {ORDER_WARN_DAYS} días o menos</p>
+          </div>
+          <div>
+            <p className={`text-xl font-bold ${overdueOrders.length > 0 ? "text-rose-600" : "text-slate-800"}`}>{overdueOrders.length}</p>
+            <p className="text-[11px] text-slate-400">Ya vencidas</p>
+          </div>
+        </div>
+        {expiringOrders.length > 0 && (
+          <div className="mt-3 space-y-1">
+            {expiringOrders.slice(0, 3).map((o) => (
+              <p key={o.key} className="text-[11px] text-slate-500">
+                <b className="text-slate-700">{o.code}</b>
+                {o.project ? ` · ${o.project}` : ""} — {o.daysLeft === 0 ? "vence hoy" : `vence en ${o.daysLeft} día${o.daysLeft === 1 ? "" : "s"}`}
+              </p>
+            ))}
+          </div>
+        )}
+      </OverviewCard>
+    ),
+    pendingApproval: (
+      <OverviewCard icon={ShieldCheck} tone="blue" label="Pendientes de aprobación">
+        <p className="mt-3 text-3xl font-bold text-slate-800">{pendingApprovalCount}</p>
+        <p className="text-[11px] text-slate-400">Verificadas, listas para aprobar</p>
+      </OverviewCard>
+    ),
+  };
+
   function addReminder(e) {
     e.preventDefault();
     const text = reminderDraft.trim();
@@ -5437,20 +6403,12 @@ function InvoiceOverview({
 
   if (explore) {
     const rows = listed
-      .filter((i) =>
-        explore.kind === "concept"
-          ? i.expenseType === explore.value
-          : explore.kind === "project"
-          ? i.project === explore.value
-          : i.uploadedByName === explore.value
-      )
+      .filter((i) => (explore.kind === "concept" ? i.expenseType === explore.value : i.uploadedByName === explore.value))
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     const total = rows.reduce((s, i) => s + i.amount, 0);
     const title =
       explore.kind === "concept"
         ? `Concepto: ${expenseTypeLabel(explore.value)}`
-        : explore.kind === "project"
-        ? `Proyecto: ${explore.value || "Sin proyecto"}`
         : `Usuario: ${explore.value || "Sin identificar"}`;
     return (
       <div className="space-y-4">
@@ -5473,6 +6431,11 @@ function InvoiceOverview({
 
   return (
     <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-bold text-slate-800">Resumen general</h2>
+        <SummaryControls period={period} onPeriodChange={onPeriodChange} onCustomize={() => setCustomizing(true)} />
+      </div>
+      {periodInvoices.length === 0 && <PeriodEmptyNote total={countable.length} period={period} onShowAll={() => onPeriodChange("all")} />}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <div className="order-first flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm xl:order-none xl:col-start-3 xl:row-span-3 xl:row-start-1">
           <div>
@@ -5526,103 +6489,9 @@ function InvoiceOverview({
           </div>
         </div>
 
-        <OverviewCard icon={DollarSign} tone="blue" label="Gasto total del mes">
-          <p className="mt-3 text-2xl font-bold text-slate-800">{formatCurrency(monthTotal, currency)}</p>
-          <p className="text-[11px] text-slate-400">
-            {monthInvoices.length} factura{monthInvoices.length === 1 ? "" : "s"} este mes
-          </p>
-          <SparkBars values={dailySpend} />
-        </OverviewCard>
-
-        <OverviewCard icon={Droplet} tone="sky" label="Litros consumidos">
-          <p className="mt-3 text-2xl font-bold text-slate-800">{monthLiters.toLocaleString()} L</p>
-          <p className="text-[11px] text-slate-400">Cargas de combustible de este mes</p>
-          <SparkBars values={dailyLiters} barClass="bg-sky-500" />
-        </OverviewCard>
-
-        <OverviewCard icon={FileText} tone="amber" label="Órdenes sin documentación completa">
-          <p className="mt-3 text-3xl font-bold text-slate-800">{ordersMissingDocs.length}</p>
-          <p className="text-[11px] text-slate-400">Les falta un documento o el monto</p>
-        </OverviewCard>
-
-        <OverviewCard icon={AlertTriangle} tone="rose" label="Servicios sin verificar">
-          <p className="mt-3 text-3xl font-bold text-slate-800">{unverifiedCount}</p>
-          <p className="text-[11px] text-slate-400">Facturas pendientes de validación</p>
-        </OverviewCard>
-
-        <OverviewCard
-          icon={Plus}
-          tone="emerald"
-          label="Nuevas órdenes de trabajo"
-          right={
-            <div className="flex items-center rounded-lg border border-slate-200 p-0.5 text-[10px] font-semibold">
-              {[
-                ["day", "Día"],
-                ["week", "Semana"],
-                ["month", "Mes"],
-              ].map(([id, label]) => (
-                <button
-                  key={id}
-                  onClick={() => setOrdersPeriod(id)}
-                  className={`rounded-md px-1.5 py-0.5 transition ${ordersPeriod === id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          }
-        >
-          <p className="mt-3 text-3xl font-bold text-slate-800">{newOrdersCount}</p>
-          <p className="text-[11px] text-slate-400">Creadas {periodLabel}</p>
-        </OverviewCard>
-
-        <OverviewCard icon={CheckCircle2} tone="emerald" label="Órdenes completadas">
-          <p className="mt-3 text-3xl font-bold text-slate-800">{completedOrders.length}</p>
-          <p className="text-[11px] text-slate-400">Con documentos y todo verificado</p>
-        </OverviewCard>
-
-        <OverviewCard
-          icon={Clock}
-          tone="amber"
-          label="Próximas a expirar"
-          className="sm:col-span-2"
-          right={
-            <button
-              onClick={() => setDeadlinesOpen(true)}
-              className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
-              aria-label="Plazos por concepto"
-              title="Plazos por concepto"
-            >
-              <Settings size={14} />
-            </button>
-          }
-        >
-          <div className="mt-3 flex flex-wrap items-end gap-x-6 gap-y-2">
-            <div>
-              <p className="text-3xl font-bold text-slate-800">{expiringOrders.length}</p>
-              <p className="text-[11px] text-slate-400">Vencen en {ORDER_WARN_DAYS} días o menos</p>
-            </div>
-            <div>
-              <p className={`text-xl font-bold ${overdueOrders.length > 0 ? "text-rose-600" : "text-slate-800"}`}>{overdueOrders.length}</p>
-              <p className="text-[11px] text-slate-400">Ya vencidas</p>
-            </div>
-          </div>
-          {expiringOrders.length > 0 && (
-            <div className="mt-3 space-y-1">
-              {expiringOrders.slice(0, 3).map((o) => (
-                <p key={o.key} className="text-[11px] text-slate-500">
-                  <b className="text-slate-700">{o.code}</b>
-                  {o.project ? ` · ${o.project}` : ""} — {o.daysLeft === 0 ? "vence hoy" : `vence en ${o.daysLeft} día${o.daysLeft === 1 ? "" : "s"}`}
-                </p>
-              ))}
-            </div>
-          )}
-        </OverviewCard>
-
-        <OverviewCard icon={ShieldCheck} tone="blue" label="Pendientes de aprobación">
-          <p className="mt-3 text-3xl font-bold text-slate-800">{pendingApprovalCount}</p>
-          <p className="text-[11px] text-slate-400">Verificadas, listas para aprobar</p>
-        </OverviewCard>
+        {selectedWidgets.filter((id) => generalCards[id]).map((id) => (
+          <React.Fragment key={id}>{generalCards[id]}</React.Fragment>
+        ))}
       </div>
 
       <div className="space-y-3">
@@ -5682,7 +6551,7 @@ function InvoiceOverview({
               {byProject.map((g) => (
                 <button
                   key={`p-${g.value}`}
-                  onClick={() => setExplore({ kind: "project", value: g.value })}
+                  onClick={() => onOpenProject(g.value)}
                   className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:border-blue-300 hover:bg-blue-50/40"
                 >
                   {g.value || "Sin proyecto"} <b className="text-slate-400">{g.count}</b>
@@ -5710,31 +6579,51 @@ function InvoiceOverview({
 
       {settingsOpen && <DesgloseSettingsModal settings={settings} onChange={setSettings} onClose={() => setSettingsOpen(false)} />}
       {deadlinesOpen && <DeadlinesModal days={deadlineDays} isAdmin={isAdmin} onSave={onSaveDeadlines} onClose={() => setDeadlinesOpen(false)} />}
+      {customizing && (
+        <SummaryWidgetsModal
+          widgets={SUMMARY_CATALOGS.general.widgets}
+          selected={selectedWidgets}
+          defaults={SUMMARY_CATALOGS.general.defaults}
+          onChange={(ids) => onWidgetPrefsChange({ ...widgetPrefs, general: ids })}
+          onClose={() => setCustomizing(false)}
+        />
+      )}
     </div>
   );
 }
 
+// Dónde está la persona dentro de Facturas y Gastos:
+// Resumen general o un concepto, o bien Proyectos → un proyecto → un concepto.
+const INVOICE_NAV_START = { inProjects: false, project: null, concept: "overview" };
+const PROJECT_SCOPES = [
+  { id: "active", label: "Activos" },
+  { id: "all", label: "Totales" },
+];
+
 function FuelPage({
-  records,
   invoices,
   orders,
+  projectSettings,
   deadlineDays,
   reminders,
   isAdmin,
   userName,
+  nav,
+  onNavChange,
   onAddInvoice,
   onEditInvoice,
   onConfirmInvoice,
   onDecideInvoice,
   onSaveDeadlines,
+  onSetProjectClosed,
 }) {
   const { profile } = useAuth();
   const currency = profile?.company?.currency || "MXN";
-  const fuelWidgets = useMemo(() => getFuelWidgets(records, currency), [records, currency]);
-  const [visibleWidgets, setVisibleWidgets] = useState({ totalSpend: true, liters: true, efficiency: true, ocr: true });
-  const [widgetModalOpen, setWidgetModalOpen] = useState(false);
-  const [invoiceCategory, setInvoiceCategory] = useState("overview");
   const [columnPrefs, setColumnPrefs] = usePersistentState("navio.invoices.columns.v1", {});
+  const [widgetPrefs, setWidgetPrefs] = usePersistentState("navio.invoices.widgets.v1", {});
+  // Un concepto se revisa mes a mes; un proyecto se mide completo.
+  const [periods, setPeriods] = usePersistentState("navio.invoices.periods.v1", { general: "month", projects: "all" });
+  const [projectScope, setProjectScope] = usePersistentState("navio.invoices.projectScope.v1", "active");
   const [columnPickerView, setColumnPickerView] = useState(null);
   const [detailKey, setDetailKey] = useState(null);
   const detailInvoice = invoices.find((i) => i.key === detailKey) ?? null;
@@ -5743,11 +6632,26 @@ function FuelPage({
   const askDecision = (type, inv) => setInvoiceDecision({ type, inv });
   const [showVoided, setShowVoided] = usePersistentState("navio.invoices.showVoided", false);
 
-  function toggleWidget(id) {
-    setVisibleWidgets((prev) => ({ ...prev, [id]: !prev[id] }));
-  }
+  const { inProjects, project: projectName, concept } = nav;
+  const projects = useMemo(() => buildProjects(invoices, orders, projectSettings), [invoices, orders, projectSettings]);
+  const namedProjects = projects.filter((p) => p.name);
+  const activeProjects = namedProjects.filter((p) => !p.closed);
+  const scopedProjects = projectScope === "active" ? activeProjects : namedProjects;
+  const looseInvoices = projects.find((p) => !p.name) ?? null;
+  const currentProject = projectName === null ? null : projects.find((p) => p.name === projectName) ?? { name: projectName, closed: false, invoices: [], orders: [] };
+  const scopeInvoices = !inProjects ? invoices : currentProject ? currentProject.invoices : scopedProjects.flatMap((p) => p.invoices);
+  const scopeOrders = !inProjects ? orders : currentProject ? currentProject.orders : scopedProjects.flatMap((p) => p.orders);
+  const conceptInvoices = concept === "overview" ? scopeInvoices : scopeInvoices.filter((i) => inConcept(i, concept));
 
-  const columnsFor = (view) => columnPrefs[view] ?? DEFAULT_INVOICE_COLUMNS[view];
+  const periodKey = inProjects ? "projects" : "general";
+  const period = periods[periodKey] ?? "month";
+  const setPeriod = (id) => setPeriods((prev) => ({ ...prev, [periodKey]: id }));
+  const openProject = (name) => onNavChange({ inProjects: true, project: name, concept: "overview" });
+  const conceptLabel = (id) => CONCEPT_CATEGORIES.find((c) => c.id === id)?.label ?? "";
+
+  const view = concept !== "overview" ? concept : inProjects ? "project" : "overview";
+  // Dentro de un proyecto no hace falta repetir de qué proyecto es cada factura.
+  const columnsFor = (id) => (columnPrefs[id] ?? DEFAULT_INVOICE_COLUMNS[id]).filter((c) => !currentProject || c !== "project");
   const handleDetail = (inv) => setDetailKey(inv.key);
   const tableProps = {
     currency,
@@ -5759,54 +6663,109 @@ function FuelPage({
   };
 
   // Cada pestaña de concepto es una vista filtrada de las mismas facturas.
-  const view = invoiceCategory === "overview" || invoiceCategory === "fuel" || invoiceCategory === "travel" ? invoiceCategory : "misc";
-  const inView = (i) => (view === "misc" ? i.module === "misc" && i.raw.category === invoiceCategory : view === "overview" || i.module === view);
-  const voidedCount = invoices.filter((i) => i.status === "voided" && inView(i)).length;
-  const categoryRows = invoices.filter((i) => inView(i) && (showVoided || i.status !== "voided"));
+  const voidedCount = conceptInvoices.filter((i) => i.status === "voided").length;
+  const categoryRows = conceptInvoices.filter((i) => showVoided || i.status !== "voided");
   const tableTools = (
     <InvoiceTableTools showVoided={showVoided} voidedCount={voidedCount} onToggleVoided={setShowVoided} onOpenColumns={() => setColumnPickerView(view)} />
   );
-  const emptyLabel =
-    view === "fuel"
-      ? "Sin cargas de combustible registradas."
-      : view === "travel"
-      ? "Sin viáticos registrados todavía."
-      : `Sin registros de ${INVOICE_CATEGORIES.find((c) => c.id === invoiceCategory)?.label.toLowerCase()} todavía.`;
+  const emptyLabel = currentProject
+    ? concept === "overview"
+      ? "Este proyecto todavía no tiene facturas."
+      : `Este proyecto no tiene registros de ${conceptLabel(concept).toLowerCase()}.`
+    : concept === "fuel"
+    ? "Sin cargas de combustible registradas."
+    : concept === "travel"
+    ? "Sin viáticos registrados todavía."
+    : `Sin registros de ${conceptLabel(concept).toLowerCase()} todavía.`;
+
+  const summaryProps = { currency, period, onPeriodChange: setPeriod, widgetPrefs, onWidgetPrefsChange: setWidgetPrefs };
+  const invoiceTable = (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-bold text-slate-800">Facturas</h2>
+          <p className="text-[11px] text-slate-400">{countLabel(categoryRows.length, "registro")} de todas las fechas</p>
+        </div>
+        {tableTools}
+      </div>
+      <InvoiceDesgloseTable rows={categoryRows} columnIds={columnsFor(view)} emptyLabel={emptyLabel} {...tableProps} />
+    </div>
+  );
+
+  const projectLabel = currentProject ? currentProject.name || "Sin proyecto" : "";
+  const breadcrumb = inProjects && [
+    { label: "Facturas y Gastos", onClick: () => onNavChange(INVOICE_NAV_START) },
+    currentProject || concept !== "overview" ? { label: "Proyectos", onClick: () => onNavChange({ inProjects: true, project: null, concept: "overview" }) } : { label: "Proyectos" },
+    ...(currentProject ? [concept !== "overview" ? { label: projectLabel, onClick: () => openProject(currentProject.name) } : { label: projectLabel }] : []),
+    ...(concept !== "overview" ? [{ label: conceptLabel(concept) }] : []),
+  ];
 
   return (
     <div className="space-y-5">
+      {breadcrumb && <InvoiceBreadcrumb items={breadcrumb} />}
+
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold text-slate-900">Facturas y Gastos</h1>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="min-w-0 break-words text-xl font-bold text-slate-900">{!inProjects ? "Facturas y Gastos" : projectLabel || "Proyectos"}</h1>
+            {currentProject?.name && (
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${currentProject.closed ? "bg-slate-100 text-slate-500" : "bg-emerald-50 text-emerald-700"}`}>
+                {currentProject.closed ? "Cerrado" : "Activo"}
+              </span>
+            )}
+          </div>
           <p className="mt-1 text-sm text-slate-500">
-            Integra consumo de combustible, consumibles, refrigerante, refacciones y casetas de la flotilla.
+            {!inProjects
+              ? "Integra consumo de combustible, consumibles, refrigerante, refacciones y casetas de la flotilla."
+              : currentProject
+              ? "Todas las facturas de este proyecto y su resumen por concepto."
+              : "Resumen de todos los conceptos de tus proyectos."}
           </p>
         </div>
-        <button
-          onClick={() => onAddInvoice(INVOICE_CATEGORY_TYPE[invoiceCategory])}
-          className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
-        >
-          <Plus size={15} /> Cargar Factura
-        </button>
-      </div>
-
-      <div className="flex flex-wrap gap-2">
-        {INVOICE_CATEGORIES.map((c) => (
+        <div className="flex flex-wrap items-center gap-2">
+          {isAdmin && currentProject?.name && (
+            <button
+              onClick={() => onSetProjectClosed(currentProject.name, !currentProject.closed)}
+              title="Solo cambia si aparece en la vista de proyectos activos. Sus facturas no se modifican."
+              className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+            >
+              {currentProject.closed ? "Reabrir proyecto" : "Cerrar proyecto"}
+            </button>
+          )}
           <button
-            key={c.id}
-            onClick={() => setInvoiceCategory(c.id)}
-            className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
-              invoiceCategory === c.id
-                ? "border-blue-600 bg-blue-600 text-white"
-                : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-            }`}
+            onClick={() => onAddInvoice(INVOICE_CATEGORY_TYPE[concept], currentProject?.name ?? "")}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
           >
-            {c.label}
+            <Plus size={15} /> Cargar Factura
           </button>
-        ))}
+        </div>
       </div>
 
-      {view === "overview" ? (
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        {inProjects ? (
+          <PillTabs
+            tabs={[{ id: "overview", label: currentProject ? "Resumen del proyecto" : "Resumen de proyectos" }, ...CONCEPT_CATEGORIES]}
+            active={concept}
+            onSelect={(id) => onNavChange({ ...nav, concept: id })}
+          />
+        ) : (
+          <PillTabs
+            tabs={[INVOICE_CATEGORIES[0], { id: "projects", label: "Proyectos" }, ...CONCEPT_CATEGORIES]}
+            active={concept}
+            onSelect={(id) => onNavChange(id === "projects" ? { inProjects: true, project: null, concept: "overview" } : { ...INVOICE_NAV_START, concept: id })}
+          />
+        )}
+        {inProjects && !currentProject && (
+          <SegmentedControl
+            label="Proyectos a incluir"
+            options={PROJECT_SCOPES.map((scope) => ({ ...scope, label: `${scope.label} (${scope.id === "active" ? activeProjects.length : namedProjects.length})` }))}
+            value={projectScope}
+            onChange={setProjectScope}
+          />
+        )}
+      </div>
+
+      {view === "overview" && (
         <InvoiceOverview
           invoices={invoices}
           orders={orders}
@@ -5818,53 +6777,67 @@ function FuelPage({
           columnIds={columnsFor("overview")}
           tableTools={tableTools}
           showVoided={showVoided}
+          period={period}
+          onPeriodChange={setPeriod}
+          widgetPrefs={widgetPrefs}
+          onWidgetPrefsChange={setWidgetPrefs}
+          onOpenProject={openProject}
           onDetail={handleDetail}
           onEditInvoice={onEditInvoice}
           onConfirmInvoice={onConfirmInvoice}
           onDecideInvoice={askDecision}
           onSaveDeadlines={onSaveDeadlines}
         />
-      ) : (
+      )}
+
+      {view === "project" && !currentProject && (
         <>
-          {view === "fuel" && (
-            <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-sm font-bold text-slate-800">Resumen del mes — Consumo de Combustible</h2>
-                <button
-                  onClick={() => setWidgetModalOpen(true)}
-                  className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-                >
-                  <Settings size={13} /> Personalizar Widgets
-                </button>
-              </div>
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                {fuelWidgets.filter((w) => visibleWidgets[w.id]).map((w) => (
-                  <KpiCard key={w.id} widget={w} />
-                ))}
-                {fuelWidgets.every((w) => !visibleWidgets[w.id]) && (
-                  <p className="col-span-full py-4 text-center text-xs text-slate-400">
-                    No hay widgets visibles. Actívalos desde "Personalizar Widgets".
-                  </p>
-                )}
-              </div>
+          <InvoiceSummary catalogId="projects" invoices={scopeInvoices} orders={scopeOrders} projects={scopedProjects} {...summaryProps} />
+          <ConceptBreakdown invoices={scopeInvoices} period={period} currency={currency} onOpen={(id) => onNavChange({ ...nav, concept: id })} />
+          <div className="space-y-3">
+            <h2 className="text-sm font-bold text-slate-800">Proyectos</h2>
+            {scopedProjects.length === 0 && (
+              <p className="rounded-2xl border border-slate-200 bg-white px-4 py-8 text-center text-xs text-slate-400">
+                {namedProjects.length > 0 ? 'No hay proyectos activos. Elige "Totales" para ver los cerrados.' : "Todavía no hay proyectos. Aparecen aquí al cargar una factura con proyecto."}
+              </p>
+            )}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              {scopedProjects.map((p) => (
+                <ProjectCard key={p.name} project={p} period={period} currency={currency} onOpen={openProject} />
+              ))}
             </div>
-          )}
-          <div className="flex justify-end">{tableTools}</div>
-          <InvoiceDesgloseTable rows={categoryRows} columnIds={columnsFor(view)} emptyLabel={emptyLabel} {...tableProps} />
+            {looseInvoices && (
+              <button
+                onClick={() => openProject("")}
+                className="flex w-full flex-wrap items-center justify-between gap-2 rounded-2xl border border-dashed border-slate-300 bg-white px-4 py-3 text-left text-xs font-medium text-slate-500 transition hover:border-blue-300 hover:bg-blue-50/40"
+              >
+                <span>Facturas sin proyecto: no cuentan en este resumen. Edítalas para asignarles uno.</span>
+                <span className="font-semibold text-slate-700">{countLabel(looseInvoices.invoices.length, "factura")}</span>
+              </button>
+            )}
+          </div>
         </>
       )}
 
-      {widgetModalOpen && (
-        <WidgetSettingsModal
-          widgets={fuelWidgets}
-          visible={visibleWidgets}
-          onToggle={toggleWidget}
-          onClose={() => setWidgetModalOpen(false)}
-        />
+      {view === "project" && currentProject && (
+        <>
+          <InvoiceSummary catalogId="project" invoices={scopeInvoices} orders={scopeOrders} {...summaryProps} />
+          <ConceptBreakdown invoices={scopeInvoices} period={period} currency={currency} onOpen={(id) => onNavChange({ ...nav, concept: id })} />
+          {invoiceTable}
+        </>
       )}
+
+      {concept !== "overview" && (
+        <>
+          <InvoiceSummary catalogId={concept} invoices={conceptInvoices} {...summaryProps} />
+          {invoiceTable}
+        </>
+      )}
+
       {columnPickerView && (
         <ColumnPickerModal
-          selected={columnsFor(columnPickerView)}
+          view={columnPickerView}
+          selected={columnPrefs[columnPickerView] ?? DEFAULT_INVOICE_COLUMNS[columnPickerView]}
           defaults={DEFAULT_INVOICE_COLUMNS[columnPickerView]}
           onChange={(ids) => setColumnPrefs((prev) => ({ ...prev, [columnPickerView]: ids }))}
           onClose={() => setColumnPickerView(null)}
@@ -9198,6 +10171,9 @@ function NavioApp() {
   // de la app sigue funcionando.
   const { rows: workOrderRows, refresh: refreshWorkOrders } = useSupabaseTable("work_orders", { companyId });
   const { rows: deadlineRows, refresh: refreshDeadlines } = useSupabaseTable("concept_deadlines", { orderBy: "expenseType", companyId });
+  // Igual que las anteriores: sin la migración v16, todos los proyectos salen activos.
+  const { rows: projectSettings, refresh: refreshProjectSettings } = useSupabaseTable("project_settings", { orderBy: "project", companyId });
+  const [invoiceNav, setInvoiceNav] = useState(INVOICE_NAV_START);
   const reminders = useSupabaseTable("user_reminders");
   const invoices = useMemo(
     () => normalizeInvoices({ fuel: fuelRecords, travel: travelExpenses, misc: miscExpenses }),
@@ -9355,9 +10331,19 @@ function NavioApp() {
     return true;
   }
 
-  function handleAddInvoice(expenseType) {
+  async function handleSetProjectClosed(project, closed) {
+    const { error } = await supabase.from("project_settings").upsert({ companyId, project, closed }, { onConflict: "companyId,project" });
+    if (error) {
+      showToast(`Error al actualizar el proyecto: ${error.message}`);
+      return;
+    }
+    await refreshProjectSettings();
+    showToast(closed ? "Proyecto cerrado. Sus facturas no cambian." : "Proyecto reabierto.");
+  }
+
+  function handleAddInvoice(expenseType, project = "") {
     const target = targetForExpenseType(expenseType);
-    setFormModal({ mode: "add", module: target.module, category: target.category, expenseType, initial: null });
+    setFormModal({ mode: "add", module: target.module, category: target.category, expenseType, project, initial: null });
   }
 
   function handleEditInvoice(inv) {
@@ -9486,6 +10472,7 @@ function NavioApp() {
               module={formModal.module}
               fixedCategory={formModal.category}
               presetExpenseType={formModal.expenseType}
+              presetProject={formModal.project}
               initial={formModal.initial}
               vehicles={vehicles}
               orders={invoiceOrders}
@@ -9523,7 +10510,7 @@ function NavioApp() {
             isSuperAdmin={!!profile?.isSuperAdmin}
           />
 
-          <div className="flex min-h-screen flex-1 flex-col">
+          <div className="flex min-h-screen min-w-0 flex-1 flex-col">
             <div data-keep-open>
               <Header
                 toggleSidebar={() => setSidebarOpen((v) => !v)}
@@ -9622,9 +10609,11 @@ function NavioApp() {
                   )}
                   {activeTab === "fuel" && (
                     <FuelPage
-                      records={countableFuelRecords}
                       invoices={invoices}
                       orders={invoiceOrders}
+                      projectSettings={projectSettings}
+                      nav={invoiceNav}
+                      onNavChange={setInvoiceNav}
                       deadlineDays={deadlineDays}
                       reminders={reminders}
                       isAdmin={isCompanyAdmin}
@@ -9634,6 +10623,7 @@ function NavioApp() {
                       onConfirmInvoice={handleConfirmInvoice}
                       onDecideInvoice={handleInvoiceDecision}
                       onSaveDeadlines={handleSaveDeadlines}
+                      onSetProjectClosed={handleSetProjectClosed}
                     />
                   )}
                   {activeTab === "settings" && <SettingsPage />}
@@ -9689,6 +10679,7 @@ function NavioApp() {
               module={formModal.module}
               fixedCategory={formModal.category}
               presetExpenseType={formModal.expenseType}
+              presetProject={formModal.project}
               initial={formModal.initial}
               vehicles={vehicles}
               orders={invoiceOrders}
