@@ -117,6 +117,7 @@ function buildRecord(extracted: any, module: string, cfdi: any): Record<string, 
     invoiceFolio: [cfdi?.serie, cfdi?.folio].filter(Boolean).join("-") || undefined,
     concept: cfdi?.conceptos?.[0]?.descripcion,
     liters: cfdi?.conceptos?.[0]?.cantidad,
+    driverName: cfdi?.otros?.find((o: any) => /hu[eé]sped|conductor|pasajero|beneficiario/i.test(String(o.campo)))?.valor,
   };
   for (const [key, value] of Object.entries(fromCfdi)) {
     if (FIELD_MAP[module]?.includes(key) && picked[key] === undefined && value !== undefined) picked[key] = value;
@@ -501,6 +502,26 @@ Deno.serve(async (req) => {
     return new Response("ok");
   }
 
+  // La misma factura no se registra dos veces. Se revisa antes de subir el
+  // documento; aun así, la base de datos lo impide si dos envíos coinciden.
+  if (cfdi?.uuid) {
+    const { data: existing } = await supabase.rpc("find_invoice_by_uuid", { target_company: company.id, target_uuid: cfdi.uuid });
+    if (existing) {
+      await supabase.from("bot_ingestions").insert({
+        companyId: company.id,
+        channel: "telegram",
+        summary: `Factura repetida, no se registró — ${MODULE_LABEL[module]} — $${record.amount ?? 0}`,
+        module,
+        status: "failed",
+      });
+      await sendMessage(
+        chatId,
+        `Esta factura ya está registrada en Navío, así que no la volví a guardar.\nUUID: ${cfdi.uuid}\nSi hay que corregirla, un administrador debe anular la anterior y luego vuelves a enviarla.`
+      );
+      return new Response("ok");
+    }
+  }
+
   const documentUrl = file ? await uploadDocument(company.id, module, file) : null;
 
   // El chat está ligado a la empresa, no a un usuario de Navío: como
@@ -527,7 +548,8 @@ Deno.serve(async (req) => {
   }
 
   const amountLabel = record.amount != null ? `$${record.amount}` : "sin monto";
-  const unitLabel = record.unit || "sin unidad";
+  // En viáticos casi nunca hay unidad: se muestra a quien recibió el servicio.
+  const unitLabel = record.unit || record.driverName || "sin unidad";
   const summary = insertError
     ? `Error al guardar en ${MODULE_LABEL[module]}: ${insertError.message}`
     : `${MODULE_LABEL[module]} — ${unitLabel} — ${amountLabel}`;

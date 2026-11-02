@@ -91,6 +91,10 @@ import {
   Mail,
   Lock,
   Trash2,
+  ChevronLeft,
+  ShieldAlert,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 
 /* ---------------------------------------------------------------------- */
@@ -1202,6 +1206,7 @@ const STATUS_BADGE_STYLES = {
   pending: { label: "Pendiente de Validación", className: "bg-amber-50 text-amber-700 ring-amber-200", icon: AlertTriangle },
   verified: { label: "Verificado", className: "bg-emerald-50 text-emerald-700 ring-emerald-200", icon: CheckCircle2 },
   rejected: { label: "Rechazado", className: "bg-rose-50 text-rose-700 ring-rose-200", icon: X },
+  voided: { label: "Anulada", className: "bg-slate-100 text-slate-500 ring-slate-200", icon: X },
 };
 
 const TONE_CLASSES = {
@@ -1807,34 +1812,324 @@ function RecordsTable({ records, columns, onConfirm, onEdit, onDelete, emptyLabe
   );
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Visor de documentos                                                   */
+/* ---------------------------------------------------------------------- */
+
+// Cualquier usuario o el bot puede subir un archivo, así que ninguno se abre
+// tal cual: se revisa qué es por su contenido real (no por su nombre) y se
+// pinta en un <canvas>. Lo que se ve son solo píxeles, de modo que los scripts,
+// enlaces y formularios que traiga un PDF no hacen nada. El documento se pide
+// con la sesión del usuario, sin generar ningún enlace temporal.
+const PDFJS_BASE_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299";
+const DOCUMENT_EXTENSIONS = { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+const DOCUMENT_ACCEPT = Object.keys(DOCUMENT_EXTENSIONS).join(",");
+const DOCUMENT_TYPE_PROBLEM = "no es un PDF ni una imagen JPG, PNG o WEBP";
+const DOCUMENT_MAX_MB = 20;
+const MAX_CANVAS_PIXELS = 16000000; // Algunos celulares no dibujan canvas más grandes.
+
+async function sniffDocumentType(blob) {
+  const bytes = new Uint8Array(await blob.slice(0, 1024).arrayBuffer());
+  const text = (start, end) => String.fromCharCode(...bytes.slice(start, end));
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (text(0, 8) === "\x89PNG\r\n\x1a\n") return "image/png";
+  if (text(0, 4) === "RIFF" && text(8, 12) === "WEBP") return "image/webp";
+  // Igual que los lectores de PDF, se tolera basura antes del encabezado.
+  if (text(0, bytes.length).includes("%PDF-")) return "application/pdf";
+  return null;
+}
+
+function blockedDocument(message) {
+  return Object.assign(new Error(message), { blocked: true });
+}
+
+let pdfJsPromise = null;
+function loadPdfJs() {
+  if (!pdfJsPromise) {
+    pdfJsPromise = import(`${PDFJS_BASE_URL}/legacy/build/pdf.min.mjs`)
+      .then((pdfjs) => {
+        pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_BASE_URL}/legacy/build/pdf.worker.min.mjs`;
+        return pdfjs;
+      })
+      .catch((err) => {
+        pdfJsPromise = null;
+        throw err;
+      });
+  }
+  return pdfJsPromise;
+}
+
+// Ajusta el canvas al ancho disponible y devuelve la escala a la que hay que dibujar.
+function fitCanvas(canvas, natural, width, zoom) {
+  const cssScale = (width / natural.width) * zoom;
+  const maxScale = Math.sqrt(MAX_CANVAS_PIXELS / (natural.width * natural.height));
+  const scale = Math.min(cssScale * Math.min(window.devicePixelRatio || 1, 2), maxScale);
+  canvas.width = Math.floor(natural.width * scale);
+  canvas.height = Math.floor(natural.height * scale);
+  canvas.style.width = `${natural.width * cssScale}px`;
+  canvas.style.height = `${natural.height * cssScale}px`;
+  return scale;
+}
+
+async function openPdfDocument(blob) {
+  const pdfjs = await loadPdfJs();
+  const task = pdfjs.getDocument({
+    data: new Uint8Array(await blob.arrayBuffer()),
+    cMapUrl: `${PDFJS_BASE_URL}/cmaps/`,
+    standardFontDataUrl: `${PDFJS_BASE_URL}/standard_fonts/`,
+    wasmUrl: `${PDFJS_BASE_URL}/wasm/`,
+    iccUrl: `${PDFJS_BASE_URL}/iccs/`,
+    enableXfa: false,
+  });
+  let pdf;
+  try {
+    pdf = await task.promise;
+  } catch (err) {
+    task.destroy();
+    if (err?.name === "PasswordException") throw blockedDocument("Este PDF tiene contraseña, así que no se puede mostrar.");
+    if (err?.name === "InvalidPDFException") throw blockedDocument("Este PDF está dañado, así que no se puede mostrar.");
+    throw err;
+  }
+  return {
+    pages: pdf.numPages,
+    draw(canvas, { page, rotation, width, zoom }) {
+      let renderTask = null;
+      let cancelled = false;
+      const promise = pdf.getPage(page).then((pdfPage) => {
+        if (cancelled) return undefined;
+        const angle = (pdfPage.rotate + rotation) % 360;
+        const scale = fitCanvas(canvas, pdfPage.getViewport({ scale: 1, rotation: angle }), width, zoom);
+        renderTask = pdfPage.render({ canvas, viewport: pdfPage.getViewport({ scale, rotation: angle }) });
+        return renderTask.promise;
+      });
+      return {
+        promise,
+        cancel() {
+          cancelled = true;
+          renderTask?.cancel();
+        },
+      };
+    },
+    close: () => task.destroy(),
+  };
+}
+
+async function openImageDocument(blob, mime) {
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(new Blob([blob], { type: mime }));
+  } catch {
+    throw blockedDocument("Esta imagen está dañada, así que no se puede mostrar.");
+  }
+  return {
+    pages: 1,
+    draw(canvas, { rotation, width, zoom }) {
+      const natural = rotation % 180 ? { width: bitmap.height, height: bitmap.width } : { width: bitmap.width, height: bitmap.height };
+      const scale = fitCanvas(canvas, natural, width, zoom);
+      const ctx = canvas.getContext("2d");
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.rotate((rotation * Math.PI) / 180);
+      ctx.scale(scale, scale);
+      ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+      return { promise: Promise.resolve(), cancel() {} };
+    },
+    close: () => bitmap.close(),
+  };
+}
+
+async function openDocument(blob) {
+  const mime = await sniffDocumentType(blob);
+  if (!mime) throw blockedDocument(`Este archivo ${DOCUMENT_TYPE_PROBLEM}, así que no se muestra. Pide que lo carguen de nuevo.`);
+  const opened = mime === "application/pdf" ? await openPdfDocument(blob) : await openImageDocument(blob, mime);
+  return { ...opened, mime };
+}
+
+function DocumentPreview({ path, file }) {
+  const [state, setState] = useState({ status: "loading" });
+  const [attempt, setAttempt] = useState(0);
+  const [page, setPage] = useState(1);
+  const [zoom, setZoom] = useState(1);
+  const [rotation, setRotation] = useState(0);
+  const [width, setWidth] = useState(0);
+  const boxRef = useRef(null);
+  const pageRef = useRef(null);
+  const source = state.source;
+
+  useEffect(() => {
+    const observer = new ResizeObserver(([entry]) => setWidth(Math.floor(entry.contentRect.width)));
+    observer.observe(boxRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let opened = null;
+    setState({ status: "loading" });
+    setPage(1);
+    setZoom(1);
+    setRotation(0);
+    pageRef.current?.replaceChildren();
+    (async () => {
+      try {
+        let blob = file;
+        if (!blob) {
+          const { data, error } = await supabase.storage.from("documents").download(path);
+          if (error) throw error;
+          blob = data;
+        }
+        const doc = await openDocument(blob);
+        if (cancelled) {
+          doc.close();
+          return;
+        }
+        opened = doc;
+        setState({ status: "ready", source: doc, blob });
+      } catch (err) {
+        if (!cancelled) setState({ status: err.blocked ? "blocked" : "error", message: err.message });
+      }
+    })();
+    return () => {
+      cancelled = true;
+      opened?.close();
+    };
+  }, [path, file, attempt]);
+
+  // Cada dibujo usa un canvas nuevo: la página anterior sigue visible hasta que
+  // la nueva está lista, y cambiar de zoom rápido no choca con el dibujo en curso.
+  useEffect(() => {
+    if (!source || !width) return undefined;
+    const canvas = document.createElement("canvas");
+    canvas.className = "mx-auto block bg-white shadow";
+    let cancelled = false;
+    const task = source.draw(canvas, { page, rotation, width, zoom });
+    task.promise
+      .then(() => {
+        if (!cancelled) pageRef.current?.replaceChildren(canvas);
+      })
+      .catch(() => {
+        if (!cancelled) setState({ status: "blocked", message: "Este documento está dañado, así que no se puede mostrar." });
+      });
+    return () => {
+      cancelled = true;
+      task.cancel();
+    };
+  }, [source, page, rotation, width, zoom]);
+
+  function handleDownload() {
+    const url = URL.createObjectURL(new Blob([state.blob], { type: "application/octet-stream" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `documento.${DOCUMENT_EXTENSIONS[source.mime]}`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  const toolClass = "flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 hover:bg-white disabled:opacity-40";
+  const ready = state.status === "ready";
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden whitespace-normal rounded-xl border border-slate-200 bg-slate-100">
+      <div className="flex min-h-[2.5rem] shrink-0 flex-wrap items-center gap-1 border-b border-slate-200 px-2 py-1">
+        {ready && (
+          <>
+            <button type="button" onClick={() => setZoom((z) => Math.max(0.5, z - 0.25))} disabled={zoom <= 0.5} className={toolClass} aria-label="Alejar" title="Alejar">
+              <ZoomOut size={14} />
+            </button>
+            <button type="button" onClick={() => setZoom(1)} className="w-11 rounded-lg py-1 text-[11px] font-semibold text-slate-500 hover:bg-white" title="Ajustar al ancho">
+              {Math.round(zoom * 100)}%
+            </button>
+            <button type="button" onClick={() => setZoom((z) => Math.min(4, z + 0.25))} disabled={zoom >= 4} className={toolClass} aria-label="Acercar" title="Acercar">
+              <ZoomIn size={14} />
+            </button>
+            <button type="button" onClick={() => setRotation((r) => (r + 90) % 360)} className={toolClass} aria-label="Girar" title="Girar">
+              <RotateCw size={14} />
+            </button>
+            {source.pages > 1 && (
+              <div className="flex items-center gap-1">
+                <button type="button" onClick={() => setPage((p) => p - 1)} disabled={page <= 1} className={toolClass} aria-label="Página anterior" title="Página anterior">
+                  <ChevronLeft size={14} />
+                </button>
+                <span className="text-[11px] font-semibold text-slate-500">
+                  {page} / {source.pages}
+                </span>
+                <button type="button" onClick={() => setPage((p) => p + 1)} disabled={page >= source.pages} className={toolClass} aria-label="Página siguiente" title="Página siguiente">
+                  <ChevronRight size={14} />
+                </button>
+              </div>
+            )}
+            {!file && (
+              <button type="button" onClick={handleDownload} className={`${toolClass} ml-auto`} aria-label="Descargar" title="Descargar">
+                <Download size={14} />
+              </button>
+            )}
+          </>
+        )}
+      </div>
+      <div ref={boxRef} className="relative min-h-0 flex-1 overflow-auto p-2 [scrollbar-gutter:stable]">
+        <div ref={pageRef} />
+        {state.status === "loading" && (
+          <div className="absolute inset-0 flex items-center justify-center text-xs font-medium text-slate-400">Cargando documento...</div>
+        )}
+        {state.status === "blocked" && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-6 text-center text-xs font-medium text-amber-700">
+            <ShieldAlert size={22} />
+            <p>{state.message}</p>
+          </div>
+        )}
+        {state.status === "error" && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-6 text-center text-xs font-medium text-slate-500">
+            <AlertTriangle size={22} />
+            <p>No se pudo abrir el documento: {state.message}</p>
+            <button type="button" onClick={() => setAttempt((a) => a + 1)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+              Reintentar
+            </button>
+          </div>
+        )}
+      </div>
+      <p className="flex shrink-0 items-center gap-1.5 border-t border-slate-200 px-3 py-1.5 text-[11px] text-slate-500">
+        <ShieldCheck size={12} className="shrink-0" />
+        {file ? "Archivo nuevo, todavía sin guardar." : "Vista segura: nada de lo que contenga el archivo se ejecuta."}
+      </p>
+    </div>
+  );
+}
+
+// Pone el documento a un lado del contenido (arriba en pantallas chicas).
+function DocumentSplit({ path, file, children }) {
+  const hasDocument = !!(path || file);
+  return (
+    <div className={hasDocument ? "flex max-h-[72vh] flex-col gap-4 overflow-y-auto lg:max-h-none lg:flex-row lg:overflow-visible" : ""}>
+      {hasDocument && (
+        <div className="h-[45vh] shrink-0 lg:h-[76vh] lg:w-1/2">
+          <DocumentPreview path={path} file={file} />
+        </div>
+      )}
+      <div className={hasDocument ? "min-w-0 pr-1 lg:max-h-[76vh] lg:flex-1 lg:overflow-y-auto" : "max-h-[70vh] overflow-y-auto pr-1"}>{children}</div>
+    </div>
+  );
+}
+
 function DocumentCell({ documentUrl }) {
-  const { showToast } = useToast();
-  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
 
   if (!documentUrl) return <span className="text-[11px] text-slate-300">Sin documento</span>;
 
-  async function handleDownload(e) {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const { data, error } = await supabase.storage.from("documents").createSignedUrl(documentUrl, 60);
-      if (error) throw error;
-      window.open(data.signedUrl, "_blank");
-    } catch (err) {
-      showToast(`Error al abrir el documento: ${err.message}`);
-    } finally {
-      setLoading(false);
-    }
-  }
-
   return (
-    <button
-      onClick={handleDownload}
-      disabled={loading}
-      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60"
-    >
-      <FileText size={12} /> {loading ? "Abriendo..." : "Descargar"}
-    </button>
+    <>
+      <button
+        onClick={() => setOpen(true)}
+        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+      >
+        <FileText size={12} /> Ver
+      </button>
+      {open && (
+        <Modal title="Documento" width="max-w-4xl" onClose={() => setOpen(false)}>
+          <div className="h-[76vh]">
+            <DocumentPreview path={documentUrl} />
+          </div>
+        </Modal>
+      )}
+    </>
   );
 }
 
@@ -1956,6 +2251,7 @@ function normalizeInvoices({ fuel = [], travel = [], misc = [] }) {
     cfdi: r.cfdi || null,
     origin: r.origin || "manual",
     status: r.status || "pending",
+    statusReason: r.statusReason || "",
     approved: !!r.approved,
     approvedByName: r.approvedByName || "",
     uploadedByName: r.uploadedByName || "",
@@ -1970,9 +2266,22 @@ function isInvoiceDone(inv) {
   return !!inv.documentUrl && inv.amount > 0 && inv.status === "verified";
 }
 
+// Flujo de una factura: Pendiente → Verificada → Aprobada. Un administrador
+// puede rechazarla o anularla (es definitivo) y revertir una aprobación,
+// siempre con motivo. Las facturas no se eliminan: las anuladas siguen en el
+// historial sin contar en totales. La migración v13 aplica estas mismas
+// reglas en la base de datos.
+function isInvoiceClosed(inv) {
+  return inv.status === "rejected" || inv.status === "voided";
+}
+
+function isInvoiceLocked(inv) {
+  return isInvoiceClosed(inv) || inv.approved;
+}
+
 // Las órdenes de trabajo se arman agrupando facturas por (proyecto, orden);
 // "work_orders" solo aporta datos propios de la orden (su fecha límite).
-// Las facturas rechazadas no cuentan: se consideran descartadas.
+// Las facturas rechazadas o anuladas no cuentan: se consideran descartadas.
 function buildOrders(invoices, workOrderRows = [], deadlineDays = getDeadlineDays()) {
   const map = new Map();
   const ensure = (project, code) => {
@@ -1986,7 +2295,7 @@ function buildOrders(invoices, workOrderRows = [], deadlineDays = getDeadlineDay
     o.createdAt = wo.createdAt || null;
   }
   for (const inv of invoices) {
-    if (inv.workOrder && inv.status !== "rejected") ensure(inv.project, inv.workOrder).invoices.push(inv);
+    if (inv.workOrder && !isInvoiceClosed(inv)) ensure(inv.project, inv.workOrder).invoices.push(inv);
   }
 
   return [...map.values()].map((o) => {
@@ -2220,10 +2529,22 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
   const [invoiceFolio, setInvoiceFolio] = useState(initial?.invoiceFolio ?? "");
   const [notes, setNotes] = useState(initial?.notes ?? "");
   const [file, setFile] = useState(null);
+  const [fileError, setFileError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
 
   const plate = vehicles.find((v) => v.unit === unit)?.plate ?? "";
+
+  async function handleFileChange(e) {
+    const input = e.target;
+    const picked = input.files?.[0] ?? null;
+    let problem = "";
+    if (picked && picked.size > DOCUMENT_MAX_MB * 1024 * 1024) problem = `pesa más de ${DOCUMENT_MAX_MB} MB`;
+    else if (picked && !(await sniffDocumentType(picked))) problem = DOCUMENT_TYPE_PROBLEM;
+    if (problem) input.value = "";
+    setFileError(problem ? `Este archivo ${problem}, así que no se puede cargar.` : "");
+    setFile(problem ? null : picked);
+  }
 
   // Al escribir una orden que ya existe, se completan su proyecto y fecha límite.
   function handleWorkOrderChange(value) {
@@ -2252,9 +2573,9 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
     try {
       let documentUrl = initial?.documentUrl ?? null;
       if (file) {
-        const ext = file.type === "application/pdf" ? "pdf" : file.type === "image/png" ? "png" : "jpg";
-        const path = `${profile.companyId}/${module}/${crypto.randomUUID()}.${ext}`;
-        const { error: uploadError } = await supabase.storage.from("documents").upload(path, file, { contentType: file.type });
+        const mime = await sniffDocumentType(file);
+        const path = `${profile.companyId}/${module}/${crypto.randomUUID()}.${DOCUMENT_EXTENSIONS[mime]}`;
+        const { error: uploadError } = await supabase.storage.from("documents").upload(path, file, { contentType: mime });
         if (uploadError) throw uploadError;
         documentUrl = path;
       }
@@ -2320,10 +2641,11 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
           ? "Editar / Corregir Registro"
           : "Agregar Registro Manual"
       }
-      width="max-w-lg"
+      width={file || initial?.documentUrl ? "max-w-6xl" : "max-w-lg"}
       onClose={onClose}
     >
-      <form onSubmit={handleSubmit} className="max-h-[70vh] space-y-3 overflow-y-auto pr-1">
+      <DocumentSplit path={initial?.documentUrl} file={file}>
+      <form onSubmit={handleSubmit} className="space-y-3">
         {!fixedModule && (
           <div>
             <label className={labelClass}>Módulo Destino</label>
@@ -2557,10 +2879,16 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
           )}
           <input
             type="file"
-            accept="image/*,application/pdf"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            accept={DOCUMENT_ACCEPT}
+            onChange={handleFileChange}
             className="w-full text-xs text-slate-500 file:mr-3 file:rounded-lg file:border file:border-slate-200 file:bg-white file:px-2.5 file:py-1.5 file:text-xs file:font-semibold file:text-slate-600 hover:file:bg-slate-50"
           />
+          {fileError && (
+            <p className="mt-1.5 flex items-center gap-1.5 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] font-medium text-rose-700">
+              <AlertTriangle size={13} className="shrink-0" />
+              {fileError}
+            </p>
+          )}
         </div>
 
         {mode === "edit" && (
@@ -2590,6 +2918,7 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
           </button>
         </div>
       </form>
+      </DocumentSplit>
     </Modal>
   );
 }
@@ -4051,14 +4380,18 @@ const invoiceConcepts = (inv) => (inv.cfdi?.conceptos ?? []).map((c) => c.descri
 const INVOICE_COLUMNS = [
   {
     id: "unit",
-    label: "Unidad / Matrícula",
+    label: "Unidad / Persona",
     group: "General",
-    render: (inv) => (
-      <div>
-        <p className="font-semibold text-slate-700">{inv.unit || "Sin unidad asociada"}</p>
-        {inv.plate && <p className="text-[11px] text-slate-400">{inv.plate}</p>}
-      </div>
-    ),
+    render: (inv) => {
+      // Sin unidad (común en viáticos), se muestra a quien recibió el servicio.
+      const detail = inv.unit ? [inv.plate, inv.driverName].filter(Boolean).join(" · ") : "";
+      return (
+        <div>
+          <p className="font-semibold text-slate-700">{inv.unit || inv.driverName || "Sin unidad asociada"}</p>
+          {detail && <p className="text-[11px] text-slate-400">{detail}</p>}
+        </div>
+      );
+    },
   },
   { id: "driver", label: "Conductor / Huésped", group: "General", render: (inv) => orEmpty(inv.driverName) },
   {
@@ -4130,17 +4463,27 @@ const INVOICE_COLUMNS = [
       inv.approved ? <CheckCircle2 size={16} className="text-emerald-500" aria-label="Aprobada" /> : <X size={16} className="text-rose-400" aria-label="Sin aprobar" />,
   },
   { id: "approvedBy", label: "Aprobado por", group: "General", render: (inv) => orEmpty(inv.approvedByName) },
+  {
+    id: "statusReason",
+    label: "Motivo",
+    group: "General",
+    cellClass: "max-w-[16rem] truncate",
+    render: (inv) => {
+      const reason = isInvoiceClosed(inv) ? inv.statusReason : "";
+      return <span title={reason}>{orEmpty(reason)}</span>;
+    },
+  },
   { id: "document", label: "Documento", group: "General", render: (inv) => <DocumentCell documentUrl={inv.documentUrl} /> },
 ];
 
 const DEFAULT_INVOICE_COLUMNS = {
   overview: ["project", "workOrder", "date", "amount", "expenseType", "vendor", "emisorRfc", "origin", "user", "status", "approved", "approvedBy", "document"],
   fuel: ["unit", "project", "workOrder", "station", "date", "amount", "liters", "odometer", "efficiency", "document", "origin", "status"],
-  travel: ["unit", "driver", "project", "workOrder", "date", "amount", "expenseType", "description", "vendor", "document", "origin", "status"],
+  travel: ["unit", "project", "workOrder", "date", "amount", "expenseType", "description", "vendor", "document", "origin", "status"],
   misc: ["unit", "project", "workOrder", "date", "amount", "expenseType", "description", "vendor", "document", "origin", "status"],
 };
 
-function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onConfirm, onApprove, onReject, onDetail, onDelete, emptyLabel }) {
+function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onConfirm, onDecide, onDetail, emptyLabel }) {
   const { format } = useDateFormat();
   const columns = INVOICE_COLUMNS.filter((c) => columnIds.includes(c.id));
   const ctx = { currency, format };
@@ -4173,7 +4516,7 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
                   >
                     <Eye size={12} /> Detalle
                   </button>
-                  {inv.status === "pending" && (
+                  {inv.status === "pending" && !inv.approved && (
                     <button
                       onClick={() => onConfirm(inv)}
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
@@ -4181,34 +4524,44 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
                       <CheckCircle2 size={12} /> Confirmar
                     </button>
                   )}
-                  {isAdmin && inv.status !== "rejected" && !inv.approved && (
+                  {isAdmin && inv.status === "verified" && !inv.approved && (
                     <button
-                      onClick={() => onApprove(inv)}
+                      onClick={() => onDecide("approve", inv)}
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-[11px] font-semibold text-blue-700 hover:bg-blue-100"
                     >
                       <ShieldCheck size={12} /> Aprobar
                     </button>
                   )}
-                  {isAdmin && inv.status !== "rejected" && (
+                  {isAdmin && inv.approved && !isInvoiceClosed(inv) && (
                     <button
-                      onClick={() => onReject(inv)}
+                      onClick={() => onDecide("revert", inv)}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                    >
+                      <RotateCw size={12} /> Revertir aprobación
+                    </button>
+                  )}
+                  {isAdmin && !isInvoiceLocked(inv) && (
+                    <button
+                      onClick={() => onDecide("reject", inv)}
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-rose-200 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
                     >
                       <X size={12} /> Rechazar
                     </button>
                   )}
-                  <button
-                    onClick={() => onEdit(inv)}
-                    className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
-                  >
-                    <Edit2 size={12} /> Editar
-                  </button>
-                  {isAdmin && onDelete && (
+                  {!isInvoiceLocked(inv) && (
                     <button
-                      onClick={() => onDelete(inv)}
-                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-rose-200 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
+                      onClick={() => onEdit(inv)}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
                     >
-                      <Trash2 size={12} /> Eliminar
+                      <Edit2 size={12} /> Editar
+                    </button>
+                  )}
+                  {isAdmin && !isInvoiceClosed(inv) && (
+                    <button
+                      onClick={() => onDecide("void", inv)}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50"
+                    >
+                      <Trash2 size={12} /> Anular
                     </button>
                   )}
                 </div>
@@ -4225,6 +4578,193 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
         </tbody>
       </table>
     </div>
+  );
+}
+
+function InvoiceTableTools({ showVoided, voidedCount, onToggleVoided, onOpenColumns }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {voidedCount > 0 && (
+        <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-slate-500">
+          <input type="checkbox" checked={showVoided} onChange={(e) => onToggleVoided(e.target.checked)} className="h-3.5 w-3.5 accent-blue-600" />
+          Mostrar anuladas ({voidedCount})
+        </label>
+      )}
+      <InvoiceColumnsButton onClick={onOpenColumns} />
+    </div>
+  );
+}
+
+const INVOICE_DECISIONS = {
+  approve: {
+    title: "Aprobar factura",
+    verb: "Aprobar",
+    confirmLabel: "Aprobar",
+    note: "Ya no se podrá editar. Si fue un error, un administrador puede revertir la aprobación indicando el motivo.",
+  },
+  reject: {
+    title: "Rechazar factura",
+    verb: "Rechazar",
+    confirmLabel: "Rechazar",
+    danger: true,
+    note: "Es definitivo: ya no se podrá editar ni aprobar. Para corregirla habrá que cargarla de nuevo.",
+    placeholder: "Ej. El monto no coincide con el comprobante",
+  },
+  void: {
+    title: "Anular factura",
+    verb: "Anular",
+    confirmLabel: "Anular",
+    danger: true,
+    note: "Es definitivo: deja de contar en los totales, pero se conserva en el historial.",
+    placeholder: "Ej. Se cargó dos veces",
+  },
+  revert: {
+    title: "Revertir aprobación",
+    verb: "Revertir la aprobación de",
+    confirmLabel: "Revertir aprobación",
+    note: "La factura vuelve a Verificada y se podrá editar o aprobar de nuevo.",
+    placeholder: "Ej. Se aprobó por error",
+  },
+};
+
+function InvoiceDecisionModal({ decision, currency, onSubmit, onClose }) {
+  const meta = INVOICE_DECISIONS[decision.type];
+  const { inv } = decision;
+  const needsReason = !!meta.placeholder;
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+  const canSubmit = !saving && (!needsReason || reason.trim().length >= 3);
+
+  async function handleSubmit() {
+    setSaving(true);
+    try {
+      await onSubmit(reason.trim());
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal title={meta.title} width={inv.documentUrl ? "max-w-5xl" : "max-w-md"} onClose={onClose}>
+      <DocumentSplit path={inv.documentUrl}>
+      <p className="text-xs text-slate-600">
+        ¿{meta.verb} "{inv.description || expenseTypeLabel(inv.expenseType)}" por {formatMoney(inv.amount, inv.cfdi?.moneda || currency)}?
+      </p>
+      <p className="mt-1 text-xs text-slate-400">{meta.note}</p>
+      {needsReason && (
+        <div className="mt-3">
+          <label className="mb-1 block text-[11px] font-semibold text-slate-500">Motivo (obligatorio)</label>
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            rows={3}
+            placeholder={meta.placeholder}
+            className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none"
+          />
+        </div>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+          Cancelar
+        </button>
+        <button
+          onClick={handleSubmit}
+          disabled={!canSubmit}
+          className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold text-white disabled:opacity-50 ${
+            meta.danger ? "bg-rose-600 hover:bg-rose-700" : "bg-blue-600 hover:bg-blue-700"
+          }`}
+        >
+          {saving ? "Guardando..." : meta.confirmLabel}
+        </button>
+      </div>
+      </DocumentSplit>
+    </Modal>
+  );
+}
+
+const INVOICE_TABLE_BY_MODULE = { fuel: "fuel_records", travel: "travel_expenses", misc: "misc_expenses" };
+const INVOICE_EVENT_LABELS = {
+  created: "Registrada",
+  verified: "Verificada",
+  edited: "Editada",
+  approved: "Aprobada",
+  approval_reverted: "Aprobación revertida",
+  rejected: "Rechazada",
+  voided: "Anulada",
+};
+const INVOICE_FIELD_LABELS = {
+  amount: "Monto",
+  date: "Fecha",
+  vendor: "Proveedor",
+  concept: "Descripción",
+  project: "Proyecto",
+  workOrder: "Orden de trabajo",
+  expenseType: "Concepto",
+  unit: "Unidad",
+  plate: "Matrícula",
+  driverName: "Conductor / Huésped",
+  invoiceFolio: "Folio",
+  notes: "Notas",
+  station: "Estación",
+  liters: "Litros",
+  odometer: "Odómetro",
+  efficiency: "Rendimiento",
+  category: "Categoría",
+};
+
+// Lista legible de lo que cambió en una edición.
+function invoiceEventChanges(changes) {
+  return Object.entries(changes ?? {}).map(([field, change]) => {
+    if (field === "cfdi") return "Datos fiscales actualizados";
+    if (field === "documentUrl") return "Documento reemplazado";
+    const shown = (value) => (value === null || value === undefined || value === "" ? "vacío" : String(value));
+    return `${INVOICE_FIELD_LABELS[field] ?? field}: ${shown(change.de)} → ${shown(change.a)}`;
+  });
+}
+
+function InvoiceHistory({ invoice }) {
+  const [events, setEvents] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    supabase
+      .from("invoice_events")
+      .select("*")
+      .eq("invoiceTable", INVOICE_TABLE_BY_MODULE[invoice.module])
+      .eq("invoiceId", invoice.id)
+      .order("createdAt", { ascending: true })
+      .then(({ data }) => {
+        if (!cancelled) setEvents(data ?? []);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [invoice.module, invoice.id, invoice.status, invoice.approved]);
+
+  return (
+    <section>
+      <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Historial</h4>
+      {events === null && <p className="text-xs text-slate-400">Cargando...</p>}
+      {events?.length === 0 && <p className="text-xs text-slate-400">Sin movimientos registrados. El historial empieza con los cambios a partir de ahora.</p>}
+      {events?.length > 0 && (
+        <ol className="space-y-2.5 border-l-2 border-slate-100 pl-3">
+          {events.map((event) => (
+            <li key={event.id}>
+              <p className="text-xs font-semibold text-slate-700">{INVOICE_EVENT_LABELS[event.action] ?? event.action}</p>
+              <p className="text-[11px] text-slate-400">
+                {event.actorName || "Sistema"} · {new Date(event.createdAt).toLocaleString("es-MX", { dateStyle: "medium", timeStyle: "short" })}
+              </p>
+              {event.reason && <p className="text-[11px] text-slate-600">Motivo: {event.reason}</p>}
+              {invoiceEventChanges(event.changes).map((line) => (
+                <p key={line} className="text-[11px] text-slate-500">
+                  {line}
+                </p>
+              ))}
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
   );
 }
 
@@ -4304,8 +4844,9 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
     [tax.tipo, tax.tasa !== undefined ? `${+(Number(tax.tasa) * 100).toFixed(4)}%` : null, tax.importe !== undefined ? money(tax.importe) : null].filter(Boolean).join(" ");
 
   return (
-    <Modal title="Detalle de la factura" width="max-w-3xl" onClose={onClose}>
-      <div className="max-h-[75vh] space-y-5 overflow-y-auto pr-1">
+    <Modal title="Detalle de la factura" width={invoice.documentUrl ? "max-w-7xl" : "max-w-3xl"} onClose={onClose}>
+      <DocumentSplit path={invoice.documentUrl}>
+      <div className="space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2.5">
           <div>
             <p className="text-lg font-bold text-slate-800">{money(invoice.amount)}</p>
@@ -4317,7 +4858,7 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
           <div className="flex flex-wrap items-center gap-2">
             <OriginBadge origin={invoice.origin} />
             <StatusBadge status={invoice.status} />
-            <DocumentCell documentUrl={invoice.documentUrl} />
+            {!invoice.documentUrl && <DocumentCell documentUrl={null} />}
           </div>
         </div>
 
@@ -4328,6 +4869,19 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
                 <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}
               </p>
             ))}
+          </div>
+        )}
+
+        {isInvoiceLocked(invoice) && (
+          <div className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-medium text-slate-600">
+            <p>
+              {invoice.status === "rejected"
+                ? "Esta factura fue rechazada y ya no se puede modificar. Para corregirla hay que cargarla de nuevo."
+                : invoice.status === "voided"
+                ? "Esta factura fue anulada: no cuenta en los totales y ya no se puede modificar."
+                : "Esta factura ya fue aprobada y no se puede modificar."}
+            </p>
+            {isInvoiceClosed(invoice) && invoice.statusReason && <p className="mt-1 font-normal">Motivo: {invoice.statusReason}</p>}
           </div>
         )}
 
@@ -4445,14 +4999,19 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
         />
 
         <DetailSection title="Otros datos" fields={(c.otros ?? []).map((o) => [o.campo, o.valor])} />
+
+        <InvoiceHistory invoice={invoice} />
       </div>
+      </DocumentSplit>
       <div className="mt-4 flex justify-end gap-2">
         <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
           Cerrar
         </button>
-        <button onClick={() => onEdit(invoice)} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
-          Editar / Corregir
-        </button>
+        {!isInvoiceLocked(invoice) && (
+          <button onClick={() => onEdit(invoice)} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
+            Editar / Corregir
+          </button>
+        )}
       </div>
     </Modal>
   );
@@ -4595,13 +5154,12 @@ function InvoiceOverview({
   isAdmin,
   reminders,
   columnIds,
-  onOpenColumns,
+  tableTools,
+  showVoided,
   onDetail,
-  onDelete,
   onEditInvoice,
   onConfirmInvoice,
-  onApproveInvoice,
-  onRejectInvoice,
+  onDecideInvoice,
   onSaveDeadlines,
 }) {
   const [settings, setSettings] = usePersistentState("navio.invoices.desglose.v1", {
@@ -4619,17 +5177,15 @@ function InvoiceOverview({
     currency,
     isAdmin,
     onDetail,
-    onDelete,
     onEdit: onEditInvoice,
     onConfirm: onConfirmInvoice,
-    onApprove: onApproveInvoice,
-    onReject: onRejectInvoice,
+    onDecide: onDecideInvoice,
   };
 
   const now = new Date();
   const monthKey = localISODate(now).slice(0, 7);
   const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  const monthInvoices = invoices.filter((i) => i.status !== "rejected" && String(i.date || "").slice(0, 7) === monthKey);
+  const monthInvoices = invoices.filter((i) => !isInvoiceClosed(i) && String(i.date || "").slice(0, 7) === monthKey);
   const monthTotal = monthInvoices.reduce((s, i) => s + i.amount, 0);
   const monthLiters = monthInvoices.reduce((s, i) => s + i.liters, 0);
   const dailySpend = Array.from({ length: daysInMonth }, () => 0);
@@ -4649,7 +5205,7 @@ function InvoiceOverview({
     .filter((o) => !o.complete && o.daysLeft !== null && o.daysLeft >= 0 && o.daysLeft <= ORDER_WARN_DAYS)
     .sort((a, b) => a.daysLeft - b.daysLeft);
   const overdueOrders = orders.filter((o) => !o.complete && o.daysLeft !== null && o.daysLeft < 0);
-  const pendingApprovalCount = invoices.filter((i) => i.status !== "rejected" && !i.approved).length;
+  const pendingApprovalCount = invoices.filter((i) => i.status === "verified" && !i.approved).length;
 
   const periodStart =
     ordersPeriod === "day"
@@ -4660,20 +5216,23 @@ function InvoiceOverview({
   const newOrdersCount = orders.filter((o) => o.createdAt && new Date(o.createdAt).getTime() >= periodStart).length;
   const periodLabel = { day: "hoy", week: "últimos 7 días", month: "este mes" }[ordersPeriod];
 
+  // Las anuladas se ocultan de listas y exploración, salvo que se pidan.
+  const listed = showVoided ? invoices : invoices.filter((i) => i.status !== "voided");
+
   const latest = invoices
-    .filter((i) => i.createdAt)
+    .filter((i) => i.createdAt && i.status !== "voided")
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, 4);
 
   const since = startOfLocalDay(now).getTime() - (settings.days - 1) * DAY_MS;
-  const desgloseRows = invoices
+  const desgloseRows = listed
     .filter((i) => i.createdAt && new Date(i.createdAt).getTime() >= since && settings.concepts.includes(i.expenseType))
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const desgloseWindow = settings.days === 1 ? "hoy" : `los últimos ${settings.days} días`;
 
   function groupInvoices(keyFn) {
     const map = new Map();
-    for (const i of invoices) {
+    for (const i of listed) {
       const k = keyFn(i);
       const g = map.get(k) ?? { value: k, count: 0, total: 0 };
       g.count += 1;
@@ -4683,7 +5242,7 @@ function InvoiceOverview({
     return [...map.values()].sort((a, b) => b.count - a.count);
   }
   const byConcept = EXPENSE_TYPES.map((t) => {
-    const rs = invoices.filter((i) => i.expenseType === t.id);
+    const rs = listed.filter((i) => i.expenseType === t.id);
     return { value: t.id, label: t.label, count: rs.length, total: rs.reduce((s, i) => s + i.amount, 0) };
   });
   const byProject = groupInvoices((i) => i.project);
@@ -4700,7 +5259,7 @@ function InvoiceOverview({
   const firstName = (userName || "").split(" ")[0] || "equipo";
 
   if (explore) {
-    const rows = invoices
+    const rows = listed
       .filter((i) =>
         explore.kind === "concept"
           ? i.expenseType === explore.value
@@ -4728,7 +5287,7 @@ function InvoiceOverview({
               {rows.length} registro{rows.length === 1 ? "" : "s"} · {formatMoney(total, currency)}
             </p>
           </div>
-          <InvoiceColumnsButton onClick={onOpenColumns} />
+          {tableTools}
         </div>
         <InvoiceDesgloseTable rows={rows} emptyLabel="No hay registros con este filtro." {...tableActions} />
       </div>
@@ -4885,7 +5444,7 @@ function InvoiceOverview({
 
         <OverviewCard icon={ShieldCheck} tone="blue" label="Pendientes de aprobación">
           <p className="mt-3 text-3xl font-bold text-slate-800">{pendingApprovalCount}</p>
-          <p className="text-[11px] text-slate-400">Facturas sin aprobar</p>
+          <p className="text-[11px] text-slate-400">Verificadas, listas para aprobar</p>
         </OverviewCard>
       </div>
 
@@ -4897,8 +5456,8 @@ function InvoiceOverview({
               Lo subido {desgloseWindow} · {settings.concepts.length} de {EXPENSE_TYPES.length} conceptos
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <InvoiceColumnsButton onClick={onOpenColumns} />
+          <div className="flex flex-wrap items-center gap-2">
+            {tableTools}
             <button
               onClick={() => setSettingsOpen(true)}
               className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
@@ -4989,9 +5548,7 @@ function FuelPage({
   onAddInvoice,
   onEditInvoice,
   onConfirmInvoice,
-  onApproveInvoice,
-  onRejectInvoice,
-  onDeleteInvoice,
+  onDecideInvoice,
   onSaveDeadlines,
 }) {
   const { profile } = useAuth();
@@ -5004,6 +5561,10 @@ function FuelPage({
   const [columnPickerView, setColumnPickerView] = useState(null);
   const [detailKey, setDetailKey] = useState(null);
   const detailInvoice = invoices.find((i) => i.key === detailKey) ?? null;
+  // Aprobar, rechazar, anular y revertir siempre se piden confirmar.
+  const [invoiceDecision, setInvoiceDecision] = useState(null);
+  const askDecision = (type, inv) => setInvoiceDecision({ type, inv });
+  const [showVoided, setShowVoided] = usePersistentState("navio.invoices.showVoided", false);
 
   function toggleWidget(id) {
     setVisibleWidgets((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -5015,19 +5576,19 @@ function FuelPage({
     currency,
     isAdmin,
     onDetail: handleDetail,
-    onDelete: onDeleteInvoice,
     onEdit: onEditInvoice,
     onConfirm: onConfirmInvoice,
-    onApprove: onApproveInvoice,
-    onReject: onRejectInvoice,
+    onDecide: askDecision,
   };
 
   // Cada pestaña de concepto es una vista filtrada de las mismas facturas.
   const view = invoiceCategory === "overview" || invoiceCategory === "fuel" || invoiceCategory === "travel" ? invoiceCategory : "misc";
-  const categoryRows =
-    view === "misc"
-      ? invoices.filter((i) => i.module === "misc" && i.raw.category === invoiceCategory)
-      : invoices.filter((i) => i.module === view);
+  const inView = (i) => (view === "misc" ? i.module === "misc" && i.raw.category === invoiceCategory : view === "overview" || i.module === view);
+  const voidedCount = invoices.filter((i) => i.status === "voided" && inView(i)).length;
+  const categoryRows = invoices.filter((i) => inView(i) && (showVoided || i.status !== "voided"));
+  const tableTools = (
+    <InvoiceTableTools showVoided={showVoided} voidedCount={voidedCount} onToggleVoided={setShowVoided} onOpenColumns={() => setColumnPickerView(view)} />
+  );
   const emptyLabel =
     view === "fuel"
       ? "Sin cargas de combustible registradas."
@@ -5078,13 +5639,12 @@ function FuelPage({
           isAdmin={isAdmin}
           reminders={reminders}
           columnIds={columnsFor("overview")}
-          onOpenColumns={() => setColumnPickerView("overview")}
+          tableTools={tableTools}
+          showVoided={showVoided}
           onDetail={handleDetail}
-          onDelete={onDeleteInvoice}
           onEditInvoice={onEditInvoice}
           onConfirmInvoice={onConfirmInvoice}
-          onApproveInvoice={onApproveInvoice}
-          onRejectInvoice={onRejectInvoice}
+          onDecideInvoice={askDecision}
           onSaveDeadlines={onSaveDeadlines}
         />
       ) : (
@@ -5112,9 +5672,7 @@ function FuelPage({
               </div>
             </div>
           )}
-          <div className="flex justify-end">
-            <InvoiceColumnsButton onClick={() => setColumnPickerView(view)} />
-          </div>
+          <div className="flex justify-end">{tableTools}</div>
           <InvoiceDesgloseTable rows={categoryRows} columnIds={columnsFor(view)} emptyLabel={emptyLabel} {...tableProps} />
         </>
       )}
@@ -5144,6 +5702,17 @@ function FuelPage({
             onEditInvoice(inv);
           }}
           onClose={() => setDetailKey(null)}
+        />
+      )}
+      {invoiceDecision && (
+        <InvoiceDecisionModal
+          decision={invoiceDecision}
+          currency={currency}
+          onSubmit={async (reason) => {
+            await onDecideInvoice(invoiceDecision.type, invoiceDecision.inv, reason);
+            setInvoiceDecision(null);
+          }}
+          onClose={() => setInvoiceDecision(null)}
         />
       )}
     </div>
@@ -6703,6 +7272,105 @@ function CompanyCurrencySetting() {
   );
 }
 
+const TEAM_ROLES = [
+  { id: "admin", label: "Administrador — sube y aprueba" },
+  { id: "member", label: "Usuario — sube, no aprueba" },
+];
+
+function TeamSetting() {
+  const { user, profile } = useAuth();
+  const { showToast } = useToast();
+  const isCompanyAdmin = !!(profile?.isSuperAdmin || profile?.companyRole === "admin");
+  const companyId = profile?.companyId;
+  const [members, setMembers] = useState(null);
+  const [inviteCode, setInviteCode] = useState("");
+  const [savingId, setSavingId] = useState(null);
+
+  const loadMembers = useCallback(async () => {
+    const { data, error } = await supabase.rpc("list_company_members");
+    if (error) showToast(`Error al cargar el equipo: ${error.message}`);
+    setMembers(data ?? []);
+  }, []);
+
+  useEffect(() => {
+    if (!isCompanyAdmin || !companyId) return;
+    loadMembers();
+    supabase
+      .from("companies")
+      .select("inviteCode")
+      .eq("id", companyId)
+      .single()
+      .then(({ data }) => setInviteCode(data?.inviteCode ?? ""));
+  }, [isCompanyAdmin, companyId, loadMembers]);
+
+  async function changeRole(member, role) {
+    setSavingId(member.id);
+    const { error } = await supabase.rpc("set_member_role", { target_user: member.id, new_role: role });
+    if (error) showToast(`Error al cambiar el rol: ${error.message}`);
+    else showToast("Rol actualizado.");
+    await loadMembers();
+    setSavingId(null);
+  }
+
+  function copyCode() {
+    navigator.clipboard?.writeText(inviteCode);
+    showToast("Código copiado.");
+  }
+
+  if (!isCompanyAdmin) return null;
+
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <h2 className="mb-1 text-sm font-bold text-slate-800">Equipo</h2>
+      <p className="mb-3 text-xs text-slate-500">Administrador: sube, aprueba, rechaza y anula facturas. Usuario: sube y verifica, pero no aprueba.</p>
+
+      {inviteCode && (
+        <div className="mb-3">
+          <p className="mb-1 text-[11px] font-semibold text-slate-500">Código de invitación</p>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">{inviteCode}</code>
+            <button onClick={copyCode} className="rounded-lg border border-slate-200 px-2.5 py-2 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+              Copiar
+            </button>
+          </div>
+          <p className="mt-1 text-[11px] text-slate-400">Quien cree su cuenta con este código entra como Usuario.</p>
+        </div>
+      )}
+
+      {members === null && <p className="text-xs text-slate-400">Cargando...</p>}
+      <div className="space-y-2">
+        {members?.map((member) => (
+          <div key={member.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 px-3 py-2">
+            <div className="min-w-0">
+              <p className="truncate text-xs font-semibold text-slate-700">
+                {member.fullName || "Sin nombre"}
+                {member.id === user?.id && <span className="ml-1.5 font-normal text-slate-400">(tú)</span>}
+              </p>
+              <p className="truncate text-[11px] text-slate-400">{member.email}</p>
+            </div>
+            {member.id === user?.id ? (
+              <span className="text-[11px] font-medium text-slate-500">{TEAM_ROLES.find((r) => r.id === member.companyRole)?.label}</span>
+            ) : (
+              <select
+                value={member.companyRole}
+                disabled={savingId === member.id}
+                onChange={(e) => changeRole(member, e.target.value)}
+                className="max-w-full rounded-lg border border-slate-200 px-2 py-1.5 text-[11px] focus:border-blue-400 focus:outline-none disabled:opacity-60"
+              >
+                {TEAM_ROLES.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.label}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function BotLinkSetting() {
   const { profile, unlinkCompanyBot } = useAuth();
   const { showToast } = useToast();
@@ -6804,6 +7472,8 @@ function SettingsPage() {
         <h2 className="mb-3 text-sm font-bold text-slate-800">Formato de fecha regional</h2>
         <DateFormatToggle />
       </div>
+
+      <TeamSetting />
 
       <CompanyCurrencySetting />
 
@@ -6983,7 +7653,7 @@ function AccountPage({ userName, userEmail, userAvatar, onSignOut, companyName, 
                 isCompanyAdmin ? "bg-emerald-50 text-emerald-700 ring-emerald-200" : "bg-slate-100 text-slate-600 ring-slate-200"
               }`}
             >
-              {isCompanyAdmin ? "Administrador de empresa" : "Miembro de empresa"}
+              {isCompanyAdmin ? "Administrador de empresa" : "Usuario de empresa"}
             </span>
           </div>
         </div>
@@ -6993,7 +7663,7 @@ function AccountPage({ userName, userEmail, userAvatar, onSignOut, companyName, 
         <h2 className="mb-3 text-sm font-bold text-slate-800">Permisos del rol</h2>
         <div className="space-y-1.5 text-xs text-slate-600">
           <p className="flex items-center gap-2"><CheckCircle2 size={13} className="text-emerald-600" /> Ver todos los módulos de tu empresa</p>
-          <p className="flex items-center gap-2"><CheckCircle2 size={13} className="text-emerald-600" /> Confirmar y validar registros de IA</p>
+          <p className="flex items-center gap-2"><CheckCircle2 size={13} className="text-emerald-600" /> Subir facturas y verificar los datos que lee la IA</p>
           <p className="flex items-center gap-2"><CheckCircle2 size={13} className="text-emerald-600" /> Agregar unidades, traslados e incidencias</p>
           <p className="flex items-center gap-2">
             {isCompanyAdmin ? (
@@ -7002,6 +7672,14 @@ function AccountPage({ userName, userEmail, userAvatar, onSignOut, companyName, 
               <X size={13} className="text-slate-300" />
             )}
             Editar o eliminar unidades de la flota
+          </p>
+          <p className="flex items-center gap-2">
+            {isCompanyAdmin ? <CheckCircle2 size={13} className="text-emerald-600" /> : <X size={13} className="text-slate-300" />}
+            Aprobar, rechazar y anular facturas
+          </p>
+          <p className="flex items-center gap-2">
+            {isCompanyAdmin ? <CheckCircle2 size={13} className="text-emerald-600" /> : <X size={13} className="text-slate-300" />}
+            Gestionar el equipo y sus roles
           </p>
         </div>
       </div>
@@ -8320,6 +8998,7 @@ function NavioApp() {
     insertRow: insertFuelRecord,
     updateRow: updateFuelRecord,
     removeRow: removeFuelRecord,
+    refresh: refreshFuelRecords,
   } = useSupabaseTable("fuel_records", { companyId });
   const {
     rows: travelExpenses,
@@ -8327,6 +9006,7 @@ function NavioApp() {
     insertRow: insertTravelExpense,
     updateRow: updateTravelExpense,
     removeRow: removeTravelExpense,
+    refresh: refreshTravelExpenses,
   } = useSupabaseTable("travel_expenses", { companyId });
   const {
     rows: miscExpenses,
@@ -8334,6 +9014,7 @@ function NavioApp() {
     insertRow: insertMiscExpense,
     updateRow: updateMiscExpense,
     removeRow: removeMiscExpense,
+    refresh: refreshMiscExpenses,
   } = useSupabaseTable("misc_expenses", { companyId });
   // Datos propios del resumen de Facturas y Gastos (migración v11): si esa
   // migración todavía no se corrió, estas tablas vienen vacías y el resto
@@ -8345,6 +9026,8 @@ function NavioApp() {
     () => normalizeInvoices({ fuel: fuelRecords, travel: travelExpenses, misc: miscExpenses }),
     [fuelRecords, travelExpenses, miscExpenses]
   );
+  // Rechazadas y anuladas no cuentan en ningún total.
+  const countableFuelRecords = useMemo(() => fuelRecords.filter((r) => r.status !== "rejected" && r.status !== "voided"), [fuelRecords]);
   const deadlineDays = useMemo(() => getDeadlineDays(deadlineRows), [deadlineRows]);
   const invoiceOrders = useMemo(() => buildOrders(invoices, workOrderRows, deadlineDays), [invoices, workOrderRows, deadlineDays]);
   const projectOptions = useMemo(
@@ -8449,24 +9132,36 @@ function NavioApp() {
     }
   }
 
-  // Acciones del resumen de Facturas y Gastos sobre una factura ya
-  // normalizada (inv.module / inv.id indican en qué tabla vive).
+  // Acciones de Facturas y Gastos sobre una factura ya normalizada
+  // (inv.module / inv.id indican en qué tabla vive). Si la base de datos la
+  // rechaza (por ejemplo, otra persona ya la aprobó), se muestra el motivo y
+  // se recarga la tabla para ver su estado real.
   async function updateInvoice(inv, patch, errorLabel) {
     try {
       await recordTables[inv.module].updateRow(inv.id, patch);
     } catch (err) {
       showToast(`${errorLabel}: ${err.message}`);
+      ({ fuel: refreshFuelRecords, travel: refreshTravelExpenses, misc: refreshMiscExpenses })[inv.module]();
     }
   }
   const handleConfirmInvoice = (inv) => updateInvoice(inv, { status: "verified" }, "Error al confirmar");
-  const handleApproveInvoice = (inv) =>
-    updateInvoice(
-      inv,
-      { approved: true, approvedBy: user?.id ?? null, approvedByName: currentUserName, approvedAt: new Date().toISOString() },
-      "Error al aprobar"
-    );
-  const handleRejectInvoice = (inv) =>
-    updateInvoice(inv, { status: "rejected", approved: false, approvedBy: null, approvedByName: null, approvedAt: null }, "Error al rechazar");
+
+  async function handleInvoiceDecision(type, inv, reason) {
+    const noApproval = { approved: false, approvedBy: null, approvedByName: null, approvedAt: null };
+    if (type === "approve") {
+      await updateInvoice(
+        inv,
+        { approved: true, approvedBy: user?.id ?? null, approvedByName: currentUserName, approvedAt: new Date().toISOString() },
+        "Error al aprobar"
+      );
+    } else if (type === "reject") {
+      await updateInvoice(inv, { ...noApproval, status: "rejected", statusReason: reason }, "Error al rechazar");
+    } else if (type === "void") {
+      await updateInvoice(inv, { ...noApproval, status: "voided", statusReason: reason }, "Error al anular");
+    } else {
+      await updateInvoice(inv, { ...noApproval, statusReason: reason }, "Error al revertir la aprobación");
+    }
+  }
 
   async function handleSaveDeadlines(changes) {
     const entries = Object.entries(changes);
@@ -8702,7 +9397,7 @@ function NavioApp() {
                       vehicles={vehicles}
                       maintenanceRecords={maintenanceRecords}
                       complianceRecords={complianceRecords}
-                      fuelRecords={fuelRecords}
+                      fuelRecords={countableFuelRecords}
                       trips={trips}
                       onSelectVehicle={jumpToVehicle}
                       onNavigate={goToTab}
@@ -8750,7 +9445,7 @@ function NavioApp() {
                   )}
                   {activeTab === "fuel" && (
                     <FuelPage
-                      records={fuelRecords}
+                      records={countableFuelRecords}
                       invoices={invoices}
                       orders={invoiceOrders}
                       deadlineDays={deadlineDays}
@@ -8760,9 +9455,7 @@ function NavioApp() {
                       onAddInvoice={handleAddInvoice}
                       onEditInvoice={handleEditInvoice}
                       onConfirmInvoice={handleConfirmInvoice}
-                      onApproveInvoice={handleApproveInvoice}
-                      onRejectInvoice={handleRejectInvoice}
-                      onDeleteInvoice={(inv) => setDeleteRecordTarget({ module: inv.module, record: inv.raw })}
+                      onDecideInvoice={handleInvoiceDecision}
                       onSaveDeadlines={handleSaveDeadlines}
                     />
                   )}
