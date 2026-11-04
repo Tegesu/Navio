@@ -59,6 +59,10 @@ const FIELD_MAP: Record<string, string[]> = {
 const INVOICE_MODULES = ["fuel", "travel"];
 const TRAVEL_EXPENSE_TYPES = ["viaticos", "hotel", "alimentos", "transporte", "otro"];
 
+// Un archivo puede traer varias facturas. El tope evita que uno enorme deje
+// la función sin tiempo antes de contestar.
+const MAX_INVOICES_PER_DOCUMENT = 10;
+
 function today() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -137,6 +141,72 @@ function buildRecord(extracted: any, module: string, cfdi: any): Record<string, 
   return picked;
 }
 
+type PreparedInvoice = { module: string; cfdi: any; record: Record<string, unknown> | null; page: number | null };
+
+// Cada factura que leyó el modelo, lista para guardarse. null si no se sabe
+// qué es ni trae datos fiscales.
+function prepareInvoice(item: any): PreparedInvoice | null {
+  const cfdi = normalizeCfdi(item.cfdi);
+  let module = item.module;
+  let source = item;
+  // Una factura con folio fiscal o total es un gasto real aunque no encaje en
+  // ninguna categoría: se registra como "otro" en lugar de descartarla.
+  if ((!module || !TABLE_MAP[module]) && (cfdi?.uuid || cfdi?.importes?.total !== undefined)) {
+    module = "travel";
+    source = { ...item, record: { ...item.record, expenseType: "otro" } };
+  }
+  if (!module || !TABLE_MAP[module]) return null;
+  const page = Number(item.pagina);
+  return { module, cfdi, record: buildRecord(source, module, cfdi), page: Number.isInteger(page) && page >= 1 ? page : null };
+}
+
+type InvoiceResult =
+  | { kind: "saved"; module: string; cfdi: any; summary: string }
+  | { kind: "duplicate"; module: string; cfdi: any; amount: unknown; inDocument: boolean }
+  | { kind: "incomplete"; module: string }
+  | { kind: "error"; module: string; message: string };
+
+// Respuesta cuando el documento trae una sola factura (igual que siempre).
+function singleInvoiceReply(result: InvoiceResult): string {
+  if (result.kind === "incomplete") {
+    return `Reconocí que es de ${MODULE_LABEL[result.module]}, pero falta información clave (categoría/concepto). Descríbelo con un poco más de detalle.`;
+  }
+  if (result.kind === "duplicate") {
+    return `Esta factura ya está registrada en Navío, así que no la volví a guardar.\nUUID: ${result.cfdi.uuid}\nSi hay que corregirla, un administrador debe anular la anterior y luego vuelves a enviarla.`;
+  }
+  if (result.kind === "error") return `Recibí el documento pero hubo un error al guardarlo: ${result.message}`;
+  return [
+    `Registrado en ${MODULE_LABEL[result.module]} ✅`,
+    result.summary,
+    ...cfdiSummaryLines(result.cfdi),
+    `Quedó como "pendiente" — confírmalo en Navío cuando lo revises.`,
+  ].join("\n");
+}
+
+// Respuesta cuando el documento trae varias: una línea por factura y el total.
+function multiInvoiceReply(results: InvoiceResult[], found: number): string {
+  const lines = [`Encontré ${found} facturas en el documento:`, ""];
+  results.forEach((r, index) => {
+    const n = `${index + 1})`;
+    const uuidLine = r.kind !== "incomplete" && r.kind !== "error" && r.cfdi?.uuid ? [`   UUID: ${r.cfdi.uuid}`] : [];
+    if (r.kind === "saved") lines.push(`${n} ✅ ${r.summary}`, ...uuidLine);
+    else if (r.kind === "duplicate") {
+      const why = r.inDocument ? "viene dos veces en el documento" : "ya estaba en Navío";
+      lines.push(`${n} Repetida, no se guardó (${why}) — ${MODULE_LABEL[r.module]} — $${r.amount ?? 0}`, ...uuidLine);
+    } else if (r.kind === "incomplete") lines.push(`${n} No se guardó: faltan datos para registrarla en ${MODULE_LABEL[r.module]}`);
+    else lines.push(`${n} Error al guardar en ${MODULE_LABEL[r.module]}: ${r.message}`);
+  });
+  const saved = results.filter((r) => r.kind === "saved").length;
+  lines.push("");
+  if (saved > 0) lines.push(`${saved === 1 ? "1 quedó como \"pendiente\"" : `${saved} quedaron como "pendientes"`} — confírmalas en Navío cuando las revises.`);
+  if (results.some((r) => r.kind === "duplicate" && !r.inDocument)) {
+    lines.push("Si hay que corregir una repetida, un administrador debe anular la anterior y luego vuelves a enviarla.");
+  }
+  if (found > results.length) lines.push(`Solo registré las primeras ${results.length}; manda las demás en otro archivo.`);
+  // Telegram corta los mensajes en 4,096 caracteres.
+  return lines.join("\n").slice(0, 4000);
+}
+
 // Resumen de lo que se leyó de la factura, para la respuesta en Telegram.
 function cfdiSummaryLines(cfdi: any): string[] {
   if (!cfdi) return [];
@@ -206,8 +276,10 @@ async function fetchTelegramFileBase64(fileId: string): Promise<{ base64: string
   return { base64, mimeType };
 }
 
-const EXTRACTION_PROMPT = `Lee TODO este documento/factura (normalmente un CFDI mexicano) relacionado con una flotilla vehicular o el viaje de un conductor, y extrae toda la información importante. Responde ÚNICAMENTE con JSON válido, sin texto adicional ni explicaciones, exactamente con esta forma:
+const EXTRACTION_PROMPT = `Lee TODO este documento (normalmente uno o varios CFDI mexicanos) relacionado con una flotilla vehicular o el viaje de un conductor, y extrae toda la información importante. Un mismo archivo puede traer VARIAS facturas distintas, por ejemplo un PDF con varias facturas del mismo servicio. Responde ÚNICAMENTE con JSON válido, sin texto adicional ni explicaciones, exactamente con esta forma:
 {
+  "facturas": [ {
+  "pagina": number | null,
   "module": "fuel" | "maintenance" | "compliance" | "travel" | "unknown",
   "record": {
     "unit": string | null,
@@ -252,8 +324,10 @@ const EXTRACTION_PROMPT = `Lee TODO este documento/factura (normalmente un CFDI 
     ],
     "otros": [ { "campo": string, "valor": string } ]
   }
+  } ]
 }
-Clasificación ("module"): usa "fuel" para tickets/facturas de gasolina o diésel. "maintenance" para servicios, refacciones o mantenimiento del vehículo. "compliance" para tenencias, pólizas, verificaciones, licencias o tarjetas de circulación. Usa "travel" para gastos generales del viaje de un conductor que NO son de la unidad en sí — hospedaje/hotel, alimentos, viáticos, casetas sueltas sin factura de combustible. Si no puedes identificar de qué se trata, usa "unknown".
+Varias facturas: pon una entrada en "facturas" por cada factura distinta del documento, en el orden en que aparecen. Cada factura tiene su propio folio fiscal (UUID), total y partidas: NUNCA mezcles datos de una factura con otra. Una factura que ocupa varias páginas es una sola entrada, y si vienen juntos el ticket y la factura de la misma compra también es una sola entrada. "pagina" es el número de página (empezando en 1) donde empieza esa factura dentro del documento; usa null si es una foto o un texto.
+Clasificación ("module"), para cada factura: usa "fuel" para tickets/facturas de gasolina o diésel. "maintenance" para servicios, refacciones o mantenimiento del vehículo. "compliance" para tenencias, pólizas, verificaciones, licencias o tarjetas de circulación. Usa "travel" para gastos generales del viaje de un conductor que NO son de la unidad en sí — hospedaje/hotel, alimentos, viáticos, casetas sueltas sin factura de combustible. Si no puedes identificar de qué se trata, usa "unknown".
 Campos de "record": "amount" es el total a pagar. "date" es la fecha de emisión. "vendor" es el nombre o razón social de quien emite. "invoiceFolio" es la serie y folio interno de la factura (no el UUID). "concept" es la descripción principal de lo que se factura. "unit"/"plate" son la unidad o placa del vehículo si el documento lo menciona (en "travel" casi nunca aplica, déjalo en null si no aparece). "driverName" es el nombre del huésped/conductor si el documento lo menciona (común en facturas de hotel). "liters" son los litros cargados. "expenseType" solo aplica a "travel": "hotel" para hospedaje, "alimentos" para comida, "transporte" para taxis, autobuses, vuelos o casetas, "viaticos" para viáticos generales y "otro" si no encaja en ninguno. "project" y "workOrder" son el proyecto y la orden de trabajo (por ejemplo "OT24053"), solo si el documento o el texto que lo acompaña los menciona; si no, déjalos en null.
 Campos de "cfdi": "uuid" es el folio fiscal. El emisor es quien vende y el receptor es a quien se le factura; no los confundas. Copia las claves del SAT tal como aparecen, sin traducirlas (por ejemplo "G03", "601", "PUE", "28", "E48", "90111800"). "ish" es el impuesto sobre hospedaje. Si hay un impuesto que no tenga campo propio, súmalo en "otrosImpuestos". Pon una entrada en "conceptos" por cada partida de la factura. En "otros" pon cualquier otro dato útil que aparezca y no tenga campo propio, con un nombre legible en "campo": huésped, fechas de estancia, habitación, reservación, cajero, referencia, agencia, tipo de combustible, bomba, placas, kilometraje, vigencia, teléfono, etc.
 Reglas: nunca inventes datos; si algo no aparece, usa null (o una lista vacía). Los montos van como número, sin comas ni signo de pesos. NO incluyas sellos digitales, cadena original, código QR ni textos legales. Si el documento no es un CFDI (por ejemplo un ticket), llena en "cfdi" lo que sí aparezca.`;
@@ -455,17 +529,15 @@ Deno.serve(async (req) => {
     text,
   });
   console.log("Resultado de Gemini", JSON.stringify(extraction), failureReason);
-  const cfdi = normalizeCfdi(extraction?.cfdi);
-  let module = extraction?.module;
 
-  // Una factura con folio fiscal o total es un gasto real aunque no encaje en
-  // ninguna categoría: se registra como "otro" en lugar de descartarla.
-  if ((!module || !TABLE_MAP[module]) && (cfdi?.uuid || cfdi?.importes?.total !== undefined)) {
-    module = "travel";
-    extraction.record = { ...extraction.record, expenseType: "otro" };
-  }
+  // Si el modelo contesta con una sola factura (la forma anterior), se toma
+  // como una lista de una.
+  const items: any[] = (Array.isArray(extraction?.facturas) ? extraction.facturas : extraction ? [extraction] : []).filter(
+    (item: any) => item && typeof item === "object"
+  );
+  const candidates = items.map(prepareInvoice).filter(Boolean) as PreparedInvoice[];
 
-  if (!module || module === "unknown" || !TABLE_MAP[module]) {
+  if (candidates.length === 0) {
     const summary =
       failureReason === "capacity"
         ? "Límite de IA alcanzado temporalmente"
@@ -489,91 +561,99 @@ Deno.serve(async (req) => {
     return new Response("ok");
   }
 
-  const record = buildRecord(extraction, module, cfdi);
-  if (!record) {
-    await supabase.from("bot_ingestions").insert({
-      companyId: company.id,
-      channel: "telegram",
-      summary: `Faltan datos para registrarlo en ${MODULE_LABEL[module]}`,
-      module,
-      status: "failed",
-    });
-    await sendMessage(chatId, `Reconocí que es de ${MODULE_LABEL[module]}, pero falta información clave (categoría/concepto). Descríbelo con un poco más de detalle.`);
-    return new Response("ok");
-  }
-
-  // La misma factura no se registra dos veces. Se revisa antes de subir el
-  // documento; aun así, la base de datos lo impide si dos envíos coinciden.
-  if (cfdi?.uuid) {
-    const { data: existing } = await supabase.rpc("find_invoice_by_uuid", { target_company: company.id, target_uuid: cfdi.uuid });
-    if (existing) {
-      await supabase.from("bot_ingestions").insert({
-        companyId: company.id,
-        channel: "telegram",
-        summary: `Factura repetida, no se registró — ${MODULE_LABEL[module]} — $${record.amount ?? 0}`,
-        module,
-        status: "failed",
-      });
-      await sendMessage(
-        chatId,
-        `Esta factura ya está registrada en Navío, así que no la volví a guardar.\nUUID: ${cfdi.uuid}\nSi hay que corregirla, un administrador debe anular la anterior y luego vuelves a enviarla.`
-      );
-      return new Response("ok");
-    }
-  }
-
-  const documentUrl = file ? await uploadDocument(company.id, module, file) : null;
+  const invoices = candidates.slice(0, MAX_INVOICES_PER_DOCUMENT);
+  const multiple = invoices.length > 1;
 
   // El chat está ligado a la empresa, no a un usuario de Navío: como
   // "Usuario" se guarda el nombre de quien mandó el mensaje en Telegram.
   const senderName =
     [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ") || message.from?.username || null;
-  const invoiceFields = INVOICE_MODULES.includes(module) ? { uploadedByName: senderName } : {};
 
-  const { data: inserted, error: insertError } = await supabase
-    .from(TABLE_MAP[module])
-    .insert({ ...record, ...invoiceFields, ...(cfdi ? { cfdi } : {}), companyId: company.id, origin: "telegram", status: "pending", documentUrl })
-    .select()
-    .single();
+  // El archivo se sube una sola vez, al guardar la primera factura, y todas
+  // las facturas que trae apuntan a él.
+  let documentUrl: string | null | undefined;
+  const seenUuids = new Set<string>();
+  const results: InvoiceResult[] = [];
 
-  // Si la factura trae orden de trabajo, se da de alta sin tocar una
-  // fecha límite que la orden ya tuviera.
-  if (!insertError && INVOICE_MODULES.includes(module) && record.workOrder) {
-    await supabase
-      .from("work_orders")
-      .upsert(
-        { companyId: company.id, project: String(record.project ?? "").trim(), code: String(record.workOrder).trim() },
-        { onConflict: "companyId,project,code", ignoreDuplicates: true }
-      );
+  for (const { module, cfdi, record, page } of invoices) {
+    if (!record) {
+      await supabase.from("bot_ingestions").insert({
+        companyId: company.id,
+        channel: "telegram",
+        summary: `Faltan datos para registrarlo en ${MODULE_LABEL[module]}`,
+        module,
+        status: "failed",
+      });
+      results.push({ kind: "incomplete", module });
+      continue;
+    }
+
+    // La misma factura no se registra dos veces. Se revisa antes de subir el
+    // documento; aun así, la base de datos lo impide si dos envíos coinciden.
+    if (cfdi?.uuid) {
+      const inDocument = seenUuids.has(cfdi.uuid);
+      seenUuids.add(cfdi.uuid);
+      const existing = inDocument
+        ? true
+        : (await supabase.rpc("find_invoice_by_uuid", { target_company: company.id, target_uuid: cfdi.uuid })).data;
+      if (existing) {
+        await supabase.from("bot_ingestions").insert({
+          companyId: company.id,
+          channel: "telegram",
+          summary: `Factura repetida, no se registró — ${MODULE_LABEL[module]} — $${record.amount ?? 0}`,
+          module,
+          status: "failed",
+        });
+        results.push({ kind: "duplicate", module, cfdi, amount: record.amount, inDocument });
+        continue;
+      }
+    }
+
+    if (documentUrl === undefined) documentUrl = file ? await uploadDocument(company.id, module, file) : null;
+
+    // Con varias facturas en un PDF, cada una recuerda en qué página empieza
+    // para que el visor la abra ahí.
+    const invoiceFields = INVOICE_MODULES.includes(module)
+      ? { uploadedByName: senderName, ...(multiple && page ? { details: { documentPage: page } } : {}) }
+      : {};
+
+    const { data: inserted, error: insertError } = await supabase
+      .from(TABLE_MAP[module])
+      .insert({ ...record, ...invoiceFields, ...(cfdi ? { cfdi } : {}), companyId: company.id, origin: "telegram", status: "pending", documentUrl })
+      .select()
+      .single();
+
+    // Si la factura trae orden de trabajo, se da de alta sin tocar una
+    // fecha límite que la orden ya tuviera.
+    if (!insertError && INVOICE_MODULES.includes(module) && record.workOrder) {
+      await supabase
+        .from("work_orders")
+        .upsert(
+          { companyId: company.id, project: String(record.project ?? "").trim(), code: String(record.workOrder).trim() },
+          { onConflict: "companyId,project,code", ignoreDuplicates: true }
+        );
+    }
+
+    const amountLabel = record.amount != null ? `$${record.amount}` : "sin monto";
+    // En viáticos casi nunca hay unidad: se muestra a quien recibió el servicio.
+    const unitLabel = record.unit || record.driverName || "sin unidad";
+    const summary = insertError
+      ? `Error al guardar en ${MODULE_LABEL[module]}: ${insertError.message}`
+      : `${MODULE_LABEL[module]} — ${unitLabel} — ${amountLabel}`;
+
+    await supabase.from("bot_ingestions").insert({
+      companyId: company.id,
+      channel: "telegram",
+      summary,
+      module,
+      status: insertError ? "failed" : "success",
+      recordId: inserted?.id ?? null,
+    });
+
+    results.push(insertError ? { kind: "error", module, message: insertError.message } : { kind: "saved", module, cfdi, summary });
   }
 
-  const amountLabel = record.amount != null ? `$${record.amount}` : "sin monto";
-  // En viáticos casi nunca hay unidad: se muestra a quien recibió el servicio.
-  const unitLabel = record.unit || record.driverName || "sin unidad";
-  const summary = insertError
-    ? `Error al guardar en ${MODULE_LABEL[module]}: ${insertError.message}`
-    : `${MODULE_LABEL[module]} — ${unitLabel} — ${amountLabel}`;
-
-  await supabase.from("bot_ingestions").insert({
-    companyId: company.id,
-    channel: "telegram",
-    summary,
-    module,
-    status: insertError ? "failed" : "success",
-    recordId: inserted?.id ?? null,
-  });
-
-  await sendMessage(
-    chatId,
-    insertError
-      ? `Recibí el documento pero hubo un error al guardarlo: ${insertError.message}`
-      : [
-          `Registrado en ${MODULE_LABEL[module]} ✅`,
-          summary,
-          ...cfdiSummaryLines(cfdi),
-          `Quedó como "pendiente" — confírmalo en Navío cuando lo revises.`,
-        ].join("\n")
-  );
+  await sendMessage(chatId, multiple ? multiInvoiceReply(results, candidates.length) : singleInvoiceReply(results[0]));
 
   return new Response("ok");
 });

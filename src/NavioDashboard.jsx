@@ -150,6 +150,28 @@ function usePersistentState(key, initialValue) {
   return [state, setState];
 }
 
+// Igual, pero solo para esta pestaña: si el navegador recarga la página (por
+// ejemplo, al liberar memoria de pestañas en segundo plano), se vuelve a la
+// misma pantalla en lugar de al inicio.
+function useSessionState(key, initialValue) {
+  const [state, setState] = useState(() => {
+    try {
+      const stored = window.sessionStorage.getItem(key);
+      return stored ? JSON.parse(stored) : initialValue;
+    } catch {
+      return initialValue;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(key, JSON.stringify(state));
+    } catch {
+      // sessionStorage no disponible — la app sigue funcionando en memoria.
+    }
+  }, [key, state]);
+  return [state, setState];
+}
+
 /* ---------------------------------------------------------------------- */
 /*  Supabase table hook — fetch/insert/update/delete compartidos          */
 /* ---------------------------------------------------------------------- */
@@ -277,19 +299,27 @@ function AuthProvider({ children }) {
     }
   }
 
+  // Al volver a la pestaña, Supabase revalida la sesión y vuelve a avisar. Si
+  // el perfil de ese usuario ya está cargado, se actualiza sin la pantalla de
+  // "cargando": esa pantalla desmontaba la app y la regresaba al inicio.
+  const loadedProfileUserRef = useRef(null);
   const refreshProfile = useCallback(async (userId) => {
     if (!supabase || !userId) {
+      loadedProfileUserRef.current = null;
       setProfile(null);
       setProfileLoading(false);
       return;
     }
-    setProfileLoading(true);
+    if (loadedProfileUserRef.current !== userId) setProfileLoading(true);
     const { data, error } = await supabase
       .from("profiles")
       .select("*, company:companies(name, currency, botChannel, botChatId, botLinkCode)")
       .eq("id", userId)
       .single();
-    if (!error) setProfile(data);
+    if (!error) {
+      loadedProfileUserRef.current = userId;
+      setProfile(data);
+    }
     setProfileLoading(false);
   }, []);
 
@@ -315,6 +345,7 @@ function AuthProvider({ children }) {
       if (event === "SIGNED_OUT") {
         setPasswordRecovery(false);
         setMfaRequired(false);
+        loadedProfileUserRef.current = null;
         setProfile(null);
       }
       if (newSession) {
@@ -2010,6 +2041,9 @@ function DocumentPreview({ path, file, invoice }) {
   const zoomAnchorRef = useRef(null);
   const source = state.source;
   zoomRef.current = zoom;
+  // Un PDF puede traer varias facturas: cada una abre en la página donde empieza.
+  const startPageRef = useRef(1);
+  startPageRef.current = Math.max(1, Math.floor(Number(invoice?.details?.documentPage)) || 1);
 
   useEffect(() => {
     const observer = new ResizeObserver(([entry]) => setWidth(Math.floor(entry.contentRect.width)));
@@ -2072,6 +2106,7 @@ function DocumentPreview({ path, file, invoice }) {
           return;
         }
         opened = doc;
+        setPage(Math.min(startPageRef.current, doc.pages));
         setState({ status: "ready", source: doc, blob });
       } catch (err) {
         if (!cancelled) setState({ status: err.blocked ? "blocked" : "error", message: err.message });
@@ -2881,6 +2916,9 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
         if (fiscal) base.cfdi = fiscal;
         else if (initial?.cfdi) base.cfdi = null;
         const details = cleanExpenseParams(expenseType, params);
+        // La página del PDF donde empieza la factura (la pone el bot) sigue
+        // valiendo mientras no se reemplace el documento.
+        if (initial?.details?.documentPage && !file) details.documentPage = initial.details.documentPage;
         if (Object.keys(details).length > 0) base.details = details;
         else if (initial?.details) base.details = null;
       }
@@ -3233,13 +3271,138 @@ function daysUntil(dateStr) {
   return Math.round((new Date(dateStr) - new Date(TODAY_ISO)) / (1000 * 60 * 60 * 24));
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Fotos y chofer de cada unidad                                         */
+/* ---------------------------------------------------------------------- */
+
+// Un chofer "variable" cambia según el viaje: la unidad no tiene uno asignado.
+const isVariableDriver = (vehicle) => vehicle?.driver?.mode === "variable";
+const vehicleDriverName = (vehicle) => (isVariableDriver(vehicle) ? "" : vehicle?.driver?.name || "");
+const vehicleDriverLabel = (vehicle) => (isVariableDriver(vehicle) ? "Chofer variable" : vehicle?.driver?.name || "Sin asignar");
+
+// Las fotos subidas se guardan en el bucket privado con la ruta de la empresa
+// ("3/vehicles/....jpg"). Las de demostración (picsum) no son de la unidad.
+const isStoredImage = (src) => typeof src === "string" && /^\d+\//.test(src);
+const vehicleImage = (src) => (src && !/picsum\.photos/.test(src) ? src : null);
+const VEHICLE_PHOTO_MAX_MB = 10;
+const storedImages = new Map();
+
+// Se descargan con la sesión y se muestran desde la memoria del navegador,
+// sin enlaces públicos. Cada foto se descarga una sola vez por visita.
+function useVehicleImage(src) {
+  const source = vehicleImage(src);
+  const [url, setUrl] = useState(() => (source && !isStoredImage(source) ? source : storedImages.get(source)?.url ?? null));
+  useEffect(() => {
+    if (!source || !isStoredImage(source)) {
+      setUrl(source);
+      return undefined;
+    }
+    let cancelled = false;
+    let entry = storedImages.get(source);
+    if (!entry) {
+      entry = {};
+      entry.promise = supabase.storage
+        .from("documents")
+        .download(source)
+        .then(({ data, error }) => {
+          if (error) throw error;
+          entry.url = URL.createObjectURL(data);
+          return entry.url;
+        });
+      entry.promise.catch(() => storedImages.delete(source));
+      storedImages.set(source, entry);
+    }
+    entry.promise.then((u) => !cancelled && setUrl(u)).catch(() => !cancelled && setUrl(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [source]);
+  return url;
+}
+
+function VehiclePhoto({ src, alt, className = "", iconSize = 22 }) {
+  const url = useVehicleImage(src);
+  if (!url) {
+    return (
+      <div role="img" aria-label={`${alt}: sin foto`} className={`flex items-center justify-center bg-slate-100 text-slate-300 ${className}`}>
+        <Truck size={iconSize} />
+      </div>
+    );
+  }
+  return <img src={url} alt={alt} className={`object-cover ${className}`} />;
+}
+
+// Revisa que sea una foto de verdad (por su contenido, no por su nombre).
+async function vehiclePhotoProblem(file) {
+  if (file.size > VEHICLE_PHOTO_MAX_MB * 1024 * 1024) return `La foto pesa más de ${VEHICLE_PHOTO_MAX_MB} MB.`;
+  const mime = await sniffDocumentType(file);
+  return mime && mime.startsWith("image/") ? "" : "Solo se aceptan fotos JPG, PNG o WEBP.";
+}
+
+async function uploadVehicleImage(file, companyId) {
+  const mime = await sniffDocumentType(file);
+  const path = `${companyId}/vehicles/${crypto.randomUUID()}.${DOCUMENT_EXTENSIONS[mime]}`;
+  const { error } = await supabase.storage.from("documents").upload(path, file, { contentType: mime });
+  if (error) throw error;
+  return path;
+}
+
+// La foto que se reemplaza ya no la usa nadie; si no se puede borrar, no estorba.
+function removeVehicleImage(src) {
+  if (isStoredImage(src) && src.includes("/vehicles/")) supabase.storage.from("documents").remove([src]).catch(() => {});
+}
+
+function VehiclePhotoPicker({ label, current, file, error, onPick }) {
+  const preview = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
+  useEffect(() => () => preview && URL.revokeObjectURL(preview), [preview]);
+  return (
+    <div>
+      <p className="mb-1 text-[11px] font-semibold text-slate-500">{label}</p>
+      <div className="flex items-center gap-3">
+        {preview ? (
+          <img src={preview} alt="Foto elegida" className="h-16 w-24 shrink-0 rounded-lg object-cover ring-1 ring-slate-200" />
+        ) : (
+          <VehiclePhoto src={current} alt={label} className="h-16 w-24 shrink-0 rounded-lg ring-1 ring-slate-200" iconSize={18} />
+        )}
+        <div className="min-w-0">
+          <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+            <Upload size={12} /> {file || vehicleImage(current) ? "Cambiar foto" : "Subir foto"}
+            <input type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(e) => onPick(e.target.files?.[0] ?? null, e.target)} />
+          </label>
+          <p className="mt-1 text-[10px] text-slate-400">JPG, PNG o WEBP de hasta {VEHICLE_PHOTO_MAX_MB} MB.</p>
+          {error && <p className="mt-1 text-[11px] font-medium text-rose-600">{error}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Para los formularios de unidad: valida la foto en cuanto se elige.
+function useVehiclePhotoField() {
+  const [file, setFile] = useState(null);
+  const [error, setError] = useState("");
+  async function pick(picked, input) {
+    if (!picked) return;
+    const problem = await vehiclePhotoProblem(picked);
+    if (problem) input.value = "";
+    setError(problem);
+    setFile(problem ? null : picked);
+  }
+  return { file, error, pick };
+}
+
+const DRIVER_MODES = [
+  { id: "fixed", label: "Chofer fijo" },
+  { id: "variable", label: "Variable (cambia según el viaje)" },
+];
+
 function VehicleCard({ vehicle, onSelect, isCompanyAdmin, onEdit, onDelete }) {
   const health = HEALTH_TONE(vehicle.healthScore);
   const kmPct = Math.min(100, Math.round((vehicle.kmActual / vehicle.kmProximoServicio) * 100));
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
       <div className="relative h-36 w-full overflow-hidden bg-slate-100">
-        <img src={vehicle.photo} alt={vehicle.unit} className="h-full w-full object-cover" />
+        <VehiclePhoto src={vehicle.photo} alt={vehicle.unit} className="h-full w-full" iconSize={32} />
         <span className={`absolute right-2 top-2 rounded-full px-2.5 py-1 text-[11px] font-bold ring-1 ${health.className}`}>
           {vehicle.healthScore}% · {health.label}
         </span>
@@ -3271,8 +3434,14 @@ function VehicleCard({ vehicle, onSelect, isCompanyAdmin, onEdit, onDelete }) {
           {[vehicle.brand, vehicle.model].filter(Boolean).join(" ") || "Sin marca/modelo"} · {vehicle.year || "—"} · {vehicle.color || "—"}
         </p>
         <div className="mt-3 flex items-center gap-2">
-          <img src={vehicle.driver.photo} alt={vehicle.driver.name} className="h-7 w-7 rounded-full bg-slate-100 ring-1 ring-slate-200" />
-          <span className="text-xs font-medium text-slate-600">{vehicle.driver.name}</span>
+          {isVariableDriver(vehicle) ? (
+            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-slate-400 ring-1 ring-slate-200">
+              <User size={14} />
+            </span>
+          ) : (
+            <img src={vehicle.driver.photo} alt={vehicle.driver.name} className="h-7 w-7 rounded-full bg-slate-100 ring-1 ring-slate-200" />
+          )}
+          <span className="text-xs font-medium text-slate-600">{isVariableDriver(vehicle) ? "Chofer variable, según el viaje" : vehicle.driver.name}</span>
         </div>
         <div className="mt-3">
           <div className="mb-1 flex items-center justify-between text-[11px] font-medium text-slate-400">
@@ -3361,6 +3530,20 @@ function FichaConductorTab({ vehicle }) {
   const licenseAlert = days <= 30;
   return (
     <div className="space-y-4">
+      {isVariableDriver(vehicle) ? (
+        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Conductor</h4>
+          <div className="flex items-center gap-3">
+            <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-slate-100 text-slate-400 ring-2 ring-blue-100">
+              <User size={22} />
+            </span>
+            <div>
+              <p className="text-sm font-bold text-slate-800">Chofer variable</p>
+              <p className="text-xs text-slate-500">Esta unidad no tiene un chofer fijo: cambia según el viaje y se elige en cada traslado.</p>
+            </div>
+          </div>
+        </div>
+      ) : (
       <div className="rounded-2xl border border-slate-200 bg-white p-4">
         <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Conductor Asignado</h4>
         <div className="flex items-center gap-3">
@@ -3387,6 +3570,7 @@ function FichaConductorTab({ vehicle }) {
           </div>
         </div>
       </div>
+      )}
 
       <div className="rounded-2xl border border-slate-200 bg-white p-4">
         <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Ficha Técnica</h4>
@@ -3631,10 +3815,11 @@ function HistorialTab({ vehicle }) {
   );
 }
 
-function VehiclePanelToggle({ view, setView }) {
+function VehiclePanelToggle({ view, setView, showCapture }) {
   const options = [
     { id: "photo", label: "Foto Principal", icon: ImageIcon },
-    { id: "capture", label: "Captura App / Chofer", icon: Camera },
+    // Con chofer variable no hay a quién atribuir la captura.
+    ...(showCapture ? [{ id: "capture", label: "Captura App / Chofer", icon: Camera }] : []),
     { id: "gps", label: "Mapa GPS en Vivo", icon: MapPin },
   ];
   return (
@@ -3696,33 +3881,82 @@ function VehicleGpsPanel({ vehicle }) {
   );
 }
 
-function VehiclePanel({ vehicle }) {
+function VehiclePanel({ vehicle, canEdit, onUpdate }) {
+  const { profile } = useAuth();
+  const { showToast } = useToast();
   const [view, setView] = useState("photo");
+  const [uploading, setUploading] = useState(null);
+  const showCapture = !isVariableDriver(vehicle);
+  const current = view === "capture" && !showCapture ? "photo" : view;
+  const capture = vehicle.appCapture ?? {};
+  const hasCapture = !!vehicleImage(capture.photoUrl);
+
+  async function upload(kind, input) {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    const problem = await vehiclePhotoProblem(file);
+    if (problem) {
+      showToast(problem);
+      return;
+    }
+    setUploading(kind);
+    try {
+      const path = await uploadVehicleImage(file, profile.companyId);
+      const takenAt = new Date().toLocaleString("es-MX", { dateStyle: "short", timeStyle: "short" });
+      const saved = await onUpdate(
+        kind === "photo" ? { photo: path } : { appCapture: { ...capture, photoUrl: path, timestamp: takenAt, driverName: vehicle.driver.name } }
+      );
+      removeVehicleImage(saved ? (kind === "photo" ? vehicle.photo : capture.photoUrl) : path);
+    } catch (err) {
+      showToast(`No se pudo subir la foto: ${err.message}`);
+    } finally {
+      setUploading(null);
+    }
+  }
+
+  const uploadButton = (kind, label) =>
+    canEdit && (
+      <label className="absolute right-3 top-3 inline-flex cursor-pointer items-center gap-1.5 rounded-lg bg-white/90 px-2.5 py-1.5 text-[11px] font-semibold text-slate-700 shadow-sm hover:bg-white">
+        <Upload size={12} /> {uploading === kind ? "Subiendo..." : label}
+        <input type="file" accept="image/jpeg,image/png,image/webp" className="hidden" disabled={!!uploading} onChange={(e) => upload(kind, e.target)} />
+      </label>
+    );
+
   return (
     <div className="space-y-3">
-      <VehiclePanelToggle view={view} setView={setView} />
-      {view === "photo" && (
-        <div className="overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
-          <img src={vehicle.photo} alt={vehicle.unit} className="h-[420px] w-full object-cover" />
+      <VehiclePanelToggle view={current} setView={setView} showCapture={showCapture} />
+      {current === "photo" && (
+        <div className="relative overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
+          <VehiclePhoto src={vehicle.photo} alt={vehicle.unit} className="h-[420px] w-full" iconSize={48} />
+          {uploadButton("photo", vehicleImage(vehicle.photo) ? "Cambiar foto" : "Subir foto")}
         </div>
       )}
-      {view === "capture" && (
-        <div className="overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
-          <img src={vehicle.appCapture.photoUrl} alt="Captura" className="h-[350px] w-full object-cover" />
+      {current === "capture" && (
+        <div className="relative overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
+          {hasCapture ? (
+            <VehiclePhoto src={capture.photoUrl} alt="Captura del chofer" className="h-[350px] w-full" iconSize={40} />
+          ) : (
+            <div className="flex h-[350px] flex-col items-center justify-center gap-2 bg-slate-50 text-slate-400">
+              <Camera size={32} />
+              <p className="text-xs font-medium">Todavía no hay capturas del chofer.</p>
+            </div>
+          )}
+          {uploadButton("capture", hasCapture ? "Cambiar captura" : "Subir captura")}
           <div className="flex items-center justify-between bg-slate-50 px-4 py-3">
             <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
-              <Camera size={13} /> {vehicle.appCapture.driverName}
+              <Camera size={13} /> {(hasCapture && capture.driverName) || vehicle.driver.name}
             </span>
-            <span className="text-[11px] text-slate-400">{vehicle.appCapture.timestamp}</span>
+            <span className="text-[11px] text-slate-400">{hasCapture ? capture.timestamp : "—"}</span>
           </div>
         </div>
       )}
-      {view === "gps" && <VehicleGpsPanel vehicle={vehicle} />}
+      {current === "gps" && <VehicleGpsPanel vehicle={vehicle} />}
     </div>
   );
 }
 
-function VehicleDetailPage({ vehicle, onBack, isCompanyAdmin, onEdit, onDelete }) {
+function VehicleDetailPage({ vehicle, onBack, isCompanyAdmin, onEdit, onDelete, onUpdate }) {
   const [tab, setTab] = useState("ficha");
 
   return (
@@ -3733,13 +3967,13 @@ function VehicleDetailPage({ vehicle, onBack, isCompanyAdmin, onEdit, onDelete }
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <img src={vehicle.photo} alt={vehicle.unit} className="h-12 w-16 rounded-lg object-cover ring-1 ring-slate-200" />
+          <VehiclePhoto src={vehicle.photo} alt={vehicle.unit} className="h-12 w-16 rounded-lg ring-1 ring-slate-200" iconSize={16} />
           <div>
             <h2 className="text-lg font-bold text-slate-900">
               {vehicle.unit} <span className="font-medium text-slate-400">· {vehicle.plate}</span>
             </h2>
             <p className="text-xs text-slate-500">
-              {[vehicle.brand, vehicle.model, vehicle.year].filter(Boolean).join(" ") || "—"} · Conductor: {vehicle.driver.name || "Sin asignar"}
+              {[vehicle.brand, vehicle.model, vehicle.year].filter(Boolean).join(" ") || "—"} · Conductor: {vehicleDriverLabel(vehicle)}
             </p>
           </div>
         </div>
@@ -3783,7 +4017,7 @@ function VehicleDetailPage({ vehicle, onBack, isCompanyAdmin, onEdit, onDelete }
           {tab === "historial" && <HistorialTab vehicle={vehicle} />}
         </div>
         <div>
-          <VehiclePanel vehicle={vehicle} />
+          <VehiclePanel vehicle={vehicle} canEdit={isCompanyAdmin} onUpdate={(patch) => onUpdate(vehicle.id, patch)} />
         </div>
       </div>
     </div>
@@ -3798,6 +4032,7 @@ function FleetTabContainer({
   isCompanyAdmin,
   onEditVehicle,
   onDeleteVehicle,
+  onUpdateVehicle,
 }) {
   const vehicle = vehicles.find((v) => v.id === selectedVehicleId);
   if (vehicle) {
@@ -3808,6 +4043,7 @@ function FleetTabContainer({
         isCompanyAdmin={isCompanyAdmin}
         onEdit={onEditVehicle}
         onDelete={onDeleteVehicle}
+        onUpdate={onUpdateVehicle}
       />
     );
   }
@@ -3824,26 +4060,46 @@ function FleetTabContainer({
 }
 
 function AddVehicleModal({ vehicles, onSave, onClose }) {
-  const existingDrivers = vehicles.map((v) => v.driver.name);
+  const { profile } = useAuth();
+  const existingDrivers = vehicles.filter((v) => !isVariableDriver(v) && v.driver?.name && v.driver.name !== "Sin asignar").map((v) => v.driver.name);
   const [unit, setUnit] = useState("");
   const [plate, setPlate] = useState("");
   const [brand, setBrand] = useState("");
   const [model, setModel] = useState("");
   const [year, setYear] = useState(new Date().getFullYear());
   const [color, setColor] = useState("");
-  const [driverMode, setDriverMode] = useState("reassign");
+  const [driverType, setDriverType] = useState("fixed");
+  const [driverMode, setDriverMode] = useState(existingDrivers.length ? "reassign" : "new");
   const [reassignedDriver, setReassignedDriver] = useState(existingDrivers[0] ?? "");
   const [newDriverName, setNewDriverName] = useState("");
   const [newDriverPhone, setNewDriverPhone] = useState("");
+  const photoField = useVehiclePhotoField();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
   const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
 
-  function handleSubmit(e) {
+  async function handleSubmit(e) {
     e.preventDefault();
-    if (!unit.trim() || !plate.trim()) return;
-    const driverName = driverMode === "reassign" ? reassignedDriver : newDriverName.trim() || "Sin asignar";
-    const reassignedFrom = driverMode === "reassign" ? vehicles.find((v) => v.driver.name === reassignedDriver) : null;
+    if (!unit.trim() || !plate.trim()) {
+      setError("Indica al menos la unidad y la matrícula.");
+      return;
+    }
+    setError("");
+    setSaving(true);
+    let photo = null;
+    try {
+      if (photoField.file) photo = await uploadVehicleImage(photoField.file, profile.companyId);
+    } catch (err) {
+      setError(`No se pudo subir la foto: ${err.message}`);
+      setSaving(false);
+      return;
+    }
+    const variable = driverType === "variable";
+    const reassigning = !variable && driverMode === "reassign" && !!reassignedDriver;
+    const driverName = variable ? "" : reassigning ? reassignedDriver : newDriverName.trim() || "Sin asignar";
+    const reassignedFrom = reassigning ? vehicles.find((v) => v.driver.name === reassignedDriver) : null;
     const vehicle = {
       unit: unit.trim(),
       plate: plate.trim(),
@@ -3851,19 +4107,22 @@ function AddVehicleModal({ vehicles, onSave, onClose }) {
       model: model.trim(),
       year: Number(year) || new Date().getFullYear(),
       color: color.trim(),
-      photo: "https://picsum.photos/seed/navio-new-unit/480/280",
+      photo,
       healthScore: 100,
       kmActual: 0,
       kmProximoServicio: 10000,
       oilType: "Sintético 15W-40",
       avgConsumption: 0,
-      driver: {
-        name: driverName,
-        phone: reassignedFrom ? reassignedFrom.driver.phone : newDriverPhone.trim(),
-        photo: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(driverName)}`,
-        license: reassignedFrom ? reassignedFrom.driver.license : "",
-        licenseExpiry: reassignedFrom ? reassignedFrom.driver.licenseExpiry : "",
-      },
+      driver: variable
+        ? { mode: "variable", name: "", phone: "", photo: "", license: "", licenseExpiry: "" }
+        : {
+            mode: "fixed",
+            name: driverName,
+            phone: reassignedFrom ? reassignedFrom.driver.phone : newDriverPhone.trim(),
+            photo: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(driverName)}`,
+            license: reassignedFrom ? reassignedFrom.driver.license : "",
+            licenseExpiry: reassignedFrom ? reassignedFrom.driver.licenseExpiry : "",
+          },
       insurance: { company: "", folio: "", expiry: "", pdfUrl: "#" },
       circulationCard: { folio: "", pdfUrl: "#" },
       verification: { hologram: "", validity: "" },
@@ -3873,9 +4132,11 @@ function AddVehicleModal({ vehicles, onSave, onClose }) {
       tires: { frontDepth: 8, rearDepth: 8, frontSize: "185/60 R15", rearSize: "190/60 R15", psi: 110, lastRotation: "" },
       history: [],
       gps: { status: "resting", address: "Patio central", speed: 0, lastUpdate: "recién agregada", fuelPercent: 100, signalType: "GPS Hardware", x: 50, y: 50, mode: "libre", destination: null, eta: null, stops: [] },
-      appCapture: { photoUrl: "https://picsum.photos/seed/navio-new-unit-capture/480/280", timestamp: "—", driverName },
+      appCapture: {},
     };
-    onSave({ vehicle, reassignedFromId: reassignedFrom ? reassignedFrom.id : null });
+    const saved = await onSave({ vehicle, reassignedFromId: reassignedFrom ? reassignedFrom.id : null });
+    if (!saved) removeVehicleImage(photo);
+    setSaving(false);
   }
 
   return (
@@ -3912,8 +4173,17 @@ function AddVehicleModal({ vehicles, onSave, onClose }) {
           </div>
         </div>
 
+        <VehiclePhotoPicker label="Foto del vehículo (opcional)" current={null} file={photoField.file} error={photoField.error} onPick={photoField.pick} />
+
         <div className="rounded-xl border border-slate-100 p-3">
-          <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-400">Reasignación de Choferes</p>
+          <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-400">Chofer</p>
+          <div className="mb-3">
+            <SegmentedControl label="Tipo de chofer" options={DRIVER_MODES} value={driverType} onChange={setDriverType} />
+          </div>
+          {driverType === "variable" ? (
+            <p className="text-[11px] text-slate-500">El chofer cambia según el viaje y se elige en cada traslado. La unidad no mostrará la sección "Captura App / Chofer".</p>
+          ) : (
+          <>
           <div className="mb-2 flex gap-1.5 rounded-xl bg-slate-100 p-1">
             {[
               { id: "reassign", label: "Reasignar conductor existente" },
@@ -3951,14 +4221,18 @@ function AddVehicleModal({ vehicles, onSave, onClose }) {
               <input value={newDriverPhone} onChange={(e) => setNewDriverPhone(e.target.value)} placeholder="Teléfono" className={inputClass} />
             </div>
           )}
+          </>
+          )}
         </div>
+
+        {error && <p className="rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] font-medium text-rose-700">{error}</p>}
 
         <div className="flex justify-end gap-2 pt-1">
           <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
             Cancelar
           </button>
-          <button type="submit" className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
-            Agregar Unidad
+          <button type="submit" disabled={saving} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
+            {saving ? "Guardando..." : "Agregar Unidad"}
           </button>
         </div>
       </form>
@@ -3967,23 +4241,42 @@ function AddVehicleModal({ vehicles, onSave, onClose }) {
 }
 
 function EditVehicleModal({ vehicle, onSave, onClose }) {
+  const { profile } = useAuth();
   const [unit, setUnit] = useState(vehicle.unit ?? "");
   const [plate, setPlate] = useState(vehicle.plate ?? "");
   const [brand, setBrand] = useState(vehicle.brand ?? "");
   const [model, setModel] = useState(vehicle.model ?? "");
   const [year, setYear] = useState(vehicle.year ?? new Date().getFullYear());
   const [color, setColor] = useState(vehicle.color ?? "");
-  const [photo, setPhoto] = useState(vehicle.photo ?? "");
+  const [driverType, setDriverType] = useState(isVariableDriver(vehicle) ? "variable" : "fixed");
   const [driverName, setDriverName] = useState(vehicle.driver?.name ?? "");
   const [driverPhone, setDriverPhone] = useState(vehicle.driver?.phone ?? "");
+  const photoField = useVehiclePhotoField();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
   const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
 
-  function handleSubmit(e) {
+  async function handleSubmit(e) {
     e.preventDefault();
-    if (!unit.trim() || !plate.trim()) return;
-    onSave({
+    if (!unit.trim() || !plate.trim()) {
+      setError("Indica al menos la unidad y la matrícula.");
+      return;
+    }
+    setError("");
+    setSaving(true);
+    let newPhoto = null;
+    try {
+      if (photoField.file) newPhoto = await uploadVehicleImage(photoField.file, profile.companyId);
+    } catch (err) {
+      setError(`No se pudo subir la foto: ${err.message}`);
+      setSaving(false);
+      return;
+    }
+    // Al pasar a chofer variable se conservan nombre y teléfono, por si se
+    // vuelve a fijo; solo dejan de mostrarse.
+    const saved = await onSave({
       id: vehicle.id,
       unit: unit.trim(),
       plate: plate.trim(),
@@ -3991,13 +4284,16 @@ function EditVehicleModal({ vehicle, onSave, onClose }) {
       model: model.trim(),
       year: Number(year) || vehicle.year,
       color: color.trim(),
-      photo: photo.trim() || vehicle.photo,
+      photo: newPhoto ?? vehicle.photo,
       driver: {
         ...vehicle.driver,
-        name: driverName.trim() || "Sin asignar",
+        mode: driverType,
+        name: driverName.trim() || (driverType === "variable" ? "" : "Sin asignar"),
         phone: driverPhone.trim(),
       },
     });
+    if (newPhoto) removeVehicleImage(saved ? vehicle.photo : newPhoto);
+    setSaving(false);
   }
 
   return (
@@ -4033,27 +4329,30 @@ function EditVehicleModal({ vehicle, onSave, onClose }) {
             <input value={color} onChange={(e) => setColor(e.target.value)} className={inputClass} />
           </div>
         </div>
-        <div>
-          <label className={labelClass}>URL de foto del vehículo</label>
-          <input value={photo} onChange={(e) => setPhoto(e.target.value)} placeholder="https://..." className={inputClass} />
-          <p className="mt-1 text-[10px] text-slate-400">
-            Navío todavía no sube archivos desde tu equipo — por ahora pega el enlace de una foto ya publicada.
-          </p>
-        </div>
+        <VehiclePhotoPicker label="Foto del vehículo" current={vehicle.photo} file={photoField.file} error={photoField.error} onPick={photoField.pick} />
         <div className="rounded-xl border border-slate-100 p-3">
-          <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-400">Conductor asignado</p>
-          <div className="grid grid-cols-2 gap-3">
-            <input value={driverName} onChange={(e) => setDriverName(e.target.value)} placeholder="Nombre del conductor" className={inputClass} />
-            <input value={driverPhone} onChange={(e) => setDriverPhone(e.target.value)} placeholder="Teléfono" className={inputClass} />
+          <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-400">Chofer</p>
+          <div className="mb-3">
+            <SegmentedControl label="Tipo de chofer" options={DRIVER_MODES} value={driverType} onChange={setDriverType} />
           </div>
+          {driverType === "variable" ? (
+            <p className="text-[11px] text-slate-500">El chofer cambia según el viaje y se elige en cada traslado. La unidad no mostrará la sección "Captura App / Chofer".</p>
+          ) : (
+            <div className="grid grid-cols-2 gap-3">
+              <input value={driverName} onChange={(e) => setDriverName(e.target.value)} placeholder="Nombre del conductor" className={inputClass} />
+              <input value={driverPhone} onChange={(e) => setDriverPhone(e.target.value)} placeholder="Teléfono" className={inputClass} />
+            </div>
+          )}
         </div>
+
+        {error && <p className="rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] font-medium text-rose-700">{error}</p>}
 
         <div className="flex justify-end gap-2 pt-1">
           <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
             Cancelar
           </button>
-          <button type="submit" className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
-            Guardar cambios
+          <button type="submit" disabled={saving} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
+            {saving ? "Guardando..." : "Guardar cambios"}
           </button>
         </div>
       </form>
@@ -4229,7 +4528,7 @@ function MaintenanceUnitCard({ vehicle, records, onViewDetails }) {
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
       <div className="p-4">
         <div className="flex items-center gap-3">
-          <img src={vehicle.photo} alt={vehicle.unit} className="h-14 w-20 shrink-0 rounded-lg object-cover ring-1 ring-slate-200" />
+          <VehiclePhoto src={vehicle.photo} alt={vehicle.unit} className="h-14 w-20 shrink-0 rounded-lg ring-1 ring-slate-200" iconSize={16} />
           <div className="min-w-0 flex-1">
             <h3 className="text-sm font-bold text-slate-800">{vehicle.unit}</h3>
             <p className="truncate text-[11px] text-slate-400">
@@ -4360,7 +4659,7 @@ function MaintenanceUnitDetail({ vehicle, onBack }) {
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <img src={vehicle.photo} alt={vehicle.unit} className="h-12 w-16 rounded-lg object-cover ring-1 ring-slate-200" />
+          <VehiclePhoto src={vehicle.photo} alt={vehicle.unit} className="h-12 w-16 rounded-lg ring-1 ring-slate-200" iconSize={16} />
           <div>
             <h2 className="text-lg font-bold text-slate-900">
               {vehicle.unit} <span className="font-medium text-slate-400">· {vehicle.plate}</span>
@@ -5924,6 +6223,7 @@ function SegmentedControl({ options, value, onChange, label }) {
       {options.map((option) => (
         <button
           key={option.id}
+          type="button"
           onClick={() => onChange(option.id)}
           aria-pressed={value === option.id}
           title={option.title}
@@ -8333,7 +8633,7 @@ function HomePage({ vehicles, maintenanceRecords, complianceRecords, fuelRecords
             <div className="flex gap-2 overflow-x-auto pb-1">
               {vehicles.map((v) => (
                 <button key={v.id} onClick={() => onSelectVehicle(v.id)} className="shrink-0" title={v.unit}>
-                  <img src={v.photo} alt={v.unit} className="h-20 w-28 rounded-lg object-cover ring-1 ring-slate-200 hover:ring-blue-300" />
+                  <VehiclePhoto src={v.photo} alt={v.unit} className="h-20 w-28 rounded-lg ring-1 ring-slate-200 hover:ring-blue-300" iconSize={16} />
                 </button>
               ))}
             </div>
@@ -9039,6 +9339,9 @@ function TripFormModal({ vehicles, onSave, onClose }) {
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [cargo, setCargo] = useState("");
   const [passengers, setPassengers] = useState("");
+  // Con chofer variable, quién maneja se anota en cada viaje.
+  const [tripDriver, setTripDriver] = useState("");
+  const selectedVehicle = vehicles.find((v) => v.unit === unit);
 
   const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
   const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
@@ -9046,7 +9349,7 @@ function TripFormModal({ vehicles, onSave, onClose }) {
   function handleSubmit(e) {
     e.preventDefault();
     if (!origin.trim() || !destination.trim()) return;
-    const driver = vehicles.find((v) => v.unit === unit)?.driver.name ?? "";
+    const driver = isVariableDriver(selectedVehicle) ? tripDriver.trim() : vehicleDriverName(selectedVehicle);
     const cargoLabel = tripType === "passengers" ? (passengers.trim() || "Sin detalle de pasajeros") : cargo.trim();
     onSave({ unit, driver, tripType, origin: origin.trim(), destination: destination.trim(), date, cargo: cargoLabel, status: "scheduled" });
   }
@@ -9076,11 +9379,17 @@ function TripFormModal({ vehicles, onSave, onClose }) {
           <select value={unit} onChange={(e) => setUnit(e.target.value)} className={inputClass}>
             {vehicles.map((v) => (
               <option key={v.unit} value={v.unit}>
-                {v.unit} — {v.driver.name}
+                {v.unit} — {vehicleDriverLabel(v)}
               </option>
             ))}
           </select>
         </div>
+        {isVariableDriver(selectedVehicle) && (
+          <div>
+            <label className={labelClass}>Chofer de este viaje</label>
+            <input value={tripDriver} onChange={(e) => setTripDriver(e.target.value)} placeholder="Nombre de quien maneja" className={inputClass} />
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className={labelClass}>Origen</label>
@@ -9273,6 +9582,8 @@ function IncidentFormModal({ vehicles, onSave, onClose }) {
   const [severity, setSeverity] = useState("medium");
   const [description, setDescription] = useState("");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [reporter, setReporter] = useState("");
+  const selectedVehicle = vehicles.find((v) => v.unit === unit);
 
   const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
   const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
@@ -9280,7 +9591,7 @@ function IncidentFormModal({ vehicles, onSave, onClose }) {
   function handleSubmit(e) {
     e.preventDefault();
     if (!description.trim()) return;
-    const driver = vehicles.find((v) => v.unit === unit)?.driver.name ?? "";
+    const driver = isVariableDriver(selectedVehicle) ? reporter.trim() : vehicleDriverName(selectedVehicle);
     onSave({ unit, severity, status: "open", description: description.trim(), reportedBy: driver, date });
   }
 
@@ -9293,7 +9604,7 @@ function IncidentFormModal({ vehicles, onSave, onClose }) {
             <select value={unit} onChange={(e) => setUnit(e.target.value)} className={inputClass}>
               {vehicles.map((v) => (
                 <option key={v.unit} value={v.unit}>
-                  {v.unit} — {v.driver.name}
+                  {v.unit} — {vehicleDriverLabel(v)}
                 </option>
               ))}
             </select>
@@ -9308,6 +9619,12 @@ function IncidentFormModal({ vehicles, onSave, onClose }) {
             </select>
           </div>
         </div>
+        {isVariableDriver(selectedVehicle) && (
+          <div>
+            <label className={labelClass}>Chofer que reporta</label>
+            <input value={reporter} onChange={(e) => setReporter(e.target.value)} placeholder="Nombre de quien manejaba" className={inputClass} />
+          </div>
+        )}
         <div>
           <label className={labelClass}>Descripción del incidente</label>
           <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder="Describe la falla o emergencia..." className={inputClass} />
@@ -10463,39 +10780,51 @@ function BotFeedPanel() {
   );
 }
 
-// Minisecciones de Facturas y Gastos: General, Proyectos y cada proyecto activo.
-function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggleProjects, onNav }) {
+// Minisecciones de Facturas y Gastos, en árbol: General → Proyectos → cada
+// proyecto activo.
+function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggle, onNav }) {
   const item = (isActive) =>
-    `block w-full truncate rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition ${
+    `block w-full min-w-0 flex-1 truncate rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition ${
       isActive ? "bg-blue-50 text-blue-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
     }`;
+  const branch = "ml-3 mt-0.5 space-y-0.5 border-l border-slate-200 pl-2";
+  const toggle = (key, what) => (
+    <button
+      onClick={() => onToggle(key)}
+      aria-label={`${expanded[key] ? "Ocultar" : "Mostrar"} ${what}`}
+      aria-expanded={!!expanded[key]}
+      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-50 hover:text-slate-600"
+    >
+      {expanded[key] ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+    </button>
+  );
   const inReport = nav.report;
   return (
     <div className="ml-[22px] mt-1 space-y-0.5 border-l border-slate-100 pl-3">
-      <button onClick={() => onNav(INVOICE_NAV_START)} className={item(active && !inReport && !nav.inProjects)}>
-        General
-      </button>
       <div className="flex items-center gap-0.5">
-        <button onClick={() => onNav(INVOICE_NAV_PROJECTS)} className={`${item(active && !inReport && nav.inProjects && nav.project === null)} flex-1`}>
-          Proyectos
+        <button onClick={() => onNav(INVOICE_NAV_START)} className={item(active && !inReport && !nav.inProjects)}>
+          General
         </button>
-        <button
-          onClick={onToggleProjects}
-          aria-label={expanded ? "Ocultar proyectos" : "Mostrar proyectos"}
-          aria-expanded={expanded}
-          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-50 hover:text-slate-600"
-        >
-          {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-        </button>
+        {toggle("invoiceGeneral", "proyectos")}
       </div>
-      {expanded && (
-        <div className="ml-2 space-y-0.5 border-l border-slate-100 pl-2">
-          {projects.map((name) => (
-            <button key={name} title={name} onClick={() => onNav({ ...INVOICE_NAV_PROJECTS, project: name })} className={item(active && !inReport && nav.project === name)}>
-              {name}
+      {expanded.invoiceGeneral && (
+        <div className={branch}>
+          <div className="flex items-center gap-0.5">
+            <button onClick={() => onNav(INVOICE_NAV_PROJECTS)} className={item(active && !inReport && nav.inProjects && nav.project === null)}>
+              Proyectos
             </button>
-          ))}
-          {projects.length === 0 && <p className="px-2.5 py-1 text-[11px] text-slate-400">Sin proyectos activos</p>}
+            {toggle("invoiceProjects", "la lista de proyectos")}
+          </div>
+          {expanded.invoiceProjects && (
+            <div className={branch}>
+              {projects.map((name) => (
+                <button key={name} title={name} onClick={() => onNav({ ...INVOICE_NAV_PROJECTS, project: name })} className={item(active && !inReport && nav.project === name)}>
+                  {name}
+                </button>
+              ))}
+              {projects.length === 0 && <p className="px-2.5 py-1 text-[11px] text-slate-400">Sin proyectos activos</p>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -10503,7 +10832,7 @@ function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggleProjects,
 }
 
 function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLogoClick, isSuperAdmin, invoiceMenu }) {
-  const [expanded, setExpanded] = useState({ maintenance: true, compliance: true, fuel: true, invoiceProjects: true });
+  const [expanded, setExpanded] = useState({ maintenance: true, compliance: true, fuel: true, invoiceGeneral: true, invoiceProjects: true });
 
   function toggleExpanded(id) {
     setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -10554,8 +10883,8 @@ function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLo
                   active={active}
                   nav={invoiceMenu.nav}
                   projects={invoiceMenu.projects}
-                  expanded={expanded.invoiceProjects}
-                  onToggleProjects={() => toggleExpanded("invoiceProjects")}
+                  expanded={expanded}
+                  onToggle={toggleExpanded}
                   onNav={invoiceMenu.onNav}
                 />
               )}
@@ -10678,7 +11007,7 @@ function Header({
             return (
               v.unit.toLowerCase().includes(q) ||
               v.plate.toLowerCase().includes(q) ||
-              v.driver.name.toLowerCase().includes(q)
+              vehicleDriverName(v).toLowerCase().includes(q)
             );
           })
           .slice(0, 6)
@@ -10745,12 +11074,12 @@ function Header({
                       }}
                       className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left hover:bg-slate-50"
                     >
-                      <img src={v.photo} alt={v.unit} className="h-8 w-11 shrink-0 rounded object-cover ring-1 ring-slate-200" />
+                      <VehiclePhoto src={v.photo} alt={v.unit} className="h-8 w-11 shrink-0 rounded ring-1 ring-slate-200" iconSize={16} />
                       <div className="min-w-0">
                         <p className="truncate text-xs font-semibold text-slate-700">
                           {v.unit} <span className="font-normal text-slate-400">· {v.plate}</span>
                         </p>
-                        <p className="truncate text-[10px] text-slate-400">{v.driver.name}</p>
+                        <p className="truncate text-[10px] text-slate-400">{vehicleDriverLabel(v)}</p>
                       </div>
                     </button>
                   ))}
@@ -11040,7 +11369,7 @@ function MobileHomeTab({ vehicles, userName, companyName, onOpenTrip }) {
                   <p className="text-xs font-bold text-slate-800">
                     {v.unit} <span className="font-medium text-slate-400">· {v.plate}</span>
                   </p>
-                  <p className="text-[11px] text-slate-500">{v.driver?.name || "Sin conductor"}</p>
+                  <p className="text-[11px] text-slate-500">{vehicleDriverLabel(v)}</p>
                 </div>
                 <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${health.className}`}>{v.healthScore}%</span>
               </div>
@@ -11172,7 +11501,7 @@ function MobileAppShell({
   onSignOut,
   onOpenRecordForm,
 }) {
-  const [tab, setTab] = useState("home");
+  const [tab, setTab] = useSessionState("navio.nav.mobileTab", "home");
 
   return (
     <div className="min-h-screen bg-[#f8fafc]">
@@ -11230,8 +11559,9 @@ function NavioApp() {
   const isMobileViewport = useIsMobileViewport();
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState("home");
-  const [selectedVehicleId, setSelectedVehicleId] = useState(null);
+  // La pantalla abierta sobrevive a una recarga de la pestaña.
+  const [activeTab, setActiveTab] = useSessionState("navio.nav.tab", "home");
+  const [selectedVehicleId, setSelectedVehicleId] = useSessionState("navio.nav.vehicle", null);
   const [bentoOpen, setBentoOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -11293,7 +11623,7 @@ function NavioApp() {
   const { rows: deadlineRows, refresh: refreshDeadlines } = useSupabaseTable("concept_deadlines", { orderBy: "expenseType", companyId });
   // Igual que las anteriores: sin la migración v16, todos los proyectos salen activos.
   const { rows: projectSettings, refresh: refreshProjectSettings } = useSupabaseTable("project_settings", { orderBy: "project", companyId });
-  const [invoiceNav, setInvoiceNav] = useState(INVOICE_NAV_START);
+  const [invoiceNav, setInvoiceNav] = useSessionState("navio.nav.invoices", INVOICE_NAV_START);
   const reminders = useSupabaseTable("user_reminders");
   const invoices = useMemo(
     () => normalizeInvoices({ fuel: fuelRecords, travel: travelExpenses, misc: miscExpenses }),
@@ -11344,8 +11674,8 @@ function NavioApp() {
     incidentsLoading ||
     communityLoading;
 
-  const [maintenanceView, setMaintenanceView] = useState("servicios");
-  const [complianceDocFilter, setComplianceDocFilter] = useState("all");
+  const [maintenanceView, setMaintenanceView] = useSessionState("navio.nav.maintenance", "servicios");
+  const [complianceDocFilter, setComplianceDocFilter] = useSessionState("navio.nav.compliance", "all");
 
   const [formModal, setFormModal] = useState(null);
   const [addVehicleModalOpen, setAddVehicleModalOpen] = useState(false);
@@ -11504,8 +11834,10 @@ function NavioApp() {
       }
       setAddVehicleModalOpen(false);
       showToast(`${inserted.unit} agregada a la flota.`);
+      return true;
     } catch (err) {
       showToast(`Error al agregar unidad: ${err.message}`);
+      return false;
     }
   }
 
@@ -11515,8 +11847,22 @@ function NavioApp() {
       await updateVehicleRow(id, rest);
       setEditVehicleTarget(null);
       showToast("Unidad actualizada.");
+      return true;
     } catch (err) {
       showToast(`Error al editar unidad: ${err.message}`);
+      return false;
+    }
+  }
+
+  // Cambios puntuales desde el expediente (por ejemplo, subir una foto).
+  async function handleUpdateVehicle(id, patch) {
+    try {
+      await updateVehicleRow(id, patch);
+      showToast("Foto guardada.");
+      return true;
+    } catch (err) {
+      showToast(`Error al guardar: ${err.message}`);
+      return false;
     }
   }
 
@@ -11711,6 +12057,7 @@ function NavioApp() {
                       isCompanyAdmin={isCompanyAdmin}
                       onEditVehicle={setEditVehicleTarget}
                       onDeleteVehicle={setDeleteVehicleTarget}
+                      onUpdateVehicle={handleUpdateVehicle}
                     />
                   )}
                   {activeTab === "transfers" && (
