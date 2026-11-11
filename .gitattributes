@@ -1,0 +1,2 @@
+# El script de compilación corre con bash: sus saltos de línea no deben cambiar.
+*.sh text eol=lf

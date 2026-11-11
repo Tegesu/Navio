@@ -7,3 +7,11 @@
 # Sistema operativo
 .DS_Store
 Thumbs.db
+
+# Herramientas de compilación (se instalan con npm dentro de tools/)
+tools/node_modules/
+
+# Página y archivos de pruebas locales (no se publican)
+_test.html
+assets/test-*
+tools/.tailwind.css

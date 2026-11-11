@@ -1,0 +1,160 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------ */
+/*  Entrada: "NAVIO" se recoge en su inicial mientras carga la app     */
+/* ------------------------------------------------------------------ */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f8fafc;
+  transition: opacity 0.35s ease, visibility 0.35s;
+}
+#splash.splash-done {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.splash-logo {
+  display: flex;
+  align-items: center;
+  font-size: clamp(40px, 9vw, 64px);
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: #1d4ed8;
+  animation: splash-in 0.3s ease both;
+}
+.splash-n {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.15em;
+  height: 1.15em;
+  border-radius: 0.28em;
+  animation: splash-n 0.5s 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+.splash-rest {
+  display: inline-block;
+  overflow: hidden;
+  max-width: 4em;
+  white-space: nowrap;
+  animation: splash-rest 0.5s 0.4s cubic-bezier(0.6, 0, 0.4, 1) forwards;
+}
+@keyframes splash-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@keyframes splash-n {
+  to {
+    background: #2563eb;
+    color: #fff;
+    transform: scale(1.2);
+    box-shadow: 0 12px 32px rgba(37, 99, 235, 0.35);
+  }
+}
+@keyframes splash-rest {
+  to {
+    max-width: 0;
+    opacity: 0;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Ilustración de la pantalla de inicio de sesión                     */
+/* ------------------------------------------------------------------ */
+@keyframes navio-dash {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes navio-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+@keyframes navio-pulse {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+@keyframes navio-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+}
+@keyframes navio-grow {
+  from {
+    transform: scaleY(0.15);
+  }
+}
+@keyframes navio-drive {
+  from {
+    offset-distance: 0%;
+  }
+  to {
+    offset-distance: 100%;
+  }
+}
+.navio-route {
+  stroke-dasharray: 1400;
+  stroke-dashoffset: 1400;
+  animation: navio-dash 2.6s 0.5s ease-out forwards;
+}
+.navio-float {
+  animation: navio-float 6s ease-in-out infinite;
+}
+.navio-float-slow {
+  animation: navio-float 8s 1s ease-in-out infinite;
+}
+.navio-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: navio-pulse 2.2s ease-out infinite;
+}
+.navio-rise {
+  animation: navio-rise 0.6s ease-out both;
+}
+.navio-bar {
+  transform-box: fill-box;
+  transform-origin: bottom;
+  animation: navio-grow 0.9s ease-out both;
+}
+.navio-truck {
+  offset-rotate: auto;
+  animation: navio-drive 9s 1.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .splash-logo,
+  .splash-n,
+  .splash-rest,
+  .navio-route,
+  .navio-float,
+  .navio-float-slow,
+  .navio-pulse,
+  .navio-rise,
+  .navio-bar,
+  .navio-truck {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

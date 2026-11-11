@@ -1,0 +1,13 @@
+# El sitio publicado solo lleva lo compilado. El código fuente, las reglas de
+# la base de datos y el bot no se sirven al público.
+src
+tools
+supabase
+*.sql
+*.sh
+*.py
+*.md
+_test*
+.claude
+Navio
+assets/test-*

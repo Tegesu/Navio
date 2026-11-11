@@ -468,18 +468,25 @@ Deno.serve(async (req) => {
       await sendMessage(chatId, "Usa: /vincular TU-CODIGO (lo encuentras en Navío → Configuración → Bot).");
       return new Response("ok");
     }
-    const { data: company } = await supabase
-      .from("companies")
-      .select("id, name")
+    // Desde la migración v17 el código vive en "company_secrets", donde solo
+    // lo ven los administradores. Si esa tabla todavía no existe, se busca
+    // donde estaba antes.
+    const { data: secret, error: secretError } = await supabase
+      .from("company_secrets")
+      .select("companyId")
       .eq("botLinkCode", code)
-      .eq("status", "approved")
       .maybeSingle();
+    let lookup = supabase.from("companies").select("id, name").eq("status", "approved");
+    lookup = secretError ? lookup.eq("botLinkCode", code) : lookup.eq("id", secret?.companyId ?? -1);
+    const { data: company } = await lookup.maybeSingle();
 
     if (!company) {
       await sendMessage(chatId, "Código no válido. Verifícalo en Navío → Configuración → Bot.");
       return new Response("ok");
     }
 
+    // Un chat pertenece a una sola empresa: si estaba ligado a otra, se suelta.
+    await supabase.from("companies").update({ botChannel: null, botChatId: null }).eq("botChatId", chatId).neq("id", company.id);
     await supabase.from("companies").update({ botChannel: "telegram", botChatId: chatId }).eq("id", company.id);
     await sendMessage(
       chatId,
@@ -491,7 +498,7 @@ Deno.serve(async (req) => {
   // --- ¿A qué empresa pertenece este chat? ---
   const { data: company, error: companyLookupError } = await supabase
     .from("companies")
-    .select("id, name")
+    .select("id, name, status")
     .eq("botChatId", chatId)
     .eq("botChannel", "telegram")
     .maybeSingle();
@@ -503,6 +510,13 @@ Deno.serve(async (req) => {
   if (!company) {
     console.log("Chat sin empresa vinculada", { chatId, hadError: !!companyLookupError });
     await sendMessage(chatId, "Este chat no está vinculado a ninguna empresa todavía. Envía /vincular TU-CODIGO para empezar.");
+    return new Response("ok");
+  }
+
+  // Una empresa suspendida no registra nada, tampoco por el bot.
+  if (company.status !== "approved") {
+    console.log("Chat de una empresa que no está activa", { chatId, status: company.status });
+    await sendMessage(chatId, "La empresa vinculada a este chat no está activa en Navio, así que no puedo registrar documentos por ahora.");
     return new Response("ok");
   }
 

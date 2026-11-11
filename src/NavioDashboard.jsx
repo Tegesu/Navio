@@ -1,5 +1,16 @@
 import React, { useState, useMemo, useEffect, useLayoutEffect, useCallback, useContext, useRef, createContext } from "react";
 import { createClient } from "@supabase/supabase-js";
+import { PeopleProvider } from "./people.jsx";
+import { TrackingProvider, TrackingPill, DriverModeModal, LiveMapPage } from "./tracking.jsx";
+import { TransfersPage } from "./trips.jsx";
+import { InboxProvider, NavBadge, BellButton, NotificationsPanel, MessagesPage, TasksPage } from "./inbox.jsx";
+import { hideSplash, FullScreenLoader, SupabaseSetupNotice, LoginPage, UpdatePasswordPage, MfaChallengePage, OnboardingPage, CompanyInactivePage, ConnectionErrorPage } from "./auth.jsx";
+import { SettingsPage, AccountPage, IdleGuard } from "./settings.jsx";
+import { AdminCompaniesPage } from "./admin.jsx";
+import { MobileAppShell } from "./mobile.jsx";
+import { CookieNotice, LegalAcceptanceGate } from "./legal.jsx";
+import { HomePage } from "./home.jsx";
+import { FleetDataProvider, VehicleStatusChip, FleetStatusSummary, VehicleDocsTab, VehicleServiceTab, VehicleTiresTab, VehicleHistoryTab, VehicleLocationPanel, WarrantiesPanel, WarrantiesPage, MaintenanceUnitDetail } from "./vehicle.jsx";
 import {
   Home,
   Menu,
@@ -63,6 +74,7 @@ import {
   Hash,
   BarChart3,
   Printer,
+  ClipboardList,
 } from "lucide-react";
 
 /* ---------------------------------------------------------------------- */
@@ -79,6 +91,35 @@ const SUPABASE_ANON_KEY =
 
 const isSupabaseConfigured = SUPABASE_URL.startsWith("http") && SUPABASE_ANON_KEY.length > 20;
 const supabase = isSupabaseConfigured ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+/* ---------------------------------------------------------------------- */
+/*  Avatares                                                              */
+/* ---------------------------------------------------------------------- */
+
+// Avatares con iniciales, generados aquí mismo: no se pide nada a servicios
+// externos (ni se les comparte quién usa la plataforma).
+const AVATAR_COLORS = ["#2563eb", "#0891b2", "#059669", "#d97706", "#dc2626", "#7c3aed", "#db2777", "#475569"];
+function avatarUrl(name) {
+  const clean = String(name || "?").trim() || "?";
+  const initials = clean
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((word) => word[0])
+    .join("")
+    .toUpperCase()
+    .replace(/[<>&"']/g, "");
+  let hash = 0;
+  for (const ch of clean) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="${AVATAR_COLORS[hash % AVATAR_COLORS.length]}"/>` +
+    `<text x="32" y="33" dy=".35em" text-anchor="middle" font-family="system-ui,sans-serif" font-size="26" font-weight="700" fill="#fff">${initials || "?"}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+// Las fotos guardadas con el servicio de avatares anterior se cambian por el local.
+function personPhoto(photo, name) {
+  return photo && !/dicebear\.com/.test(photo) ? photo : avatarUrl(name);
+}
 
 /* ---------------------------------------------------------------------- */
 /*  Global date-format context                                            */
@@ -176,29 +217,32 @@ function useSessionState(key, initialValue) {
 /*  Supabase table hook — fetch/insert/update/delete compartidos          */
 /* ---------------------------------------------------------------------- */
 
-function useSupabaseTable(table, { orderBy = "id", ascending = false, companyId = null } = {}) {
+// Con `enabled: false` la tabla no se pide hasta que una pantalla la necesita.
+function useSupabaseTable(table, { orderBy = "id", ascending = false, companyId = null, enabled = true } = {}) {
   const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(null);
 
+  // Solo la primera carga muestra "Cargando"; las siguientes actualizan en
+  // silencio para no desmontar la pantalla que la persona tiene abierta.
   const refresh = useCallback(async () => {
     if (!supabase) {
-      setLoading(false);
+      setLoaded(true);
       return;
     }
-    setLoading(true);
     const { data, error: fetchError } = await supabase.from(table).select("*").order(orderBy, { ascending });
     if (fetchError) setError(fetchError.message);
     else {
       setError(null);
       setRows(data ?? []);
     }
-    setLoading(false);
+    setLoaded(true);
   }, [table, orderBy, ascending]);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    if (enabled) refresh();
+  }, [refresh, enabled]);
+  const loading = enabled && !loaded;
 
   async function insertRow(row) {
     const payload = companyId ? { ...row, companyId } : row;
@@ -261,7 +305,7 @@ const AuthContext = createContext({
   loading: true,
   passwordRecovery: false,
   mfaRequired: false,
-  mfaVerifying: false,
+  profileError: false,
   signIn: async () => {},
   signUp: async () => {},
   signOut: async () => {},
@@ -273,9 +317,6 @@ const AuthContext = createContext({
   listMFAFactors: async () => {},
   joinCompanyWithCode: async () => {},
   requestCompany: async () => {},
-  approveCompany: async () => {},
-  rejectCompany: async () => {},
-  updateCompanyCurrency: async () => {},
   unlinkCompanyBot: async () => {},
 });
 function useAuth() {
@@ -287,7 +328,7 @@ function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const [passwordRecovery, setPasswordRecovery] = useState(false);
   const [mfaRequired, setMfaRequired] = useState(false);
-  const [mfaVerifying, setMfaVerifying] = useState(false);
+  const [profileError, setProfileError] = useState(false);
   const [profile, setProfile] = useState(null);
   const [profileLoading, setProfileLoading] = useState(true);
 
@@ -311,15 +352,16 @@ function AuthProvider({ children }) {
       return;
     }
     if (loadedProfileUserRef.current !== userId) setProfileLoading(true);
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("*, company:companies(name, currency, botChannel, botChatId, botLinkCode)")
-      .eq("id", userId)
-      .single();
+    const query = (companyColumns) => supabase.from("profiles").select(`*, company:companies(${companyColumns})`).eq("id", userId).single();
+    let { data, error } = await query("name, currency, botChannel, legalName, rfc, address, contactName, contactEmail, contactPhone, settings");
+    // Antes de la migración v17 esas columnas no existen: se piden las de siempre.
+    if (error) ({ data, error } = await query("name, currency, botChannel"));
     if (!error) {
       loadedProfileUserRef.current = userId;
       setProfile(data);
     }
+    // Sin perfil no se sabe a qué empresa pertenece: se avisa en vez de adivinar.
+    setProfileError(!!error && loadedProfileUserRef.current !== userId);
     setProfileLoading(false);
   }, []);
 
@@ -357,45 +399,18 @@ function AuthProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function signIn(email, password, token) {
+  async function signIn(email, password) {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) throw error;
-
-    // ¿La cuenta tiene verificación en dos pasos activa? Si sí, se resuelve
-    // aquí mismo con el campo "Token" del formulario — sin pantalla aparte.
-    const { data: aalData } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-    const needsSecondFactor = aalData && aalData.nextLevel === "aal2" && aalData.currentLevel !== aalData.nextLevel;
-    if (needsSecondFactor) {
-      if (!token || !token.trim()) {
-        setMfaRequired(true);
-        throw new Error("Esta cuenta tiene verificación en dos pasos. Ingresa el código de tu app de autenticación.");
-      }
-      // Ya tenemos un token: lo verificamos aquí mismo, sin dejar que la
-      // pantalla salte momentáneamente a MfaChallengePage mientras tanto
-      // (AuthGate ignora mfaRequired/session mientras mfaVerifying es true).
-      setMfaVerifying(true);
-      try {
-        const { data: factorsData, error: factorsError } = await supabase.auth.mfa.listFactors();
-        if (factorsError) throw factorsError;
-        const factorId = factorsData?.totp?.find((f) => f.status === "verified")?.id;
-        if (!factorId) throw new Error("No se encontró tu método de verificación en dos pasos.");
-        await verifyFactor(factorId, token.trim());
-      } catch (err) {
-        await refreshAal(); // el token era incorrecto: refleja que seguimos en aal1
-        throw err;
-      } finally {
-        setMfaVerifying(false);
-      }
-    } else {
-      setMfaRequired(false);
-    }
+    // Si la cuenta tiene verificación en dos pasos, sigue la pantalla del código.
+    await refreshAal();
   }
 
-  async function signUp(email, password, fullName) {
+  async function signUp(email, password, fullName, legalVersion) {
     const { error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { full_name: fullName } },
+      options: { data: { full_name: fullName, legal_version: legalVersion ?? null }, emailRedirectTo: window.location.origin },
     });
     if (error) throw error;
   }
@@ -450,6 +465,8 @@ function AuthProvider({ children }) {
   async function joinCompanyWithCode(code) {
     const { data, error } = await supabase.rpc("join_company_with_code", { invite_code: code.trim() });
     if (error) throw error;
+    // Sin empresa de vuelta, el código no existe (o ya no está vigente).
+    if (data == null) throw new Error("Ese código no es válido. Revisa que esté bien escrito o pide uno nuevo a tu administrador.");
     await refreshProfile(session.user.id);
     return data;
   }
@@ -461,24 +478,6 @@ function AuthProvider({ children }) {
       status: "pending",
     });
     if (error) throw error;
-  }
-
-  async function approveCompany(companyId) {
-    const { data, error } = await supabase.rpc("approve_company", { target_company_id: companyId });
-    if (error) throw error;
-    return data; // nuevo inviteCode
-  }
-
-  async function rejectCompany(companyId) {
-    const { error } = await supabase.rpc("reject_company", { target_company_id: companyId });
-    if (error) throw error;
-  }
-
-  async function updateCompanyCurrency(currency) {
-    if (!profile?.companyId) throw new Error("No perteneces a ninguna empresa todavía.");
-    const { error } = await supabase.from("companies").update({ currency }).eq("id", profile.companyId);
-    if (error) throw error;
-    await refreshProfile(session.user.id);
   }
 
   async function unlinkCompanyBot() {
@@ -499,7 +498,7 @@ function AuthProvider({ children }) {
         loading,
         passwordRecovery,
         mfaRequired,
-        mfaVerifying,
+        profileError,
         signIn,
         signUp,
         signOut,
@@ -507,9 +506,6 @@ function AuthProvider({ children }) {
         updatePassword,
         joinCompanyWithCode,
         requestCompany,
-        approveCompany,
-        rejectCompany,
-        updateCompanyCurrency,
         unlinkCompanyBot,
         enrollMFA,
         verifyFactor,
@@ -519,675 +515,6 @@ function AuthProvider({ children }) {
     >
       {children}
     </AuthContext.Provider>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
-/*  Login — pantallas de autenticación                                    */
-/* ---------------------------------------------------------------------- */
-
-function AuthLayout({ children }) {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-white px-4 py-10">
-      <div className="w-full max-w-[420px]">
-        <div className="mb-8 flex items-center justify-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-sm font-extrabold text-white">N</div>
-          <span className="text-xl font-extrabold tracking-tight text-slate-900">NAVIO</span>
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function FullScreenLoader() {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-[#f8fafc]">
-      <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">
-        <RefreshCw size={16} className="animate-spin" /> Cargando...
-      </div>
-    </div>
-  );
-}
-
-function SupabaseSetupNotice() {
-  return (
-    <AuthLayout>
-      <div className="rounded-2xl border border-amber-200 bg-amber-50 p-6 shadow-sm">
-        <div className="flex items-center gap-2 text-amber-700">
-          <AlertTriangle size={18} />
-          <h1 className="text-sm font-bold">Falta configurar Supabase</h1>
-        </div>
-        <p className="mt-2 text-xs leading-relaxed text-amber-700">
-          Para activar el login real, crea un proyecto gratis en <span className="font-semibold">supabase.com</span>,
-          ve a Project Settings → API, y pega el "Project URL" y la llave "anon public" en las constantes{" "}
-          <code className="rounded bg-amber-100 px-1 py-0.5">SUPABASE_URL</code> y{" "}
-          <code className="rounded bg-amber-100 px-1 py-0.5">SUPABASE_ANON_KEY</code> al inicio de{" "}
-          <code className="rounded bg-amber-100 px-1 py-0.5">src/NavioDashboard.jsx</code>.
-        </p>
-      </div>
-    </AuthLayout>
-  );
-}
-
-function AuthErrorMessage({ message }) {
-  if (!message) return null;
-  return (
-    <p className="flex items-center gap-1.5 rounded-lg bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
-      <AlertTriangle size={13} className="shrink-0" /> {message}
-    </p>
-  );
-}
-
-function translateAuthError(error) {
-  const msg = error?.message || "";
-  if (msg.includes("Invalid login credentials")) return "Correo o contraseña incorrectos.";
-  if (msg.includes("User already registered")) return "Ya existe una cuenta con ese correo.";
-  if (msg.toLowerCase().includes("password should be at least")) return "La contraseña debe tener al menos 6 caracteres.";
-  if (msg.includes("Email not confirmed")) return "Confirma tu correo antes de iniciar sesión (revisa tu bandeja de entrada).";
-  if (msg.includes("rate limit")) return "Demasiados intentos. Espera un momento y vuelve a intentar.";
-  return msg || "Ocurrió un error inesperado. Intenta de nuevo.";
-}
-
-const AUTH_MODES = { SIGN_IN: "signin", SIGN_UP: "signup", FORGOT: "forgot" };
-
-function LoginPage() {
-  const { signIn, signUp, resetPassword } = useAuth();
-  const [mode, setMode] = useState(AUTH_MODES.SIGN_IN);
-  const [fullName, setFullName] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [token, setToken] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-
-  const inputClass =
-    "w-full rounded-md border border-slate-300 px-3 py-2.5 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500";
-  const labelClass = "mb-1.5 block text-xs font-semibold text-slate-600";
-
-  function resetMessages() {
-    setError("");
-    setNotice("");
-  }
-
-  function switchMode(next) {
-    resetMessages();
-    setMode(next);
-  }
-
-  async function handleSignIn(e) {
-    e.preventDefault();
-    resetMessages();
-    setLoading(true);
-    try {
-      await signIn(email.trim(), password, token);
-      setToken("");
-    } catch (err) {
-      setError(translateAuthError(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleSignUp(e) {
-    e.preventDefault();
-    resetMessages();
-    if (!fullName.trim()) {
-      setError("Ingresa tu nombre completo.");
-      return;
-    }
-    if (password.length < 6) {
-      setError("La contraseña debe tener al menos 6 caracteres.");
-      return;
-    }
-    setLoading(true);
-    try {
-      await signUp(email.trim(), password, fullName.trim());
-      setNotice("Cuenta creada. Revisa tu correo para confirmar tu cuenta antes de iniciar sesión.");
-      setMode(AUTH_MODES.SIGN_IN);
-    } catch (err) {
-      setError(translateAuthError(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleForgot(e) {
-    e.preventDefault();
-    resetMessages();
-    setLoading(true);
-    try {
-      await resetPassword(email.trim());
-      setNotice("Te enviamos un enlace para restablecer tu contraseña. Revisa tu correo.");
-    } catch (err) {
-      setError(translateAuthError(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  const handleSubmit = mode === AUTH_MODES.SIGN_IN ? handleSignIn : mode === AUTH_MODES.SIGN_UP ? handleSignUp : handleForgot;
-
-  return (
-    <AuthLayout>
-      <div className="rounded-lg border border-slate-200 bg-white p-8 shadow-sm">
-        <h1 className="text-xl font-bold text-slate-900">
-          {mode === AUTH_MODES.SIGN_IN && "Iniciar sesión"}
-          {mode === AUTH_MODES.SIGN_UP && "Crear cuenta"}
-          {mode === AUTH_MODES.FORGOT && "Restablecer contraseña"}
-        </h1>
-        <p className="mt-1.5 text-xs text-slate-500">
-          {mode === AUTH_MODES.SIGN_IN && "Accede a tu panel de gestión logística."}
-          {mode === AUTH_MODES.SIGN_UP && "Crea una cuenta para empezar a usar Navio."}
-          {mode === AUTH_MODES.FORGOT && "Te enviaremos un enlace a tu correo."}
-        </p>
-
-        <form onSubmit={handleSubmit} className="mt-6 space-y-4">
-          {mode === AUTH_MODES.SIGN_UP && (
-            <div>
-              <label className={labelClass}>Nombre completo</label>
-              <input
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                placeholder="Ej. Johana Ramírez"
-                className={inputClass}
-              />
-            </div>
-          )}
-          <div>
-            <label className={labelClass}>Correo electrónico</label>
-            <input
-              type="email"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="usuario@empresa.com"
-              autoComplete="username"
-              className={inputClass}
-            />
-            {mode === AUTH_MODES.SIGN_IN && (
-              <p className="mt-1 text-[11px] text-slate-400">Usa exactamente el mismo correo con el que te registraste.</p>
-            )}
-          </div>
-          {mode !== AUTH_MODES.FORGOT && (
-            <div>
-              <label className={labelClass}>Contraseña</label>
-              <div className="relative">
-                <input
-                  type={showPassword ? "text" : "password"}
-                  required
-                  minLength={6}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  autoComplete="current-password"
-                  className={`${inputClass} pr-9`}
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                >
-                  {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
-                </button>
-              </div>
-            </div>
-          )}
-          {mode === AUTH_MODES.SIGN_IN && (
-            <div>
-              <label className={labelClass}>Token</label>
-              <input
-                value={token}
-                onChange={(e) => setToken(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                inputMode="numeric"
-                placeholder="123456"
-                autoComplete="one-time-code"
-                className={inputClass}
-              />
-              <p className="mt-1 text-[11px] text-slate-400">
-                Solo si activaste verificación en dos pasos en Cuenta → Seguridad. Déjalo en blanco si no.
-              </p>
-            </div>
-          )}
-
-          {mode === AUTH_MODES.SIGN_IN && (
-            <button type="button" onClick={() => switchMode(AUTH_MODES.FORGOT)} className="text-[11px] font-semibold text-blue-600 hover:text-blue-700">
-              ¿Olvidaste tu contraseña?
-            </button>
-          )}
-
-          <AuthErrorMessage message={error} />
-          {notice && (
-            <p className="flex items-center gap-1.5 rounded-lg bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
-              <CheckCircle2 size={13} className="shrink-0" /> {notice}
-            </p>
-          )}
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-md bg-blue-600 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
-          >
-            {loading
-              ? "Procesando..."
-              : mode === AUTH_MODES.SIGN_IN
-              ? "Iniciar sesión"
-              : mode === AUTH_MODES.SIGN_UP
-              ? "Crear cuenta"
-              : "Enviar enlace"}
-          </button>
-        </form>
-
-        <div className="mt-5 text-center text-xs text-slate-500">
-          {mode === AUTH_MODES.SIGN_IN && (
-            <>
-              ¿No tienes cuenta?{" "}
-              <button onClick={() => switchMode(AUTH_MODES.SIGN_UP)} className="font-semibold text-blue-600 hover:text-blue-700">
-                Crea una
-              </button>
-            </>
-          )}
-          {(mode === AUTH_MODES.SIGN_UP || mode === AUTH_MODES.FORGOT) && (
-            <button onClick={() => switchMode(AUTH_MODES.SIGN_IN)} className="font-semibold text-blue-600 hover:text-blue-700">
-              ← Volver a iniciar sesión
-            </button>
-          )}
-        </div>
-      </div>
-    </AuthLayout>
-  );
-}
-
-function UpdatePasswordPage() {
-  const { updatePassword } = useAuth();
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  async function handleSubmit(e) {
-    e.preventDefault();
-    setError("");
-    if (password.length < 6) {
-      setError("La contraseña debe tener al menos 6 caracteres.");
-      return;
-    }
-    if (password !== confirm) {
-      setError("Las contraseñas no coinciden.");
-      return;
-    }
-    setLoading(true);
-    try {
-      await updatePassword(password);
-    } catch (err) {
-      setError(translateAuthError(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <AuthLayout>
-      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h1 className="text-lg font-bold text-slate-900">Elige una nueva contraseña</h1>
-        <p className="mt-1 text-xs text-slate-500">Tu enlace de recuperación es válido. Define tu nueva contraseña para continuar.</p>
-        <form onSubmit={handleSubmit} className="mt-5 space-y-3">
-          <div>
-            <label className="mb-1 block text-xs font-semibold text-slate-500">Nueva contraseña</label>
-            <div className="relative">
-              <Lock size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-300" />
-              <input
-                type={showPassword ? "text" : "password"}
-                required
-                minLength={6}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full rounded-lg border border-slate-200 py-2 pl-8 pr-9 text-sm focus:border-blue-400 focus:outline-none"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword((v) => !v)}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-              >
-                {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
-              </button>
-            </div>
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-semibold text-slate-500">Confirmar contraseña</label>
-            <input
-              type={showPassword ? "text" : "password"}
-              required
-              minLength={6}
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-blue-400 focus:outline-none"
-            />
-          </div>
-          <AuthErrorMessage message={error} />
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-lg bg-blue-600 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
-          >
-            {loading ? "Guardando..." : "Guardar nueva contraseña"}
-          </button>
-        </form>
-      </div>
-    </AuthLayout>
-  );
-}
-
-function MfaChallengePage() {
-  const { verifyFactor, listMFAFactors, signOut } = useAuth();
-  const [factorId, setFactorId] = useState(null);
-  const [code, setCode] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [loadingFactors, setLoadingFactors] = useState(true);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    listMFAFactors()
-      .then((data) => {
-        if (cancelled) return;
-        const verifiedTotp = data?.totp?.find((f) => f.status === "verified") ?? data?.totp?.[0];
-        setFactorId(verifiedTotp?.id ?? null);
-      })
-      .catch((err) => !cancelled && setError(translateAuthError(err)))
-      .finally(() => !cancelled && setLoadingFactors(false));
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function handleSubmit(e) {
-    e.preventDefault();
-    setError("");
-    if (!factorId) {
-      setError("No se encontró tu método de verificación en dos pasos.");
-      return;
-    }
-    setLoading(true);
-    try {
-      await verifyFactor(factorId, code.trim());
-    } catch (err) {
-      setError(translateAuthError(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <AuthLayout>
-      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h1 className="text-lg font-bold text-slate-900">Verificación en dos pasos</h1>
-        <p className="mt-1 text-xs text-slate-500">
-          Ingresa el código de 6 dígitos de tu app de autenticación (Google Authenticator, Authy, etc.).
-        </p>
-        {loadingFactors ? (
-          <p className="mt-4 text-xs text-slate-400">Cargando...</p>
-        ) : (
-          <form onSubmit={handleSubmit} className="mt-5 space-y-3">
-            <input
-              value={code}
-              onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-              inputMode="numeric"
-              autoFocus
-              placeholder="123456"
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-center text-lg tracking-[0.5em] focus:border-blue-400 focus:outline-none"
-            />
-            <AuthErrorMessage message={error} />
-            <button
-              type="submit"
-              disabled={loading || code.length < 6}
-              className="w-full rounded-lg bg-blue-600 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
-            >
-              {loading ? "Verificando..." : "Verificar"}
-            </button>
-          </form>
-        )}
-        <button onClick={() => signOut()} className="mt-4 w-full text-center text-[11px] font-semibold text-slate-400 hover:text-slate-600">
-          Cancelar y cerrar sesión
-        </button>
-      </div>
-    </AuthLayout>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
-/*  Onboarding — vincular la cuenta a una empresa                        */
-/* ---------------------------------------------------------------------- */
-
-const COMPANY_INDUSTRIES = ["Transporte de carga", "Transporte de pasajeros", "Logística y distribución", "Construcción", "Otro"];
-const FLEET_SIZE_RANGES = ["1-5 unidades", "6-20 unidades", "21-50 unidades", "Más de 50 unidades"];
-
-const onboardingInputClass =
-  "w-full rounded-md border border-slate-300 px-3 py-2.5 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500";
-const onboardingLabelClass = "mb-1.5 block text-xs font-semibold text-slate-600";
-
-function OnboardingPage() {
-  const { user, joinCompanyWithCode, requestCompany, signOut } = useAuth();
-  const { showToast } = useToast();
-  const [tab, setTab] = useState("join");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [myRequest, setMyRequest] = useState(undefined); // undefined = cargando, null = sin solicitud
-
-  const [code, setCode] = useState("");
-
-  const [companyName, setCompanyName] = useState("");
-  const [industry, setIndustry] = useState(COMPANY_INDUSTRIES[0]);
-  const [fleetSize, setFleetSize] = useState(FLEET_SIZE_RANGES[0]);
-  const [contactName, setContactName] = useState("");
-  const [contactEmail, setContactEmail] = useState(user?.email ?? "");
-  const [contactPhone, setContactPhone] = useState("");
-  const [needs, setNeeds] = useState("");
-
-  const loadMyRequest = useCallback(() => {
-    if (!supabase || !user) return;
-    supabase
-      .from("companies")
-      .select("*")
-      .eq("requestedBy", user.id)
-      .order("createdAt", { ascending: false })
-      .limit(1)
-      .then(({ data }) => setMyRequest(data && data.length > 0 ? data[0] : null));
-  }, [user]);
-
-  useEffect(() => {
-    loadMyRequest();
-  }, [loadMyRequest]);
-
-  async function handleJoin(e) {
-    e.preventDefault();
-    setError("");
-    setLoading(true);
-    try {
-      await joinCompanyWithCode(code);
-      showToast("Te uniste a la empresa correctamente.");
-    } catch (err) {
-      setError(err.message || "Código inválido.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleRequest(e) {
-    e.preventDefault();
-    setError("");
-    if (!companyName.trim() || !contactName.trim() || !contactEmail.trim()) {
-      setError("Completa al menos el nombre de la empresa y los datos de contacto.");
-      return;
-    }
-    setLoading(true);
-    try {
-      await requestCompany({
-        name: companyName.trim(),
-        industry,
-        fleetSize,
-        contactName: contactName.trim(),
-        contactEmail: contactEmail.trim(),
-        contactPhone: contactPhone.trim(),
-        needs: needs.trim(),
-      });
-      loadMyRequest();
-    } catch (err) {
-      setError(err.message || "No se pudo enviar la solicitud.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  if (myRequest === undefined) {
-    return <FullScreenLoader />;
-  }
-
-  if (myRequest && myRequest.status !== "rejected") {
-    return (
-      <AuthLayout>
-        <div className="rounded-lg border border-slate-200 bg-white p-8 text-center shadow-sm">
-          <Clock size={26} className="mx-auto mb-3 text-amber-500" />
-          <h1 className="text-lg font-bold text-slate-900">Solicitud en revisión</h1>
-          <p className="mt-2 text-xs text-slate-500">
-            Tu solicitud para registrar <span className="font-semibold text-slate-700">{myRequest.name}</span> está pendiente de
-            aprobación. Te avisaremos en cuanto quede lista.
-          </p>
-          <button onClick={() => signOut()} className="mt-5 text-xs font-semibold text-blue-600 hover:text-blue-700">
-            Cerrar sesión
-          </button>
-        </div>
-      </AuthLayout>
-    );
-  }
-
-  return (
-    <AuthLayout>
-      <div className="rounded-lg border border-slate-200 bg-white p-8 shadow-sm">
-        <h1 className="text-lg font-bold text-slate-900">Falta un paso</h1>
-        <p className="mt-1.5 text-xs text-slate-500">Tu cuenta todavía no está vinculada a ninguna empresa.</p>
-
-        {myRequest?.status === "rejected" && (
-          <p className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-700">
-            Tu solicitud anterior para "{myRequest.name}" no fue aprobada. Puedes intentar de nuevo o unirte con un código.
-          </p>
-        )}
-
-        <div className="mt-5 flex gap-1.5 rounded-lg bg-slate-100 p-1">
-          {[
-            { id: "join", label: "Tengo un código" },
-            { id: "request", label: "Registrar mi empresa" },
-          ].map((t) => (
-            <button
-              key={t.id}
-              onClick={() => {
-                setError("");
-                setTab(t.id);
-              }}
-              className={`flex-1 rounded-md px-3 py-1.5 text-xs font-semibold transition ${
-                tab === t.id ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-700"
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-
-        {tab === "join" ? (
-          <form onSubmit={handleJoin} className="mt-5 space-y-3">
-            <div>
-              <label className={onboardingLabelClass}>Código de invitación</label>
-              <input
-                value={code}
-                onChange={(e) => setCode(e.target.value.toUpperCase())}
-                placeholder="Ej. DEMO-NAVIO"
-                className={onboardingInputClass}
-              />
-            </div>
-            <AuthErrorMessage message={error} />
-            <button
-              type="submit"
-              disabled={loading || !code.trim()}
-              className="w-full rounded-md bg-blue-600 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
-            >
-              {loading ? "Verificando..." : "Unirme"}
-            </button>
-          </form>
-        ) : (
-          <form onSubmit={handleRequest} className="mt-5 space-y-3">
-            <div>
-              <label className={onboardingLabelClass}>Nombre de la empresa</label>
-              <input value={companyName} onChange={(e) => setCompanyName(e.target.value)} placeholder="Ej. SIISA" className={onboardingInputClass} />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className={onboardingLabelClass}>Giro / industria</label>
-                <select value={industry} onChange={(e) => setIndustry(e.target.value)} className={onboardingInputClass}>
-                  {COMPANY_INDUSTRIES.map((i) => (
-                    <option key={i} value={i}>
-                      {i}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className={onboardingLabelClass}>Tamaño de flota</label>
-                <select value={fleetSize} onChange={(e) => setFleetSize(e.target.value)} className={onboardingInputClass}>
-                  {FLEET_SIZE_RANGES.map((r) => (
-                    <option key={r} value={r}>
-                      {r}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-            <div>
-              <label className={onboardingLabelClass}>Persona de contacto para esta empresa</label>
-              <input value={contactName} onChange={(e) => setContactName(e.target.value)} className={onboardingInputClass} />
-              <p className="mt-1 text-[10px] text-slate-400">
-                No tiene que ser tu nombre de cuenta — es a quién contactar sobre esta empresa dentro de Navío.
-              </p>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className={onboardingLabelClass}>Correo de contacto</label>
-                <input type="email" value={contactEmail} onChange={(e) => setContactEmail(e.target.value)} className={onboardingInputClass} />
-              </div>
-              <div>
-                <label className={onboardingLabelClass}>Teléfono</label>
-                <input value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} className={onboardingInputClass} />
-              </div>
-            </div>
-            <div>
-              <label className={onboardingLabelClass}>¿Qué necesitas de Navío?</label>
-              <textarea
-                value={needs}
-                onChange={(e) => setNeeds(e.target.value)}
-                rows={3}
-                placeholder="Cuéntanos brevemente qué buscas gestionar (mantenimiento, combustible, trámites...)."
-                className={onboardingInputClass}
-              />
-            </div>
-            <AuthErrorMessage message={error} />
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full rounded-md bg-blue-600 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
-            >
-              {loading ? "Enviando..." : "Enviar solicitud"}
-            </button>
-          </form>
-        )}
-
-        <button onClick={() => signOut()} className="mt-5 w-full text-center text-[11px] font-semibold text-slate-400 hover:text-slate-600">
-          Cerrar sesión
-        </button>
-      </div>
-    </AuthLayout>
   );
 }
 
@@ -1218,283 +545,11 @@ const TONE_CLASSES = {
   slate: "bg-slate-100 text-slate-600",
 };
 
-const HEALTH_TONE = (score) =>
-  score >= 80
-    ? { className: "bg-emerald-50 text-emerald-700 ring-emerald-200", label: "Óptimo" }
-    : score >= 50
-    ? { className: "bg-amber-50 text-amber-700 ring-amber-200", label: "Atención" }
-    : { className: "bg-rose-50 text-rose-700 ring-rose-200", label: "Crítico" };
-
 /* ---------------------------------------------------------------------- */
-/*  Mock data — Fleet                                                     */
+/*  Flota: estados y estilos                                             */
 /* ---------------------------------------------------------------------- */
 
-const VEHICLES_FULL = [
-  {
-    id: 1,
-    unit: "Unidad 12",
-    plate: "YZA-142-B",
-    brand: "Kenworth",
-    model: "T680",
-    year: 2022,
-    color: "Blanco",
-    photo: "https://picsum.photos/seed/navio-unidad12/480/280",
-    healthScore: 88,
-    kmActual: 152400,
-    kmProximoServicio: 155000,
-    oilType: "Sintético 15W-40",
-    avgConsumption: 3.8,
-    driver: {
-      name: "Ricardo Pérez",
-      phone: "+52 921 123 4567",
-      photo: "https://api.dicebear.com/7.x/avataaars/svg?seed=RicardoPerez",
-      license: "LIC-8845213",
-      licenseExpiry: "2026-09-02",
-    },
-    insurance: { company: "Qualitas", folio: "QLT-559012", expiry: "2026-11-15", pdfUrl: "#" },
-    circulationCard: { folio: "TC-2026-4471", pdfUrl: "#" },
-    verification: { hologram: "00 (Doble Cero)", validity: "2027-02-28" },
-    warranty: { engine: "Motor Cummins X15 — vigente hasta 2027-06-30", parts: "Piezas de transmisión — vigente hasta 2026-12-31" },
-    documentHistory: [
-      { doc: "Póliza de Seguro (anterior)", expired: "2025-11-15", pdfUrl: "#" },
-      { doc: "Tarjeta de Circulación (anterior)", expired: "2025-04-30", pdfUrl: "#" },
-    ],
-    maintenancePanel: { kmRestante: 2600, coolantType: "Refrigerante Verde", brakesLast: "2026-06-18", oilLast: "2026-07-02" },
-    tires: { frontDepth: 7.2, rearDepth: 5.8, frontSize: "185/60 R15", rearSize: "190/60 R15", psi: 110, lastRotation: "2026-07-15" },
-    history: [
-      { date: "2026-07-02", concept: "Cambio de aceite y filtro", cost: 1850, workshop: "Taller Central Coatzacoalcos" },
-      { date: "2026-06-18", concept: "Cambio de balatas delanteras", cost: 3200, workshop: "Frenos y Diesel del Sur" },
-      { date: "2026-05-10", concept: "Alineación y balanceo", cost: 950, workshop: "Llantas del Golfo" },
-    ],
-    gps: {
-      status: "moving",
-      address: "Carretera Nanchital–Coatzacoalcos, km 8.4",
-      speed: 68,
-      lastUpdate: "hace 2 min",
-      fuelPercent: 62,
-      signalType: "GPS Hardware",
-      x: 30,
-      y: 55,
-      mode: "directo",
-      destination: "Coatzacoalcos",
-      eta: "1.1 hrs",
-      stops: [],
-    },
-    appCapture: { photoUrl: "https://picsum.photos/seed/navio-capture12/480/280", timestamp: "12/08/2026 09:14", driverName: "Ricardo Pérez" },
-  },
-  {
-    id: 2,
-    unit: "Unidad 07",
-    plate: "XKT-880-A",
-    brand: "Freightliner",
-    model: "Cascadia",
-    year: 2020,
-    color: "Gris",
-    photo: "https://picsum.photos/seed/navio-unidad07/480/280",
-    healthScore: 62,
-    kmActual: 208900,
-    kmProximoServicio: 210000,
-    oilType: "Sintético 15W-40",
-    avgConsumption: 3.4,
-    driver: {
-      name: "Lucía Gómez",
-      phone: "+52 921 234 5678",
-      photo: "https://api.dicebear.com/7.x/avataaars/svg?seed=LuciaGomez",
-      license: "LIC-7723190",
-      licenseExpiry: "2026-08-25",
-    },
-    insurance: { company: "GNP Seguros", folio: "GNP-330217", expiry: "2026-08-30", pdfUrl: "#" },
-    circulationCard: { folio: "TC-2025-9012", pdfUrl: "#" },
-    verification: { hologram: "0 (Cero)", validity: "2026-09-30" },
-    warranty: { engine: "Motor Detroit DD15 — vigente hasta 2026-10-01", parts: "Piezas de suspensión — vencida 2026-02-15" },
-    documentHistory: [
-      { doc: "Póliza de Seguro (anterior)", expired: "2025-08-30", pdfUrl: "#" },
-      { doc: "Verificación Vehicular (anterior)", expired: "2026-02-28", pdfUrl: "#" },
-    ],
-    maintenancePanel: { kmRestante: 1100, coolantType: "Refrigerante Rosa (OAT)", brakesLast: "2026-08-08", oilLast: "2026-06-15" },
-    tires: { frontDepth: 6.1, rearDepth: 4.1, frontSize: "185/60 R15", rearSize: "190/60 R15", psi: 105, lastRotation: "2026-05-30" },
-    history: [
-      { date: "2026-08-08", concept: "Cambio de balatas delanteras", cost: 3200, workshop: "Frenos y Diesel del Sur" },
-      { date: "2026-06-15", concept: "Cambio de aceite y filtro", cost: 1780, workshop: "Taller Central Coatzacoalcos" },
-      { date: "2026-04-02", concept: "Reparación de suspensión", cost: 5400, workshop: "Suspensiones del Istmo" },
-    ],
-    gps: {
-      status: "stopped",
-      address: "Bama Solís, Coatzacoalcos",
-      speed: 0,
-      lastUpdate: "hace 8 min",
-      fuelPercent: 18,
-      signalType: "Smartphone App",
-      x: 55,
-      y: 40,
-      mode: "libre",
-      destination: null,
-      eta: null,
-      stops: [{ place: "Bama Solís", time: "17:52" }],
-    },
-    appCapture: { photoUrl: "https://picsum.photos/seed/navio-capture07/480/280", timestamp: "11/08/2026 17:52", driverName: "Lucía Gómez" },
-  },
-  {
-    id: 3,
-    unit: "Unidad 09",
-    plate: "WPL-215-C",
-    brand: "International",
-    model: "LT625",
-    year: 2019,
-    color: "Azul",
-    photo: "https://picsum.photos/seed/navio-unidad09/480/280",
-    healthScore: 41,
-    kmActual: 261300,
-    kmProximoServicio: 262000,
-    oilType: "Mineral 20W-50",
-    avgConsumption: 2.9,
-    driver: {
-      name: "Marco Aguilar",
-      phone: "+52 921 345 6789",
-      photo: "https://api.dicebear.com/7.x/avataaars/svg?seed=MarcoAguilar",
-      license: "LIC-6612044",
-      licenseExpiry: "2027-01-14",
-    },
-    insurance: { company: "AXA Seguros", folio: "AXA-118845", expiry: "2026-09-05", pdfUrl: "#" },
-    circulationCard: { folio: "TC-2025-3387", pdfUrl: "#" },
-    verification: { hologram: "1 (Uno)", validity: "2026-08-31" },
-    warranty: { engine: "Motor Navistar N9 — vencida 2025-12-01", parts: "Piezas de embrague — vencida 2026-01-10" },
-    documentHistory: [
-      { doc: "Tarjeta de Circulación (anterior)", expired: "2024-12-31", pdfUrl: "#" },
-      { doc: "Licencia de Conducir (anterior)", expired: "2025-06-14", pdfUrl: "#" },
-    ],
-    maintenancePanel: { kmRestante: 700, coolantType: "Refrigerante Verde", brakesLast: "2026-07-22", oilLast: "2026-05-20" },
-    tires: { frontDepth: 4.8, rearDepth: 3.6, frontSize: "185/60 R15", rearSize: "190/60 R15", psi: 98, lastRotation: "2026-03-11" },
-    history: [
-      { date: "2026-07-22", concept: "Servicio completo de frenos", cost: 4100, workshop: "Frenos y Diesel del Sur" },
-      { date: "2026-05-20", concept: "Cambio de aceite y filtro", cost: 1650, workshop: "Taller Central Coatzacoalcos" },
-      { date: "2026-02-18", concept: "Cambio de embrague", cost: 7200, workshop: "Transmisiones Golfo" },
-    ],
-    gps: {
-      status: "resting",
-      address: "Patio Nanchital",
-      speed: 0,
-      lastUpdate: "hace 3 h",
-      fuelPercent: 44,
-      signalType: "GPS Hardware",
-      x: 15,
-      y: 75,
-      mode: "libre",
-      destination: null,
-      eta: null,
-      stops: [{ place: "Patio Nanchital", time: "08:30" }],
-    },
-    appCapture: { photoUrl: "https://picsum.photos/seed/navio-capture09/480/280", timestamp: "10/08/2026 08:30", driverName: "Marco Aguilar" },
-  },
-  {
-    id: 4,
-    unit: "Unidad 03",
-    plate: "VJH-004-D",
-    brand: "Volvo",
-    model: "VNL 760",
-    year: 2023,
-    color: "Rojo",
-    photo: "https://picsum.photos/seed/navio-unidad03/480/280",
-    healthScore: 95,
-    kmActual: 64200,
-    kmProximoServicio: 70000,
-    oilType: "Sintético 5W-30",
-    avgConsumption: 4.3,
-    driver: {
-      name: "Diana Ruiz",
-      phone: "+52 921 456 7890",
-      photo: "https://api.dicebear.com/7.x/avataaars/svg?seed=DianaRuiz",
-      license: "LIC-9910238",
-      licenseExpiry: "2027-05-19",
-    },
-    insurance: { company: "Qualitas", folio: "QLT-772104", expiry: "2027-01-20", pdfUrl: "#" },
-    circulationCard: { folio: "TC-2026-1120", pdfUrl: "#" },
-    verification: { hologram: "00 (Doble Cero)", validity: "2027-06-30" },
-    warranty: { engine: "Motor Volvo D13 — vigente hasta 2028-01-15", parts: "Piezas de frenos — vigente hasta 2027-01-20" },
-    documentHistory: [
-      { doc: "Tarjeta de Circulación (anterior)", expired: "2025-01-20", pdfUrl: "#" },
-    ],
-    maintenancePanel: { kmRestante: 5800, coolantType: "Refrigerante Azul (IAT)", brakesLast: "2026-05-02", oilLast: "2026-07-28" },
-    tires: { frontDepth: 8.4, rearDepth: 7.9, frontSize: "185/60 R15", rearSize: "190/60 R15", psi: 112, lastRotation: "2026-07-01" },
-    history: [
-      { date: "2026-08-01", concept: "Verificación vehicular", cost: 850, workshop: "Verificentro Coatzacoalcos" },
-      { date: "2026-07-28", concept: "Revisión de niveles", cost: 0, workshop: "Taller Central Coatzacoalcos" },
-      { date: "2026-05-02", concept: "Cambio de balatas traseras", cost: 2900, workshop: "Frenos y Diesel del Sur" },
-    ],
-    gps: {
-      status: "moving",
-      address: "Av. Independencia, Coatzacoalcos",
-      speed: 42,
-      lastUpdate: "hace 1 min",
-      fuelPercent: 81,
-      signalType: "GPS Hardware",
-      x: 60,
-      y: 65,
-      mode: "directo",
-      destination: "Coatzacoalcos Centro",
-      eta: "22 min",
-      stops: [],
-    },
-    appCapture: { photoUrl: "https://picsum.photos/seed/navio-capture03/480/280", timestamp: "12/08/2026 07:05", driverName: "Diana Ruiz" },
-  },
-  {
-    id: 5,
-    unit: "Unidad 21",
-    plate: "TBN-561-E",
-    brand: "Kenworth",
-    model: "T880",
-    year: 2021,
-    color: "Negro",
-    photo: "https://picsum.photos/seed/navio-unidad21/480/280",
-    healthScore: 74,
-    kmActual: 118750,
-    kmProximoServicio: 121000,
-    oilType: "Sintético 15W-40",
-    avgConsumption: 3.6,
-    driver: {
-      name: "José Torres",
-      phone: "+52 921 567 8901",
-      photo: "https://api.dicebear.com/7.x/avataaars/svg?seed=JoseTorres",
-      license: "LIC-5591027",
-      licenseExpiry: "2026-12-11",
-    },
-    insurance: { company: "GNP Seguros", folio: "GNP-441093", expiry: "2026-10-08", pdfUrl: "#" },
-    circulationCard: { folio: "TC-2026-6650", pdfUrl: "#" },
-    verification: { hologram: "0 (Cero)", validity: "2026-11-30" },
-    warranty: { engine: "Motor Cummins X15 — vigente hasta 2026-09-10", parts: "Piezas de transmisión — vencida 2026-03-05" },
-    documentHistory: [
-      { doc: "Póliza de Seguro (anterior)", expired: "2025-10-08", pdfUrl: "#" },
-      { doc: "Tarjeta de Circulación (anterior)", expired: "2025-12-31", pdfUrl: "#" },
-    ],
-    maintenancePanel: { kmRestante: 2250, coolantType: "Refrigerante Verde", brakesLast: "2026-04-19", oilLast: "2026-06-30" },
-    tires: { frontDepth: 6.6, rearDepth: 5.2, frontSize: "185/60 R15", rearSize: "190/60 R15", psi: 108, lastRotation: "2026-08-05" },
-    history: [
-      { date: "2026-08-05", concept: "Rotación de llantas 4 posiciones", cost: 600, workshop: "Llantas del Golfo" },
-      { date: "2026-06-30", concept: "Cambio de aceite y filtro", cost: 1900, workshop: "Taller Central Coatzacoalcos" },
-      { date: "2026-04-19", concept: "Cambio de balatas delanteras", cost: 3050, workshop: "Frenos y Diesel del Sur" },
-    ],
-    gps: {
-      status: "alert",
-      address: "Puente peatonal, Coatzacoalcos — tráfico intenso",
-      speed: 12,
-      lastUpdate: "hace 30 seg",
-      fuelPercent: 37,
-      signalType: "WhatsApp Share",
-      x: 70,
-      y: 28,
-      mode: "directo",
-      destination: "Coatzacoalcos",
-      eta: "1.2 hrs",
-      stops: [],
-    },
-    appCapture: { photoUrl: "https://picsum.photos/seed/navio-capture21/480/280", timestamp: "12/08/2026 10:47", driverName: "José Torres" },
-  },
-];
 
-// Nota: "resting"/"alert" siguen aquí porque la ficha del vehículo
-// (VehicleGpsPanel, expediente) todavía usa el campo mock "vehicle.gps"
-// como resumen decorativo — es un dato distinto de la posición real
-// que ahora alimenta Mapa en Vivo (tabla vehicle_positions).
 const GPS_STATUS_STYLES = {
   moving: { label: "En Ruta", dot: "bg-emerald-500" },
   stopped: { label: "Detenida", dot: "bg-amber-500" },
@@ -1548,7 +603,7 @@ function timeAgoLabel(iso) {
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Mock data — Maintenance                                               */
+/*  Mantenimiento: categorías y resumen                                  */
 /* ---------------------------------------------------------------------- */
 
 const MAINTENANCE_CATEGORIES = [
@@ -1588,17 +643,9 @@ function getMaintenanceWidgets(records, vehicles) {
   ];
 }
 
-const MAINTENANCE_RECORDS_SEED = [
-  { id: 101, unit: "Unidad 12", plate: "YZA-142-B", category: "engine", concept: "Cambio de aceite y filtro", amount: 1850, date: "2026-08-10", vendor: "Taller Central Coatzacoalcos", invoiceFolio: "FA-33210", origin: "whatsapp", status: "pending", notes: "Reportado por conductor R. Pérez" },
-  { id: 102, unit: "Unidad 07", plate: "XKT-880-A", category: "brakes", concept: "Cambio de balatas delanteras", amount: 3200, date: "2026-08-08", vendor: "Frenos y Diesel del Sur", invoiceFolio: "FA-33198", origin: "telegram", status: "pending", notes: "" },
-  { id: 103, unit: "Unidad 21", plate: "TBN-561-E", category: "tires", concept: "Rotación de llantas 4 posiciones", amount: 600, date: "2026-08-05", vendor: "Llantas del Golfo", invoiceFolio: "FA-33172", origin: "manual", status: "verified", notes: "Registrado por taller interno" },
-  { id: 104, unit: "Unidad 03", plate: "VJH-004-D", category: "paperwork", concept: "Verificación vehicular", amount: 850, date: "2026-08-01", vendor: "Verificentro Coatzacoalcos", invoiceFolio: "FA-33140", origin: "whatsapp", status: "pending", notes: "" },
-  { id: 105, unit: "Unidad 09", plate: "WPL-215-C", category: "brakes", concept: "Servicio completo de frenos", amount: 4100, date: "2026-07-22", vendor: "Frenos y Diesel del Sur", invoiceFolio: "FA-33065", origin: "whatsapp", status: "verified", notes: "Validado por supervisor" },
-  { id: 106, unit: "Unidad 12", plate: "YZA-142-B", category: "engine", concept: "Revisión de niveles", amount: 0, date: "2026-07-28", vendor: "Taller Central Coatzacoalcos", invoiceFolio: "", origin: "manual", status: "verified", notes: "" },
-];
 
 /* ---------------------------------------------------------------------- */
-/*  Mock data — Compliance                                                */
+/*  Trámites: tipos y resumen                                            */
 /* ---------------------------------------------------------------------- */
 
 const COMPLIANCE_DOC_TYPES = ["Tenencia", "Póliza de Seguro", "Verificación Vehicular", "Licencia de Conducir", "Tarjeta de Circulación"];
@@ -1614,25 +661,6 @@ function getComplianceWidgets(records) {
     { id: "license", label: "Licencias Expiradas", icon: User, value: `${licenseExpired} conductor${licenseExpired === 1 ? "" : "es"}`, detail: "Requiere renovación", tone: "red" },
   ];
 }
-const COMPLIANCE_RECORDS_SEED = [
-  { id: 201, unit: "Unidad 12", plate: "YZA-142-B", docType: "Tenencia", concept: "Pago de tenencia estatal 2026", amount: 1850, date: "2026-08-09", dueDate: "2026-08-31", paymentStatus: "Pendiente de Pago", vendor: "Sec. Finanzas Veracruz", invoiceFolio: "TEN-2026-0912", origin: "whatsapp", status: "pending", notes: "" },
-  { id: 202, unit: "Unidad 07", plate: "XKT-880-A", docType: "Póliza de Seguro", concept: "Renovación de póliza anual", amount: 18400, date: "2026-08-02", dueDate: "2026-08-30", paymentStatus: "Pendiente de Pago", vendor: "GNP Seguros", invoiceFolio: "GNP-330217", origin: "manual", status: "verified", notes: "Cotización enviada al cliente" },
-  { id: 203, unit: "Unidad 03", plate: "VJH-004-D", docType: "Verificación Vehicular", concept: "Verificación semestral", amount: 850, date: "2026-08-01", dueDate: "2027-01-31", paymentStatus: "Pagado", vendor: "Verificentro Coatzacoalcos", invoiceFolio: "FA-33140", origin: "whatsapp", status: "verified", notes: "" },
-  { id: 204, unit: "Unidad 09", plate: "WPL-215-C", docType: "Licencia de Conducir", concept: "Renovación licencia federal — M. Aguilar", amount: 2100, date: "2026-07-29", dueDate: "2027-01-14", paymentStatus: "Pagado", vendor: "SICT", invoiceFolio: "LIC-6612044", origin: "telegram", status: "pending", notes: "" },
-  { id: 205, unit: "Unidad 21", plate: "TBN-561-E", docType: "Tarjeta de Circulación", concept: "Refrendo tarjeta de circulación", amount: 620, date: "2026-07-20", dueDate: "2026-12-31", paymentStatus: "Pagado", vendor: "Sec. Finanzas Veracruz", invoiceFolio: "TC-2026-6650", origin: "manual", status: "verified", notes: "" },
-];
-
-/* ---------------------------------------------------------------------- */
-/*  Mock data — Fuel                                                      */
-/* ---------------------------------------------------------------------- */
-
-const FUEL_RECORDS_SEED = [
-  { id: 301, unit: "Unidad 07", plate: "XKT-880-A", station: "Pemex Nanchital", liters: 180, amount: 3960, odometer: 208900, efficiency: 3.4, date: "2026-08-12", vendor: "Pemex Nanchital", invoiceFolio: "T-99021", origin: "whatsapp", status: "pending", notes: "Ticket foto procesado por OCR" },
-  { id: 302, unit: "Unidad 12", plate: "YZA-142-B", station: "Pemex Coatzacoalcos Centro", liters: 210, amount: 4620, odometer: 152400, efficiency: 3.8, date: "2026-08-11", vendor: "Pemex Coatzacoalcos Centro", invoiceFolio: "T-98884", origin: "whatsapp", status: "verified", notes: "" },
-  { id: 303, unit: "Unidad 21", plate: "TBN-561-E", station: "G500 Coatzacoalcos", liters: 195, amount: 4290, odometer: 118750, efficiency: 3.6, date: "2026-08-10", vendor: "G500 Coatzacoalcos", invoiceFolio: "T-98701", origin: "telegram", status: "pending", notes: "" },
-  { id: 304, unit: "Unidad 09", plate: "WPL-215-C", station: "Pemex Nanchital", liters: 165, amount: 3630, odometer: 261300, efficiency: 2.9, date: "2026-08-09", vendor: "Pemex Nanchital", invoiceFolio: "T-98530", origin: "manual", status: "verified", notes: "Capturado por despachador" },
-  { id: 305, unit: "Unidad 03", plate: "VJH-004-D", station: "Pemex Coatzacoalcos Centro", liters: 175, amount: 3850, odometer: 64200, efficiency: 4.3, date: "2026-08-08", vendor: "Pemex Coatzacoalcos Centro", invoiceFolio: "T-98315", origin: "whatsapp", status: "verified", notes: "" },
-];
 
 /* ---------------------------------------------------------------------- */
 /*  Shared UI primitives                                                  */
@@ -1809,7 +837,8 @@ function RecordsTable({ records, columns, onConfirm, onEdit, onDelete, emptyLabe
 // pinta en un <canvas>. Lo que se ve son solo píxeles, de modo que los scripts,
 // enlaces y formularios que traiga un PDF no hacen nada. El documento se pide
 // con la sesión del usuario, sin generar ningún enlace temporal.
-const PDFJS_BASE_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299";
+// El visor de PDF se sirve desde el propio sitio (vendor/pdfjs), no desde un CDN.
+const PDFJS_BASE_URL = "/vendor/pdfjs";
 const DOCUMENT_EXTENSIONS = { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
 const DOCUMENT_ACCEPT = Object.keys(DOCUMENT_EXTENSIONS).join(",");
 const DOCUMENT_TYPE_PROBLEM = "no es un PDF ni una imagen JPG, PNG o WEBP";
@@ -1834,9 +863,10 @@ function blockedDocument(message) {
 let pdfJsPromise = null;
 function loadPdfJs() {
   if (!pdfJsPromise) {
-    pdfJsPromise = import(`${PDFJS_BASE_URL}/legacy/build/pdf.min.mjs`)
+    const moduleUrl = `${PDFJS_BASE_URL}/pdf.min.mjs`;
+    pdfJsPromise = import(moduleUrl)
       .then((pdfjs) => {
-        pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_BASE_URL}/legacy/build/pdf.worker.min.mjs`;
+        pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_BASE_URL}/pdf.worker.min.mjs`;
         return pdfjs;
       })
       .catch((err) => {
@@ -3266,9 +2296,8 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
 /*  Fleet — mosaic view                                                   */
 /* ---------------------------------------------------------------------- */
 
-const TODAY_ISO = "2026-08-12";
 function daysUntil(dateStr) {
-  return Math.round((new Date(dateStr) - new Date(TODAY_ISO)) / (1000 * 60 * 60 * 24));
+  return Math.round((new Date(dateStr) - new Date(localISODate())) / (1000 * 60 * 60 * 24));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -3397,15 +2426,12 @@ const DRIVER_MODES = [
 ];
 
 function VehicleCard({ vehicle, onSelect, isCompanyAdmin, onEdit, onDelete }) {
-  const health = HEALTH_TONE(vehicle.healthScore);
-  const kmPct = Math.min(100, Math.round((vehicle.kmActual / vehicle.kmProximoServicio) * 100));
+  const kmPct = vehicle.kmProximoServicio ? Math.min(100, Math.round((vehicle.kmActual / vehicle.kmProximoServicio) * 100)) : 0;
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
       <div className="relative h-36 w-full overflow-hidden bg-slate-100">
         <VehiclePhoto src={vehicle.photo} alt={vehicle.unit} className="h-full w-full" iconSize={32} />
-        <span className={`absolute right-2 top-2 rounded-full px-2.5 py-1 text-[11px] font-bold ring-1 ${health.className}`}>
-          {vehicle.healthScore}% · {health.label}
-        </span>
+        <VehicleStatusChip vehicle={vehicle} className="absolute right-2 top-2" />
         {isCompanyAdmin && (
           <div className="absolute left-2 top-2 flex gap-1">
             <button
@@ -3439,7 +2465,7 @@ function VehicleCard({ vehicle, onSelect, isCompanyAdmin, onEdit, onDelete }) {
               <User size={14} />
             </span>
           ) : (
-            <img src={vehicle.driver.photo} alt={vehicle.driver.name} className="h-7 w-7 rounded-full bg-slate-100 ring-1 ring-slate-200" />
+            <img src={personPhoto(vehicle.driver.photo, vehicle.driver.name)} alt={vehicle.driver.name} className="h-7 w-7 rounded-full bg-slate-100 ring-1 ring-slate-200" />
           )}
           <span className="text-xs font-medium text-slate-600">{isVariableDriver(vehicle) ? "Chofer variable, según el viaje" : vehicle.driver.name}</span>
         </div>
@@ -3467,14 +2493,13 @@ function VehicleCard({ vehicle, onSelect, isCompanyAdmin, onEdit, onDelete }) {
 }
 
 function FleetPage({ vehicles, onSelectVehicle, onAddClick, isCompanyAdmin, onEditVehicle, onDeleteVehicle }) {
-  const avgHealth = Math.round(vehicles.reduce((s, v) => s + v.healthScore, 0) / vehicles.length);
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold text-slate-900">Gestión de Flota</h1>
           <p className="mt-1 text-sm text-slate-500">
-            {vehicles.length} unidades activas · Salud promedio de flota {avgHealth}%
+            <FleetStatusSummary vehicles={vehicles} />
           </p>
         </div>
         <button
@@ -3505,15 +2530,13 @@ function FleetPage({ vehicles, onSelectVehicle, onAddClick, isCompanyAdmin, onEd
 /* ---------------------------------------------------------------------- */
 
 const EXPEDIENTE_TABS = [
-  { id: "ficha", label: "Ficha & Conductor" },
+  { id: "ficha", label: "Ficha y conductor" },
   { id: "guantera", label: "Trámites" },
-  { id: "mantenimiento", label: "Mantenimiento Preventivo" },
-  { id: "llantas", label: "Llantas y Neumáticos" },
-  { id: "historial", label: "Historial Completo" },
+  { id: "mantenimiento", label: "Servicio" },
+  { id: "llantas", label: "Llantas" },
+  { id: "garantias", label: "Garantías" },
+  { id: "historial", label: "Historial" },
 ];
-
-const DETAIL_DATE_RANGES = ["Últimos 7 días", "Últimos 30 días", "Este trimestre", "Este año"];
-const DETAIL_RANGE_DAYS = { "Últimos 7 días": 7, "Últimos 30 días": 30, "Este trimestre": 90, "Este año": 365 };
 
 function FichaItem({ label, value }) {
   return (
@@ -3547,7 +2570,7 @@ function FichaConductorTab({ vehicle }) {
       <div className="rounded-2xl border border-slate-200 bg-white p-4">
         <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Conductor Asignado</h4>
         <div className="flex items-center gap-3">
-          <img src={vehicle.driver.photo} alt={vehicle.driver.name} className="h-14 w-14 rounded-full bg-slate-100 ring-2 ring-blue-100" />
+          <img src={personPhoto(vehicle.driver.photo, vehicle.driver.name)} alt={vehicle.driver.name} className="h-14 w-14 rounded-full bg-slate-100 ring-2 ring-blue-100" />
           <div>
             <p className="text-sm font-bold text-slate-800">{vehicle.driver.name}</p>
             <p className="flex items-center gap-1 text-xs text-slate-500">
@@ -3589,130 +2612,6 @@ function FichaConductorTab({ vehicle }) {
   );
 }
 
-function DocCard({ icon: Icon, title, rows, pdfUrl, footer }) {
-  const { showToast } = useToast();
-  return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-50 text-blue-600">
-          <Icon size={15} />
-        </span>
-        <h4 className="text-xs font-bold uppercase tracking-wide text-slate-500">{title}</h4>
-      </div>
-      {pdfUrl && (
-        <div className="mb-3 flex h-20 w-full items-center justify-center rounded-lg border border-dashed border-slate-200 bg-slate-50 text-slate-300">
-          <FileText size={26} />
-        </div>
-      )}
-      <div className="space-y-1.5">
-        {rows.map((r) => (
-          <div key={r.label} className="flex items-center justify-between text-xs">
-            <span className="text-slate-400">{r.label}</span>
-            <span className="font-semibold text-slate-700">{r.value}</span>
-          </div>
-        ))}
-      </div>
-      {pdfUrl && (
-        <div className="mt-3 flex gap-2">
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              showToast(`Descarga simulada: ${title}.pdf (no hay archivo real en este demo).`);
-            }}
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-200 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
-          >
-            <Download size={12} /> Descargar PDF
-          </button>
-          <label className="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-slate-200 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
-            <Upload size={12} /> Cargar Documento
-            <input
-              type="file"
-              className="hidden"
-              onClick={(e) => e.stopPropagation()}
-              onChange={(e) => {
-                e.preventDefault();
-                showToast(`Documento recibido para ${title} (guardado solo en esta sesión de demo).`);
-              }}
-            />
-          </label>
-        </div>
-      )}
-      {footer}
-    </div>
-  );
-}
-
-function DocHistoryCollapsible({ documents }) {
-  const [open, setOpen] = useState(false);
-  const { showToast } = useToast();
-  if (!documents || documents.length === 0) return null;
-  return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4">
-      <button onClick={() => setOpen((v) => !v)} className="flex w-full items-center justify-between text-left">
-        <h4 className="text-xs font-bold uppercase tracking-wide text-slate-500">Historial de Documentos Anteriores</h4>
-        {open ? <ChevronUp size={15} className="text-slate-400" /> : <ChevronDown size={15} className="text-slate-400" />}
-      </button>
-      {open && (
-        <div className="mt-3 space-y-1.5">
-          {documents.map((d, i) => (
-            <div key={i} className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs">
-              <div className="min-w-0">
-                <p className="truncate font-semibold text-slate-600">{d.doc}</p>
-                <p className="text-[10px] text-slate-400">Venció {d.expired}</p>
-              </div>
-              <button
-                onClick={(e) => {
-                  e.preventDefault();
-                  showToast(`Descarga simulada: ${d.doc}.pdf`);
-                }}
-                className="flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
-              >
-                <Download size={11} /> PDF
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function GuanteraDigitalTab({ vehicle }) {
-  const { format } = useDateFormat();
-  return (
-    <div className="space-y-4">
-      <DocCard
-        icon={ShieldCheck}
-        title="Póliza de Seguro"
-        pdfUrl={vehicle.insurance.pdfUrl}
-        rows={[
-          { label: "Aseguradora", value: vehicle.insurance.company },
-          { label: "Folio", value: vehicle.insurance.folio },
-          { label: "Vencimiento", value: formatDate(vehicle.insurance.expiry, format) },
-        ]}
-      />
-      <DocCard
-        icon={FileText}
-        title="Tarjeta de Circulación"
-        pdfUrl={vehicle.circulationCard.pdfUrl}
-        rows={[{ label: "Folio", value: vehicle.circulationCard.folio }]}
-      />
-      <DocCard
-        icon={CheckCircle2}
-        title="Verificación Vehicular Ambiental"
-        rows={[
-          { label: "Holograma", value: vehicle.verification.hologram },
-          { label: "Vigencia", value: formatDate(vehicle.verification.validity, format) },
-        ]}
-      />
-      <div className="flex items-center gap-1.5 rounded-xl bg-emerald-50 px-3 py-2.5 text-[11px] font-semibold text-emerald-700">
-        <MessageSquare size={13} /> Sincronizado vía WhatsApp Cloud API 📱
-      </div>
-      <DocHistoryCollapsible documents={vehicle.documentHistory} />
-    </div>
-  );
-}
-
 function ProgressRow({ label, pct, detail, tone = "blue" }) {
   const barTone = tone === "rose" ? "bg-rose-500" : tone === "amber" ? "bg-amber-500" : "bg-blue-600";
   return (
@@ -3728,99 +2627,12 @@ function ProgressRow({ label, pct, detail, tone = "blue" }) {
   );
 }
 
-function MantenimientoPreventivoTab({ vehicle }) {
-  const { format } = useDateFormat();
-  const kmPct = Math.max(4, 100 - Math.round((vehicle.maintenancePanel.kmRestante / 3000) * 100));
-  return (
-    <div className="space-y-4 rounded-2xl border border-slate-200 bg-white p-4">
-      <ProgressRow
-        label="Kilometraje restante para próximo servicio"
-        pct={kmPct}
-        detail={`${vehicle.maintenancePanel.kmRestante.toLocaleString()} km restantes`}
-        tone={vehicle.maintenancePanel.kmRestante < 1500 ? "rose" : "blue"}
-      />
-      <div className="grid grid-cols-2 gap-3 pt-1">
-        <FichaItem label="Tipo de Refrigerante" value={vehicle.maintenancePanel.coolantType} />
-        <FichaItem label="Último Cambio de Frenos" value={formatDate(vehicle.maintenancePanel.brakesLast, format)} />
-        <FichaItem label="Último Cambio de Aceite" value={formatDate(vehicle.maintenancePanel.oilLast, format)} />
-        <FichaItem label="Tipo de Aceite" value={vehicle.oilType} />
-      </div>
-    </div>
-  );
-}
-
-function LlantasTab({ vehicle }) {
-  const { format } = useDateFormat();
-  const rearAlert = vehicle.tires.rearDepth < 4.5;
-  return (
-    <div className="space-y-4">
-      <div className="rounded-2xl border border-slate-200 bg-white p-4">
-        <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Medidas Oficiales de Llanta</h4>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="rounded-xl bg-blue-50 px-3 py-3 text-center ring-1 ring-blue-100">
-            <p className="text-[11px] font-medium text-blue-500">Delanteras</p>
-            <p className="text-2xl font-extrabold text-blue-700">{vehicle.tires.frontSize}</p>
-            <p className="mt-1 text-[11px] font-semibold text-slate-500">{vehicle.tires.frontDepth} mm de piso</p>
-          </div>
-          <div className={`rounded-xl px-3 py-3 text-center ring-1 ${rearAlert ? "bg-rose-50 ring-rose-100" : "bg-blue-50 ring-blue-100"}`}>
-            <p className={`text-[11px] font-medium ${rearAlert ? "text-rose-500" : "text-blue-500"}`}>Traseras</p>
-            <p className={`text-2xl font-extrabold ${rearAlert ? "text-rose-700" : "text-blue-700"}`}>{vehicle.tires.rearSize}</p>
-            <p className={`mt-1 flex items-center justify-center gap-1 text-[11px] font-semibold ${rearAlert ? "text-rose-600" : "text-slate-500"}`}>
-              {vehicle.tires.rearDepth} mm de piso {rearAlert && <AlertTriangle size={13} />}
-            </p>
-            {rearAlert && <p className="mt-0.5 text-[10px] font-semibold text-rose-600">Bajo el mínimo recomendado (4.5 mm)</p>}
-          </div>
-        </div>
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <FichaItem label="Presión (PSI)" value={`${vehicle.tires.psi} PSI`} />
-        <FichaItem label="Última Rotación" value={formatDate(vehicle.tires.lastRotation, format)} />
-      </div>
-    </div>
-  );
-}
-
-function HistorialTab({ vehicle }) {
-  const { format } = useDateFormat();
-  return (
-    <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
-      <table className="w-full text-left text-xs">
-        <thead>
-          <tr className="border-b border-slate-100 text-[11px] uppercase tracking-wide text-slate-400">
-            <th className="px-4 py-3 font-semibold">Fecha</th>
-            <th className="px-4 py-3 font-semibold">Servicio</th>
-            <th className="px-4 py-3 font-semibold">Taller</th>
-            <th className="px-4 py-3 text-right font-semibold">Costo</th>
-          </tr>
-        </thead>
-        <tbody>
-          {vehicle.history.map((h, i) => (
-            <tr key={i} className="border-b border-slate-50 last:border-0">
-              <td className="px-4 py-3 text-slate-500">{formatDate(h.date, format)}</td>
-              <td className="px-4 py-3 font-medium text-slate-700">{h.concept}</td>
-              <td className="px-4 py-3 text-slate-500">{h.workshop}</td>
-              <td className="px-4 py-3 text-right font-semibold text-slate-700">{h.cost ? `$${h.cost.toLocaleString()}` : "—"}</td>
-            </tr>
-          ))}
-          {vehicle.history.length === 0 && (
-            <tr>
-              <td colSpan={4} className="px-4 py-8 text-center text-xs text-slate-400">
-                Sin movimientos en el rango seleccionado.
-              </td>
-            </tr>
-          )}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 function VehiclePanelToggle({ view, setView, showCapture }) {
   const options = [
     { id: "photo", label: "Foto Principal", icon: ImageIcon },
     // Con chofer variable no hay a quién atribuir la captura.
     ...(showCapture ? [{ id: "capture", label: "Captura App / Chofer", icon: Camera }] : []),
-    { id: "gps", label: "Mapa GPS en Vivo", icon: MapPin },
+    { id: "gps", label: "Ubicación", icon: MapPin },
   ];
   return (
     <div className="flex gap-1.5 rounded-xl bg-slate-100 p-1">
@@ -3838,45 +2650,6 @@ function VehiclePanelToggle({ view, setView, showCapture }) {
           </button>
         );
       })}
-    </div>
-  );
-}
-
-function VehicleGpsPanel({ vehicle }) {
-  const s = GPS_STATUS_STYLES[vehicle.gps.status];
-  return (
-    <div className="relative flex h-[420px] flex-col justify-between overflow-hidden rounded-2xl bg-slate-900 p-5 text-white">
-      <div
-        className="absolute inset-0 opacity-30"
-        style={{
-          backgroundImage: "linear-gradient(#334155 1px, transparent 1px), linear-gradient(90deg, #334155 1px, transparent 1px)",
-          backgroundSize: "28px 28px",
-        }}
-      />
-      <div className="relative flex items-center justify-between">
-        <span className="flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11px] font-semibold">
-          <span className={`h-2 w-2 rounded-full ${s.dot} animate-pulse`} /> {s.label}
-        </span>
-        <span className="text-[11px] text-slate-300">{vehicle.gps.lastUpdate}</span>
-      </div>
-      <div className="relative">
-        <span className="flex h-11 w-11 items-center justify-center rounded-full bg-blue-500 ring-8 ring-blue-500/20">
-          <Navigation size={18} />
-        </span>
-      </div>
-      <div className="relative space-y-2 rounded-xl bg-white/10 p-4 backdrop-blur">
-        <p className="flex items-center gap-1.5 text-xs font-semibold">
-          <MapPin size={13} /> {vehicle.gps.address}
-        </p>
-        <div className="grid grid-cols-2 gap-2 pt-1 text-[11px] text-slate-300">
-          <span>
-            Velocidad: <b className="text-white">{vehicle.gps.speed} km/h</b>
-          </span>
-          <span>
-            Motor: <b className="text-white">{s.label}</b>
-          </span>
-        </div>
-      </div>
     </div>
   );
 }
@@ -3951,7 +2724,7 @@ function VehiclePanel({ vehicle, canEdit, onUpdate }) {
           </div>
         </div>
       )}
-      {current === "gps" && <VehicleGpsPanel vehicle={vehicle} />}
+      {current === "gps" && <VehicleLocationPanel vehicle={vehicle} />}
     </div>
   );
 }
@@ -4011,10 +2784,11 @@ function VehicleDetailPage({ vehicle, onBack, isCompanyAdmin, onEdit, onDelete, 
             ))}
           </div>
           {tab === "ficha" && <FichaConductorTab vehicle={vehicle} />}
-          {tab === "guantera" && <GuanteraDigitalTab vehicle={vehicle} />}
-          {tab === "mantenimiento" && <MantenimientoPreventivoTab vehicle={vehicle} />}
-          {tab === "llantas" && <LlantasTab vehicle={vehicle} />}
-          {tab === "historial" && <HistorialTab vehicle={vehicle} />}
+          {tab === "guantera" && <VehicleDocsTab vehicle={vehicle} />}
+          {tab === "mantenimiento" && <VehicleServiceTab vehicle={vehicle} canEdit={isCompanyAdmin} onUpdate={(patch, message) => onUpdate(vehicle.id, patch, message)} />}
+          {tab === "llantas" && <VehicleTiresTab vehicle={vehicle} canEdit={isCompanyAdmin} onUpdate={(patch, message) => onUpdate(vehicle.id, patch, message)} />}
+          {tab === "garantias" && <WarrantiesPanel vehicle={vehicle} />}
+          {tab === "historial" && <VehicleHistoryTab vehicle={vehicle} />}
         </div>
         <div>
           <VehiclePanel vehicle={vehicle} canEdit={isCompanyAdmin} onUpdate={(patch) => onUpdate(vehicle.id, patch)} />
@@ -4119,7 +2893,7 @@ function AddVehicleModal({ vehicles, onSave, onClose }) {
             mode: "fixed",
             name: driverName,
             phone: reassignedFrom ? reassignedFrom.driver.phone : newDriverPhone.trim(),
-            photo: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(driverName)}`,
+            photo: avatarUrl(driverName),
             license: reassignedFrom ? reassignedFrom.driver.license : "",
             licenseExpiry: reassignedFrom ? reassignedFrom.driver.licenseExpiry : "",
           },
@@ -4445,7 +3219,7 @@ function MaintenanceOrdersTable({ records, vehicles, onAddClick, onConfirm, onEd
         <div>
           <h1 className="text-xl font-bold text-slate-900">Órdenes de Trabajo</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Ingesta multicanal por WhatsApp, Telegram y registro manual, con trazabilidad y validación de cada dato.
+            Servicios registrados a mano o recibidos por el bot de Telegram, con el origen y la revisión de cada dato.
           </p>
         </div>
         <button
@@ -4523,7 +3297,14 @@ function MaintenanceOrdersTable({ records, vehicles, onAddClick, onConfirm, onEd
 function MaintenanceUnitCard({ vehicle, records, onViewDetails }) {
   const { format } = useDateFormat();
   const unitPending = records.filter((r) => r.unit === vehicle.unit && r.status === "pending").length;
-  const kmPct = Math.max(4, 100 - Math.round((vehicle.maintenancePanel.kmRestante / 3000) * 100));
+  const lastOf = (category) =>
+    records
+      .filter((r) => r.unit === vehicle.unit && r.category === category)
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)))[0]?.date;
+  const nextKm = Number(vehicle.kmProximoServicio) || 0;
+  const kmLeft = nextKm - (Number(vehicle.kmActual) || 0);
+  const interval = Math.max(Number(vehicle.maintenancePanel?.intervalKm) || 10000, 1);
+  const kmPct = nextKm ? Math.min(100, Math.max(4, 100 - Math.round((kmLeft / interval) * 100))) : 0;
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
       <div className="p-4">
@@ -4545,16 +3326,16 @@ function MaintenanceUnitCard({ vehicle, records, onViewDetails }) {
           <ProgressRow
             label="Próximo servicio por km"
             pct={kmPct}
-            detail={`${vehicle.maintenancePanel.kmRestante.toLocaleString()} km restantes`}
-            tone={vehicle.maintenancePanel.kmRestante < 1500 ? "rose" : "blue"}
+            detail={!nextKm ? "Sin programar" : kmLeft <= 0 ? "Servicio vencido" : `${kmLeft.toLocaleString("es-MX")} km restantes`}
+            tone={nextKm && kmLeft <= 0 ? "rose" : nextKm && kmLeft <= 1500 ? "amber" : "blue"}
           />
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-slate-500">
           <span>
-            Aceite: <b className="text-slate-700">{formatDate(vehicle.maintenancePanel.oilLast, format)}</b>
+            Aceite: <b className="text-slate-700">{formatDate(lastOf("engine"), format)}</b>
           </span>
           <span>
-            Frenos/Balatas: <b className="text-slate-700">{formatDate(vehicle.maintenancePanel.brakesLast, format)}</b>
+            Frenos/Balatas: <b className="text-slate-700">{formatDate(lastOf("brakes"), format)}</b>
           </span>
         </div>
         <button
@@ -4592,167 +3373,10 @@ function MaintenanceUnitsGrid({ vehicles, records, onAddClick, onViewDetails }) 
   );
 }
 
-function FrenosBalatasTab({ vehicle }) {
-  const { format } = useDateFormat();
-  const brakeHistory = vehicle.history.filter((h) => /balata|freno/i.test(h.concept));
-  return (
-    <div className="space-y-4">
-      <div className="rounded-2xl border border-slate-200 bg-white p-4">
-        <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Frenos y Balatas</h4>
-        <FichaItem label="Último Cambio de Frenos / Balatas" value={formatDate(vehicle.maintenancePanel.brakesLast, format)} />
-      </div>
-      {brakeHistory.length > 0 && (
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
-          <h4 className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Historial de Frenos / Balatas</h4>
-          <div className="space-y-1.5">
-            {brakeHistory.map((h, i) => (
-              <div key={i} className="flex items-center justify-between text-xs">
-                <span className="text-slate-600">{h.concept}</span>
-                <span className="text-slate-400">{formatDate(h.date, format)}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function GarantiasTab({ vehicle }) {
-  return (
-    <div className="space-y-3">
-      <div className="rounded-2xl border border-slate-200 bg-white p-4">
-        <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Garantía de Motor</h4>
-        <p className="text-sm font-semibold text-slate-700">{vehicle.warranty.engine}</p>
-      </div>
-      <div className="rounded-2xl border border-slate-200 bg-white p-4">
-        <h4 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-400">Garantía de Piezas</h4>
-        <p className="text-sm font-semibold text-slate-700">{vehicle.warranty.parts}</p>
-      </div>
-    </div>
-  );
-}
-
-const MAINT_UNIT_TABS = [
-  { id: "motor", label: "Motor y Aceite" },
-  { id: "frenos", label: "Frenos y Balatas" },
-  { id: "garantias", label: "Garantías" },
-  { id: "historial", label: "Historial" },
-];
-
-function MaintenanceUnitDetail({ vehicle, onBack }) {
-  const { format } = useDateFormat();
-  const [tab, setTab] = useState("motor");
-  const [dateRange, setDateRange] = useState("Este año");
-  const [dateOpen, setDateOpen] = useState(false);
-
-  const filteredHistory = useMemo(() => {
-    const maxDays = DETAIL_RANGE_DAYS[dateRange];
-    return vehicle.history.filter((h) => (new Date(TODAY_ISO) - new Date(h.date)) / (1000 * 60 * 60 * 24) <= maxDays);
-  }, [vehicle, dateRange]);
-
-  return (
-    <div className="space-y-4">
-      <button onClick={onBack} className="flex items-center gap-1.5 text-sm font-semibold text-blue-600 hover:text-blue-700">
-        <ArrowLeft size={16} /> Volver a Unidades
-      </button>
-
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <VehiclePhoto src={vehicle.photo} alt={vehicle.unit} className="h-12 w-16 rounded-lg ring-1 ring-slate-200" iconSize={16} />
-          <div>
-            <h2 className="text-lg font-bold text-slate-900">
-              {vehicle.unit} <span className="font-medium text-slate-400">· {vehicle.plate}</span>
-            </h2>
-            <p className="text-xs text-slate-500">Mantenimiento independiente de esta unidad</p>
-          </div>
-        </div>
-        {tab === "historial" && (
-          <div className="relative">
-            <button
-              onClick={() => setDateOpen((v) => !v)}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-            >
-              <Calendar size={13} /> {dateRange} <ChevronDown size={13} />
-            </button>
-            {dateOpen && (
-              <div className="absolute right-0 z-20 mt-1.5 w-44 rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg">
-                {DETAIL_DATE_RANGES.map((r) => (
-                  <button
-                    key={r}
-                    onClick={() => {
-                      setDateRange(r);
-                      setDateOpen(false);
-                    }}
-                    className={`block w-full rounded-lg px-2.5 py-1.5 text-left text-xs font-medium hover:bg-blue-50 ${
-                      r === dateRange ? "text-blue-600" : "text-slate-600"
-                    }`}
-                  >
-                    {r}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      <div className="flex flex-wrap gap-1.5 rounded-xl bg-slate-100 p-1">
-        {MAINT_UNIT_TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold transition ${
-              tab === t.id ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-700"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-
-      {tab === "motor" && <MantenimientoPreventivoTab vehicle={vehicle} />}
-      {tab === "frenos" && <FrenosBalatasTab vehicle={vehicle} />}
-      {tab === "garantias" && <GarantiasTab vehicle={vehicle} />}
-      {tab === "historial" && <HistorialTab vehicle={{ ...vehicle, history: filteredHistory }} />}
-    </div>
-  );
-}
-
-function MaintenanceWarrantyView({ vehicles }) {
-  return (
-    <div className="space-y-5">
-      <div>
-        <h1 className="text-xl font-bold text-slate-900">Garantías</h1>
-        <p className="mt-1 text-sm text-slate-500">Vigencia de garantías de motor y piezas por unidad.</p>
-      </div>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        {vehicles.map((v) => (
-          <div key={v.id} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-            <h3 className="text-sm font-bold text-slate-800">
-              {v.unit} <span className="font-medium text-slate-400">· {v.plate}</span>
-            </h3>
-            <div className="mt-3 space-y-2 text-xs">
-              <p>
-                <span className="font-semibold text-slate-500">Motor: </span>
-                <span className="text-slate-700">{v.warranty.engine}</span>
-              </p>
-              <p>
-                <span className="font-semibold text-slate-500">Piezas: </span>
-                <span className="text-slate-700">{v.warranty.parts}</span>
-              </p>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function MaintenanceSection({ view, vehicles, records, onAddClick, onConfirm, onEditClick, onDeleteClick }) {
+function MaintenanceSection({ view, vehicles, records, onAddClick, onConfirm, onEditClick, onDeleteClick, onUpdateVehicle }) {
   const [selectedUnitId, setSelectedUnitId] = useState(null);
 
-  if (view === "garantias") return <MaintenanceWarrantyView vehicles={vehicles} />;
+  if (view === "garantias") return <WarrantiesPage />;
   if (view === "ordenes") {
     return (
       <MaintenanceOrdersTable
@@ -4767,7 +3391,7 @@ function MaintenanceSection({ view, vehicles, records, onAddClick, onConfirm, on
   }
 
   const selectedVehicle = vehicles.find((v) => v.id === selectedUnitId);
-  if (selectedVehicle) return <MaintenanceUnitDetail vehicle={selectedVehicle} onBack={() => setSelectedUnitId(null)} />;
+  if (selectedVehicle) return <MaintenanceUnitDetail vehicle={selectedVehicle} onBack={() => setSelectedUnitId(null)} onUpdate={onUpdateVehicle} />;
   return <MaintenanceUnitsGrid vehicles={vehicles} records={records} onAddClick={onAddClick} onViewDetails={setSelectedUnitId} />;
 }
 
@@ -8243,7 +6867,7 @@ function FuelPage({
 /* ---------------------------------------------------------------------- */
 
 const NAV_ITEMS = [
-  { id: "home", label: "Home / Inicio", icon: Home },
+  { id: "home", label: "Inicio", icon: Home },
   { id: "map", label: "Mapa en vivo", icon: MapPin },
   { id: "fleet", label: "Gestión de flota", icon: Truck },
   { id: "transfers", label: "Traslados", icon: Navigation },
@@ -8269,34 +6893,31 @@ const NAV_ITEMS = [
     ],
   },
   { id: "incidents", label: "Incidencias", icon: AlertTriangle },
+  { id: "messages", label: "Mensajes", icon: MessageSquare },
+  { id: "tasks", label: "Tareas", icon: ClipboardList },
 ];
 
 const BOTTOM_NAV_ITEMS = [
-  { id: "settings", label: "Conf.", icon: Settings },
+  { id: "settings", label: "Configuración", icon: Settings },
   { id: "account", label: "Cuenta", icon: User },
   { id: "support", label: "Comunidad", icon: HelpCircle },
 ];
 
 const PAGE_META = {
-  home: { title: "Home / Inicio", subtitle: "Dashboard general con KPIs globales de la flota." },
-  map: { title: "Mapa en Vivo", subtitle: "Torre de control y telemetría en tiempo real." },
+  home: { title: "Inicio", subtitle: "Lo que pasa hoy en tu operación y lo que necesita atención." },
+  map: { title: "Mapa en vivo", subtitle: "Dónde está cada unidad y el recorrido de sus viajes." },
   fleet: { title: "Gestión de Flota", subtitle: "Mosaico de unidades y expediente digital por vehículo." },
   transfers: { title: "Traslados", subtitle: "Asignación de viajes, rutas y carga por unidad." },
   maintenance: { title: "Mantenimiento", subtitle: "Desglose por unidad: servicios, garantías y órdenes de trabajo." },
   incidents: { title: "Incidencias", subtitle: "Reporte de fallos y emergencias en ruta." },
+  messages: { title: "Mensajes", subtitle: "Conversaciones entre las personas de tu empresa." },
+  tasks: { title: "Tareas", subtitle: "Pendientes asignados a cada persona." },
   compliance: { title: "Trámites", subtitle: "Tenencias, pólizas, verificaciones y licencias al día." },
   fuel: { title: "Facturas y Gastos", subtitle: "Consumo de combustible, consumibles, refrigerante, refacciones y casetas." },
-  settings: { title: "Configuración", subtitle: "Preferencias regionales y de notificaciones de la plataforma." },
-  account: { title: "Cuenta", subtitle: "Perfil y permisos del usuario activo." },
+  settings: { title: "Configuración", subtitle: "Tu empresa, tu equipo, el bot y la seguridad de la información." },
+  account: { title: "Cuenta", subtitle: "Tu perfil, tu seguridad y tus datos." },
   support: { title: "Comunidad", subtitle: "Comunidad y soporte técnico de Navio." },
-  admin: { title: "Administración", subtitle: "Aprobación de empresas y gestión de la plataforma Navío." },
-};
-
-const COMPANY_STATUS_META = {
-  pending: { label: "Pendiente", className: "bg-amber-50 text-amber-700 ring-1 ring-amber-200" },
-  approved: { label: "Aprobada", className: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200" },
-  rejected: { label: "Rechazada", className: "bg-rose-50 text-rose-700 ring-1 ring-rose-200" },
-  suspended: { label: "Suspendida", className: "bg-slate-100 text-slate-600 ring-1 ring-slate-200" },
+  admin: { title: "Administración", subtitle: "Empresas, suspensiones y solicitudes de privacidad." },
 };
 
 /* ---------------------------------------------------------------------- */
@@ -8374,96 +6995,6 @@ function MiniLineChart({ points }) {
   );
 }
 
-const DEFAULT_HOME_SHORTCUTS = [
-  { id: "garantia", label: "Garantía", icon: ShieldCheck, tab: "maintenance", sub: "garantias" },
-  { id: "facturaComb", label: "Factura Comb", icon: Receipt, tab: "fuel", sub: null },
-  { id: "merida", label: "Mérida", icon: Navigation, tab: "transfers", sub: null },
-];
-
-const HOME_NAV_TARGET_OPTIONS = NAV_ITEMS.flatMap((item) =>
-  item.children
-    ? item.children.map((c) => ({ value: `${item.id}|${c.id}`, label: `${item.label} — ${c.label}` }))
-    : [{ value: `${item.id}|`, label: item.label }]
-);
-
-function AnnouncementEditModal({ title, text, onSave, onClose }) {
-  const [draftTitle, setDraftTitle] = useState(title);
-  const [draftText, setDraftText] = useState(text);
-  const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
-  const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
-  return (
-    <Modal title="Editar Anuncio / Novedades" onClose={onClose}>
-      <div className="space-y-3">
-        <div>
-          <label className={labelClass}>Título</label>
-          <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} className={inputClass} />
-        </div>
-        <div>
-          <label className={labelClass}>Mensaje</label>
-          <textarea value={draftText} onChange={(e) => setDraftText(e.target.value)} rows={3} className={inputClass} />
-        </div>
-        <p className="flex items-center gap-1.5 rounded-lg bg-blue-50 px-2.5 py-2 text-[11px] font-medium text-blue-700">
-          <ShieldCheck size={13} /> Visible para todos. Editable solo por administradores o el equipo de Navio.
-        </p>
-        <div className="flex justify-end gap-2 pt-1">
-          <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
-            Cancelar
-          </button>
-          <button
-            onClick={() => onSave({ title: draftTitle, text: draftText })}
-            className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700"
-          >
-            Guardar
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function ShortcutAddModal({ onSave, onClose }) {
-  const [label, setLabel] = useState("");
-  const [target, setTarget] = useState(HOME_NAV_TARGET_OPTIONS[0]?.value ?? "");
-  const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
-  const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
-
-  function handleSubmit(e) {
-    e.preventDefault();
-    if (!label.trim()) return;
-    const [tab, sub] = target.split("|");
-    onSave({ id: `custom-${Date.now()}`, label: label.trim(), icon: ChevronRight, tab, sub: sub || null });
-  }
-
-  return (
-    <Modal title="Agregar Acceso Rápido" onClose={onClose}>
-      <form onSubmit={handleSubmit} className="space-y-3">
-        <div>
-          <label className={labelClass}>Nombre del acceso</label>
-          <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder='Ej. "Garantías Mérida"' className={inputClass} />
-        </div>
-        <div>
-          <label className={labelClass}>Sección destino</label>
-          <select value={target} onChange={(e) => setTarget(e.target.value)} className={inputClass}>
-            {HOME_NAV_TARGET_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="flex justify-end gap-2 pt-1">
-          <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
-            Cancelar
-          </button>
-          <button type="submit" className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
-            Agregar
-          </button>
-        </div>
-      </form>
-    </Modal>
-  );
-}
-
 function HomeChartSlot({ metricKey, metrics, onChangeMetric }) {
   const metric = metrics[metricKey];
   return (
@@ -8495,1064 +7026,6 @@ function HomeChartSlot({ metricKey, metrics, onChangeMetric }) {
   );
 }
 
-const HOME_KPI_ICONS = { km: Navigation, fuel: Droplet, cargo: Truck, opCosts: DollarSign, maintCost: Wrench, docCost: ShieldCheck, health: Activity };
-
-function HomePage({ vehicles, maintenanceRecords, complianceRecords, fuelRecords, trips, onSelectVehicle, onNavigate, userName }) {
-  const isAdmin = true; // Cualquier usuario autenticado es tratado como administrador — todavía no hay tabla de roles en Supabase.
-
-  const [announcement, setAnnouncement] = useState({
-    title: "Nuevas funciones de telemetría",
-    text: "Ahora puedes ver el estado de anti-jamming GPS en tiempo real desde el Mapa en Vivo.",
-  });
-  const [announcementModalOpen, setAnnouncementModalOpen] = useState(false);
-
-  const [dateRange, setDateRange] = useState("Este año");
-  const [dateOpen, setDateOpen] = useState(false);
-
-  const [visibleKpis, setVisibleKpis] = useState({
-    km: true,
-    fuel: true,
-    cargo: true,
-    opCosts: true,
-    maintCost: false,
-    docCost: false,
-    health: false,
-  });
-  const [kpiModalOpen, setKpiModalOpen] = useState(false);
-
-  const [shortcuts, setShortcuts] = useState(DEFAULT_HOME_SHORTCUTS);
-  const [shortcutModalOpen, setShortcutModalOpen] = useState(false);
-
-  const [chartMetric1, setChartMetric1] = useState("km");
-  const [chartMetric2, setChartMetric2] = useState("fuelLiters");
-  const [chartMetric3, setChartMetric3] = useState("maintenanceCost");
-
-  function toggleKpi(id) {
-    setVisibleKpis((prev) => ({ ...prev, [id]: !prev[id] }));
-  }
-
-  const criticalAlerts = vehicles.filter(
-    (v) => v.healthScore < 60 || v.tires.rearDepth < 4.5 || daysUntil(v.driver.licenseExpiry) <= 30
-  );
-
-  const maxDays = DETAIL_RANGE_DAYS[dateRange];
-  const inRange = (dateStr) => (new Date(TODAY_ISO) - new Date(dateStr)) / (1000 * 60 * 60 * 24) <= maxDays;
-  const rangedFuel = fuelRecords.filter((r) => inRange(r.date));
-  const rangedMaintenance = maintenanceRecords.filter((r) => inRange(r.date));
-  const rangedCompliance = complianceRecords.filter((r) => inRange(r.date));
-
-  const kmRecorridos = vehicles.reduce((s, v) => s + v.kmActual, 0);
-  const consumoTotal = rangedFuel.reduce((s, r) => s + r.liters, 0);
-  const cargaActiva = trips.filter((t) => t.status === "ongoing").length;
-  const costoMantenimiento = rangedMaintenance.reduce((s, r) => s + r.amount, 0);
-  const costoTramites = rangedCompliance.reduce((s, r) => s + r.amount, 0);
-  const costoCombustible = rangedFuel.reduce((s, r) => s + r.amount, 0);
-  const costosOperativos = costoMantenimiento + costoTramites + costoCombustible;
-  const saludPromedio = Math.round(vehicles.reduce((s, v) => s + v.healthScore, 0) / vehicles.length);
-
-  const HOME_KPIS = [
-    { id: "km", label: "Kilómetros Recorridos", value: `${kmRecorridos.toLocaleString()} km`, detail: "Total acumulado de flota", icon: HOME_KPI_ICONS.km, tone: "blue" },
-    { id: "fuel", label: "Consumo Total", value: `${consumoTotal.toLocaleString()} L`, detail: dateRange, icon: HOME_KPI_ICONS.fuel, tone: "sky" },
-    { id: "cargo", label: "Carga Activa", value: cargaActiva, detail: "Traslados en curso", icon: HOME_KPI_ICONS.cargo, tone: "emerald" },
-    { id: "opCosts", label: "Costos Operativos", value: `$${costosOperativos.toLocaleString()}`, detail: dateRange, icon: HOME_KPI_ICONS.opCosts, tone: "blue" },
-    { id: "maintCost", label: "Costo de Mantenimiento", value: `$${costoMantenimiento.toLocaleString()}`, detail: dateRange, icon: HOME_KPI_ICONS.maintCost, tone: "amber" },
-    { id: "docCost", label: "Costo de Trámites", value: `$${costoTramites.toLocaleString()}`, detail: dateRange, icon: HOME_KPI_ICONS.docCost, tone: "slate" },
-    {
-      id: "health",
-      label: "Salud Promedio de Flota",
-      value: `${saludPromedio}%`,
-      detail: "Estado actual",
-      icon: HOME_KPI_ICONS.health,
-      tone: saludPromedio >= 80 ? "emerald" : saludPromedio >= 50 ? "amber" : "red",
-    },
-  ];
-
-  const kmByUnit = vehicles.map((v) => ({ label: v.unit.replace("Unidad ", "U"), value: v.kmActual }));
-  const litersByUnit = vehicles.map((v) => ({
-    label: v.unit.replace("Unidad ", "U"),
-    value: rangedFuel.filter((r) => r.unit === v.unit).reduce((s, r) => s + r.liters, 0),
-  }));
-  const fuelCostTrend = [...rangedFuel].sort((a, b) => new Date(a.date) - new Date(b.date)).map((r) => ({ label: r.date.slice(5), value: r.amount }));
-  const maintenanceCostTrend = [...rangedMaintenance]
-    .sort((a, b) => new Date(a.date) - new Date(b.date))
-    .map((r) => ({ label: r.date.slice(5), value: r.amount }));
-  const complianceCostTrend = [...rangedCompliance]
-    .sort((a, b) => new Date(a.date) - new Date(b.date))
-    .map((r) => ({ label: r.date.slice(5), value: r.amount }));
-  const waitingSegments = [
-    { label: "En espera", value: vehicles.filter((v) => v.gps.status === "stopped" || v.gps.status === "resting").length, color: "#f59e0b" },
-    { label: "En ruta", value: vehicles.filter((v) => v.gps.status === "moving").length, color: "#10b981" },
-    { label: "Alerta", value: vehicles.filter((v) => v.gps.status === "alert").length, color: "#f43f5e" },
-  ];
-
-  const chartMetrics = {
-    km: { label: "Kilómetros Recorridos por Unidad", type: "bar", data: kmByUnit },
-    fuelLiters: { label: "Consumo de Combustible (L)", type: "bar", data: litersByUnit },
-    fuelCost: { label: "Costo de Combustible — Tendencia", type: "line", data: fuelCostTrend },
-    maintenanceCost: { label: "Costo de Mantenimiento — Tendencia", type: "line", data: maintenanceCostTrend },
-    complianceCost: { label: "Costo de Trámites — Tendencia", type: "line", data: complianceCostTrend },
-    waiting: { label: "Vehículos en Espera", type: "donut", data: waitingSegments },
-  };
-
-  return (
-    <div className="space-y-5">
-      <div>
-        <h1 className="text-xl font-bold text-slate-900">¡Qué gusto verte de nuevo, {userName}!</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          Resumen ejecutivo de operaciones de tu flotilla — hoy, 12 de agosto de 2026.
-          {criticalAlerts.length > 0 && (
-            <>
-              {" "}
-              <button onClick={() => onSelectVehicle(criticalAlerts[0].id)} className="font-semibold text-rose-600 hover:underline">
-                {criticalAlerts.length} unidad{criticalAlerts.length > 1 ? "es" : ""} con alertas críticas →
-              </button>
-            </>
-          )}
-        </p>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        <div className="relative rounded-2xl border border-slate-200 bg-white p-4 shadow-sm lg:col-span-2">
-          {isAdmin && (
-            <button
-              onClick={() => setAnnouncementModalOpen(true)}
-              title="Editar anuncio (solo administradores)"
-              className="absolute right-4 top-4 flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
-            >
-              <Edit2 size={14} />
-            </button>
-          )}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div className="pr-8">
-              <h2 className="text-sm font-bold text-slate-800">{announcement.title}</h2>
-              <p className="mt-2 text-xs text-slate-500">{announcement.text}</p>
-              <button onClick={() => onNavigate("map")} className="mt-3 text-xs font-semibold text-blue-600 hover:text-blue-700">
-                Ver más →
-              </button>
-            </div>
-            <div className="flex gap-2 overflow-x-auto pb-1">
-              {vehicles.map((v) => (
-                <button key={v.id} onClick={() => onSelectVehicle(v.id)} className="shrink-0" title={v.unit}>
-                  <VehiclePhoto src={v.photo} alt={v.unit} className="h-20 w-28 rounded-lg ring-1 ring-slate-200 hover:ring-blue-300" iconSize={16} />
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-sm font-bold text-slate-800">General information</h2>
-            <div className="flex items-center gap-1.5">
-              <div className="relative">
-                <button
-                  onClick={() => setDateOpen((v) => !v)}
-                  className="flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[10px] font-medium text-slate-500 hover:bg-slate-50"
-                >
-                  <Calendar size={11} /> {dateRange} <ChevronDown size={11} />
-                </button>
-                {dateOpen && (
-                  <div className="absolute right-0 z-20 mt-1.5 w-40 rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg">
-                    {DETAIL_DATE_RANGES.map((r) => (
-                      <button
-                        key={r}
-                        onClick={() => {
-                          setDateRange(r);
-                          setDateOpen(false);
-                        }}
-                        className={`block w-full rounded-lg px-2.5 py-1.5 text-left text-[11px] font-medium hover:bg-blue-50 ${
-                          r === dateRange ? "text-blue-600" : "text-slate-600"
-                        }`}
-                      >
-                        {r}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <button
-                onClick={() => setKpiModalOpen(true)}
-                title="Personalizar métricas"
-                className="flex h-6 w-6 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50"
-              >
-                <Settings size={12} />
-              </button>
-              <button
-                onClick={() => setShortcutModalOpen(true)}
-                title="Agregar acceso rápido"
-                className="flex h-6 w-6 items-center justify-center rounded-full bg-blue-600 text-white hover:bg-blue-700"
-              >
-                <Plus size={13} />
-              </button>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-2">
-            {HOME_KPIS.filter((k) => visibleKpis[k.id]).map((k) => (
-              <KpiCard key={k.id} widget={k} />
-            ))}
-            {HOME_KPIS.every((k) => !visibleKpis[k.id]) && (
-              <p className="col-span-full py-4 text-center text-xs text-slate-400">
-                Sin métricas visibles. Actívalas desde el ícono de ajustes.
-              </p>
-            )}
-          </div>
-
-          <div className="mt-4 border-t border-slate-100 pt-3">
-            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Accesos Rápidos</p>
-            <div className="grid grid-cols-3 gap-2">
-              {shortcuts.map((s) => {
-                const Icon = s.icon;
-                return (
-                  <button
-                    key={s.id}
-                    onClick={() => onNavigate(s.tab, s.sub)}
-                    className="flex flex-col items-center gap-1.5 rounded-xl border border-slate-100 p-2 text-center hover:border-blue-200 hover:bg-blue-50/50"
-                  >
-                    <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-50 text-blue-600">
-                      <Icon size={13} />
-                    </span>
-                    <span className="text-[10px] font-medium leading-tight text-slate-600">{s.label}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        <HomeChartSlot metricKey={chartMetric1} metrics={chartMetrics} onChangeMetric={setChartMetric1} />
-        <HomeChartSlot metricKey={chartMetric2} metrics={chartMetrics} onChangeMetric={setChartMetric2} />
-        <HomeChartSlot metricKey={chartMetric3} metrics={chartMetrics} onChangeMetric={setChartMetric3} />
-      </div>
-
-      {announcementModalOpen && (
-        <AnnouncementEditModal
-          title={announcement.title}
-          text={announcement.text}
-          onSave={(next) => {
-            setAnnouncement(next);
-            setAnnouncementModalOpen(false);
-          }}
-          onClose={() => setAnnouncementModalOpen(false)}
-        />
-      )}
-
-      {kpiModalOpen && (
-        <WidgetSettingsModal
-          widgets={HOME_KPIS}
-          visible={visibleKpis}
-          onToggle={toggleKpi}
-          onClose={() => setKpiModalOpen(false)}
-        />
-      )}
-
-      {shortcutModalOpen && (
-        <ShortcutAddModal
-          onSave={(s) => {
-            setShortcuts((prev) => [...prev, s]);
-            setShortcutModalOpen(false);
-          }}
-          onClose={() => setShortcutModalOpen(false)}
-        />
-      )}
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
-/*  Mapa en vivo — Torre de Control                                       */
-/* ---------------------------------------------------------------------- */
-
-const MAP_MARKER_COLOR = { moving: "#10b981", stopped: "#f59e0b", offline: "#94a3b8" };
-const DEFAULT_MAP_CENTER = [18.1345, -94.4269]; // Coatzacoalcos, Veracruz
-
-function useLivePositions() {
-  const [positions, setPositions] = useState({});
-
-  useEffect(() => {
-    if (!supabase) return;
-    let cancelled = false;
-    supabase
-      .from("vehicle_positions")
-      .select("*")
-      .then(({ data }) => {
-        if (cancelled || !data) return;
-        const map = {};
-        data.forEach((p) => {
-          map[p.vehicleId] = p;
-        });
-        setPositions(map);
-      });
-    const channel = supabase
-      .channel("vehicle_positions_live")
-      .on("postgres_changes", { event: "*", schema: "public", table: "vehicle_positions" }, (payload) => {
-        setPositions((prev) => {
-          if (payload.eventType === "DELETE") {
-            const next = { ...prev };
-            delete next[payload.old.vehicleId];
-            return next;
-          }
-          return { ...prev, [payload.new.vehicleId]: payload.new };
-        });
-      })
-      .subscribe();
-    return () => {
-      cancelled = true;
-      supabase.removeChannel(channel);
-    };
-  }, []);
-
-  return positions;
-}
-
-function LeafletMap({ markers, routePolyline, onSelectMarker }) {
-  const containerRef = useRef(null);
-  const mapRef = useRef(null);
-  const markersRef = useRef({});
-  const polylineRef = useRef(null);
-  const firstFitRef = useRef(false);
-
-  useEffect(() => {
-    if (!containerRef.current || mapRef.current || !window.L) return;
-    const map = window.L.map(containerRef.current, { zoomControl: true }).setView(DEFAULT_MAP_CENTER, 12);
-    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-      maxZoom: 19,
-    }).addTo(map);
-    mapRef.current = map;
-    return () => {
-      map.remove();
-      mapRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !window.L) return;
-    const seen = new Set();
-    markers.forEach((m) => {
-      seen.add(m.id);
-      const color = MAP_MARKER_COLOR[m.status];
-      const icon = window.L.divIcon({
-        className: "",
-        html: `<div style="width:16px;height:16px;border-radius:50%;background:${color};border:3px solid white;box-shadow:0 1px 4px rgba(0,0,0,.45)"></div>`,
-        iconSize: [16, 16],
-        iconAnchor: [8, 8],
-      });
-      let marker = markersRef.current[m.id];
-      if (!marker) {
-        marker = window.L.marker([m.lat, m.lng], { icon }).addTo(map);
-        marker.on("click", () => onSelectMarker(m.id));
-        marker.bindTooltip(m.label, { direction: "top", offset: [0, -6] });
-        markersRef.current[m.id] = marker;
-      } else {
-        marker.setLatLng([m.lat, m.lng]);
-        marker.setIcon(icon);
-      }
-    });
-    Object.keys(markersRef.current).forEach((id) => {
-      if (!seen.has(Number(id))) {
-        markersRef.current[id].remove();
-        delete markersRef.current[id];
-      }
-    });
-    if (!firstFitRef.current && markers.length > 0) {
-      firstFitRef.current = true;
-      const bounds = window.L.latLngBounds(markers.map((m) => [m.lat, m.lng]));
-      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
-    }
-  }, [markers, onSelectMarker]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !window.L) return;
-    if (polylineRef.current) {
-      polylineRef.current.remove();
-      polylineRef.current = null;
-    }
-    if (routePolyline && routePolyline.length > 1) {
-      const line = window.L.polyline(routePolyline.map((p) => [p.lat, p.lng]), { color: "#2563eb", weight: 4 }).addTo(map);
-      polylineRef.current = line;
-      map.fitBounds(line.getBounds(), { padding: [40, 40] });
-    }
-  }, [routePolyline]);
-
-  return <div ref={containerRef} className="absolute inset-0" />;
-}
-
-function useVehicleRoutes(vehicleId) {
-  const [routes, setRoutes] = useState([]);
-  const [loading, setLoading] = useState(false);
-
-  const load = useCallback(() => {
-    if (!supabase || !vehicleId) {
-      setRoutes([]);
-      return;
-    }
-    setLoading(true);
-    supabase
-      .from("routes")
-      .select("*")
-      .eq("vehicleId", vehicleId)
-      .eq("status", "completed")
-      .order("startedAt", { ascending: false })
-      .limit(15)
-      .then(({ data }) => {
-        setRoutes(data ?? []);
-        setLoading(false);
-      });
-  }, [vehicleId]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  return { routes, loading };
-}
-
-function RouteHistoryPanel({ vehicle, onSelectRoute, selectedRouteId }) {
-  const { routes, loading } = useVehicleRoutes(vehicle?.id);
-
-  return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h3 className="mb-3 text-sm font-bold text-slate-800">Historial de Rutas — {vehicle.unit}</h3>
-      {loading ? (
-        <p className="text-xs text-slate-400">Cargando...</p>
-      ) : routes.length === 0 ? (
-        <p className="text-xs text-slate-400">Sin rutas guardadas todavía para esta unidad.</p>
-      ) : (
-        <div className="space-y-1.5">
-          {routes.map((r) => (
-            <button
-              key={r.id}
-              onClick={() => onSelectRoute(selectedRouteId === r.id ? null : r.id)}
-              className={`flex w-full items-center justify-between rounded-xl border px-3 py-2 text-left text-xs transition ${
-                selectedRouteId === r.id ? "border-blue-300 bg-blue-50" : "border-slate-200 hover:border-blue-200"
-              }`}
-            >
-              <span className="font-semibold text-slate-700">
-                {new Date(r.startedAt).toLocaleDateString("es-MX")} · {r.driverName || "Conductor sin nombre"}
-              </span>
-              <span className="text-slate-500">{r.distanceKm != null ? `${r.distanceKm.toFixed(1)} km` : "—"}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function useDriverTracking(vehicleId) {
-  const { profile, user } = useAuth();
-  const { showToast } = useToast();
-  const [tracking, setTracking] = useState(false);
-  const [pointCount, setPointCount] = useState(0);
-  const [lastFix, setLastFix] = useState(null);
-  const [error, setError] = useState("");
-  const watchIdRef = useRef(null);
-  const lastSentRef = useRef(0);
-  const routeIdRef = useRef(null);
-  const vehicleIdRef = useRef(vehicleId);
-
-  useEffect(() => {
-    vehicleIdRef.current = vehicleId;
-  }, [vehicleId]);
-
-  useEffect(() => {
-    return () => {
-      if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
-    };
-  }, []);
-
-  async function handleFix(pos) {
-    const now = Date.now();
-    if (now - lastSentRef.current < 8000) return;
-    lastSentRef.current = now;
-    const { latitude, longitude, speed, heading, accuracy } = pos.coords;
-    const speedKmh = speed != null && speed >= 0 ? speed * 3.6 : null;
-    setLastFix({ lat: latitude, lng: longitude, speed: speedKmh });
-
-    const currentRouteId = routeIdRef.current;
-    const currentVehicleId = vehicleIdRef.current;
-    if (!currentRouteId || !currentVehicleId) return;
-
-    await supabase.from("vehicle_positions").upsert({
-      vehicleId: currentVehicleId,
-      companyId: profile.companyId,
-      routeId: currentRouteId,
-      lat: latitude,
-      lng: longitude,
-      speed: speedKmh,
-      heading,
-      accuracy,
-      source: "phone",
-      recordedAt: new Date().toISOString(),
-    });
-
-    await supabase.from("route_points").insert({
-      routeId: currentRouteId,
-      companyId: profile.companyId,
-      lat: latitude,
-      lng: longitude,
-      speed: speedKmh,
-      heading,
-      accuracy,
-      source: "phone",
-    });
-
-    setPointCount((c) => c + 1);
-  }
-
-  async function start() {
-    if (!vehicleId) return;
-    if (!navigator.geolocation) {
-      setError("Este navegador no soporta geolocalización.");
-      return;
-    }
-    setError("");
-    try {
-      const { data, error: insertError } = await supabase
-        .from("routes")
-        .insert({
-          vehicleId,
-          companyId: profile.companyId,
-          driverName: user?.user_metadata?.full_name?.trim() || user?.email,
-          status: "active",
-          createdBy: user.id,
-        })
-        .select()
-        .single();
-      if (insertError) throw insertError;
-      routeIdRef.current = data.id;
-      setPointCount(0);
-      setTracking(true);
-      watchIdRef.current = navigator.geolocation.watchPosition(
-        handleFix,
-        (geoErr) => setError(`Error de geolocalización: ${geoErr.message}`),
-        { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 }
-      );
-    } catch (err) {
-      setError(`No se pudo iniciar la ruta: ${err.message}`);
-    }
-  }
-
-  async function stop() {
-    if (watchIdRef.current != null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-    setTracking(false);
-    const closingRouteId = routeIdRef.current;
-    routeIdRef.current = null;
-    if (!closingRouteId) return;
-    try {
-      const { data: points } = await supabase
-        .from("route_points")
-        .select("lat, lng")
-        .eq("routeId", closingRouteId)
-        .order("recordedAt", { ascending: true });
-      let distanceKm = 0;
-      if (points && points.length > 1) {
-        for (let i = 1; i < points.length; i++) distanceKm += haversineKm(points[i - 1], points[i]);
-      }
-      await supabase.from("routes").update({ status: "completed", endedAt: new Date().toISOString(), distanceKm }).eq("id", closingRouteId);
-      showToast(`Ruta guardada — ${distanceKm.toFixed(1)} km recorridos, ${pointCount} puntos.`);
-    } catch (err) {
-      showToast(`Error al cerrar la ruta: ${err.message}`);
-    }
-  }
-
-  return { tracking, pointCount, lastFix, error, start, stop };
-}
-
-function DriverModeModal({ vehicles, onClose }) {
-  const [vehicleId, setVehicleId] = useState(vehicles[0]?.id ?? null);
-  const { tracking, pointCount, lastFix, error, start, stop } = useDriverTracking(vehicleId);
-
-  return (
-    <Modal title="Modo Conductor" onClose={tracking ? () => {} : onClose} width="max-w-sm">
-      <div className="space-y-4">
-        <p className="text-xs text-slate-500">Deja esta pantalla abierta mientras manejas — el rastreo se detiene si sales de aquí.</p>
-        <div>
-          <label className="mb-1 block text-[11px] font-semibold text-slate-500">Unidad</label>
-          <select
-            value={vehicleId ?? ""}
-            onChange={(e) => setVehicleId(Number(e.target.value))}
-            disabled={tracking}
-            className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none disabled:bg-slate-50"
-          >
-            {vehicles.map((v) => (
-              <option key={v.id} value={v.id}>
-                {v.unit} — {v.plate}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        {tracking ? (
-          <div className="space-y-1.5 rounded-xl bg-emerald-50 p-3 text-xs text-emerald-700 ring-1 ring-emerald-200">
-            <p className="flex items-center gap-1.5 font-semibold">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" /> Rastreando en vivo
-            </p>
-            <p>Puntos registrados: {pointCount}</p>
-            {lastFix && (
-              <p>
-                Última posición: {lastFix.lat.toFixed(5)}, {lastFix.lng.toFixed(5)}
-                {lastFix.speed != null && ` · ${lastFix.speed.toFixed(0)} km/h`}
-              </p>
-            )}
-          </div>
-        ) : (
-          <p className="text-xs text-slate-400">Ruta detenida. Inicia para empezar a registrar tu recorrido.</p>
-        )}
-
-        {error && (
-          <p className="flex items-center gap-1.5 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] font-medium text-rose-700">
-            <AlertTriangle size={13} /> {error}
-          </p>
-        )}
-
-        <div className="flex justify-end gap-2">
-          {!tracking && (
-            <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
-              Cerrar
-            </button>
-          )}
-          {tracking ? (
-            <button onClick={stop} className="rounded-lg bg-rose-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-rose-700">
-              Finalizar Ruta
-            </button>
-          ) : (
-            <button onClick={start} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
-              Iniciar Ruta
-            </button>
-          )}
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function LiveMapPage({ vehicles, onSelectVehicle }) {
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [activeVehicleId, setActiveVehicleId] = useState(vehicles[0]?.id ?? null);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [driverModeOpen, setDriverModeOpen] = useState(false);
-  const [selectedRouteId, setSelectedRouteId] = useState(null);
-  const [routePolyline, setRoutePolyline] = useState(null);
-
-  const positions = useLivePositions();
-
-  const vehiclesWithStatus = useMemo(
-    () =>
-      vehicles.map((v) => {
-        const position = positions[v.id] ?? null;
-        return { ...v, position, gpsStatus: computeVehicleStatus(position) };
-      }),
-    [vehicles, positions]
-  );
-
-  const filtered = statusFilter === "all" ? vehiclesWithStatus : vehiclesWithStatus.filter((v) => v.gpsStatus === statusFilter);
-  const activeVehicle = vehiclesWithStatus.find((v) => v.id === activeVehicleId) ?? vehiclesWithStatus[0];
-
-  const markers = useMemo(
-    () =>
-      vehiclesWithStatus
-        .filter((v) => v.position)
-        .map((v) => ({ id: v.id, lat: v.position.lat, lng: v.position.lng, status: v.gpsStatus, label: v.unit })),
-    [vehiclesWithStatus]
-  );
-
-  function focusVehicle(id) {
-    setActiveVehicleId(id);
-    setDrawerOpen(true);
-    setSelectedRouteId(null);
-    setRoutePolyline(null);
-  }
-
-  async function handleSelectRoute(routeId) {
-    setSelectedRouteId(routeId);
-    if (!routeId) {
-      setRoutePolyline(null);
-      return;
-    }
-    const { data } = await supabase.from("route_points").select("lat, lng").eq("routeId", routeId).order("recordedAt", { ascending: true });
-    setRoutePolyline(data ?? []);
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold text-slate-900">Mapa en Vivo</h1>
-          <p className="mt-1 text-sm text-slate-500">Ubicación real de la flotilla, reportada por celular o tracker GPS.</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1.5 text-[11px] font-semibold text-emerald-700 ring-1 ring-emerald-200">
-            <RefreshCw size={12} /> Tiempo real
-          </span>
-          <button
-            onClick={() => setDriverModeOpen(true)}
-            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
-          >
-            <Navigation size={14} /> Modo Conductor
-          </button>
-        </div>
-      </div>
-
-      <div className="flex flex-wrap gap-2">
-        {FLEET_STATUS_FILTERS.map((f) => (
-          <button
-            key={f.id}
-            onClick={() => setStatusFilter(f.id)}
-            className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
-              statusFilter === f.id ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-            }`}
-          >
-            {f.label}
-          </button>
-        ))}
-      </div>
-
-      <div className="flex flex-col gap-4 lg:flex-row">
-        <div className="relative h-[480px] w-full overflow-hidden rounded-2xl border border-slate-200 shadow-sm lg:w-[70%]">
-          <LeafletMap markers={markers} routePolyline={routePolyline} onSelectMarker={focusVehicle} />
-
-          {markers.length === 0 && (
-            <div className="pointer-events-none absolute inset-x-0 top-3 z-[400] flex justify-center">
-              <span className="rounded-full bg-white/95 px-3 py-1.5 text-[11px] font-semibold text-slate-500 shadow-md">
-                Ninguna unidad ha reportado posición todavía — usa "Modo Conductor" para empezar.
-              </span>
-            </div>
-          )}
-
-          <div className="absolute bottom-4 left-4 z-[400] flex flex-wrap items-center gap-3 rounded-xl bg-white/95 px-3 py-2 text-[11px] font-medium text-slate-500 shadow-md backdrop-blur">
-            {Object.entries(LIVE_MAP_STATUS_STYLES).map(([key, s]) => (
-              <span key={key} className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: MAP_MARKER_COLOR[key] }} /> {s.label}
-              </span>
-            ))}
-          </div>
-        </div>
-
-        <div className="w-full space-y-2 overflow-y-auto lg:w-[30%]" style={{ maxHeight: 480 }}>
-          {filtered.map((v) => {
-            const s = GPS_STATUS_STYLES[v.gpsStatus];
-            const isActive = activeVehicle?.id === v.id;
-            return (
-              <button
-                key={v.id}
-                onClick={() => focusVehicle(v.id)}
-                className={`block w-full rounded-2xl border p-3 text-left shadow-sm transition ${
-                  isActive ? "border-blue-300 bg-blue-50/60" : "border-slate-200 bg-white hover:border-blue-200"
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="text-xs font-bold text-slate-800">
-                    {v.unit} <span className="font-medium text-slate-400">· {v.plate}</span>
-                  </p>
-                  <span className="flex items-center gap-1 text-[10px] font-semibold text-slate-500">
-                    <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: MAP_MARKER_COLOR[v.gpsStatus] }} /> {s.label}
-                  </span>
-                </div>
-                <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-slate-500">
-                  <span>
-                    Velocidad: <b className="text-slate-700">{v.position?.speed != null ? `${v.position.speed.toFixed(0)} km/h` : "—"}</b>
-                  </span>
-                  <span>
-                    Odómetro: <b className="text-slate-700">{v.kmActual.toLocaleString()} km</b>
-                  </span>
-                  <span>
-                    Última señal: <b className="text-slate-700">{timeAgoLabel(v.position?.recordedAt)}</b>
-                  </span>
-                  <span>
-                    Fuente: <b className="text-slate-700">{v.position?.source === "hardware" ? "Tracker GPS" : v.position ? "Celular" : "—"}</b>
-                  </span>
-                </div>
-              </button>
-            );
-          })}
-          {filtered.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Sin unidades en este filtro.</p>}
-        </div>
-      </div>
-
-      {drawerOpen && activeVehicle && (
-        <div className="space-y-4">
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-bold text-slate-800">Telemetría — {activeVehicle.unit}</h3>
-              <button onClick={() => setDrawerOpen(false)} className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100">
-                <X size={14} />
-              </button>
-            </div>
-            <button
-              onClick={() => onSelectVehicle(activeVehicle.id)}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-            >
-              <Truck size={13} /> Ver Expediente
-            </button>
-          </div>
-
-          <RouteHistoryPanel vehicle={activeVehicle} onSelectRoute={handleSelectRoute} selectedRouteId={selectedRouteId} />
-        </div>
-      )}
-
-      {driverModeOpen && <DriverModeModal vehicles={vehicles} onClose={() => setDriverModeOpen(false)} />}
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
-/*  Traslados                                                              */
-/* ---------------------------------------------------------------------- */
-
-const TRIP_STATUS_STYLES = {
-  scheduled: { label: "Programado", className: "bg-blue-50 text-blue-700 ring-blue-200" },
-  ongoing: { label: "En Curso", className: "bg-emerald-50 text-emerald-700 ring-emerald-200" },
-  completed: { label: "Completado", className: "bg-slate-100 text-slate-600 ring-slate-200" },
-  cancelled: { label: "Cancelado", className: "bg-rose-50 text-rose-700 ring-rose-200" },
-};
-
-const TRIP_STATUS_FILTERS = [
-  { id: "all", label: "Todos" },
-  { id: "scheduled", label: "Programado" },
-  { id: "ongoing", label: "En Curso" },
-  { id: "completed", label: "Completado" },
-  { id: "cancelled", label: "Cancelado" },
-];
-
-const TRIPS_SEED = [
-  { id: 1, unit: "Unidad 12", driver: "Ricardo Pérez", origin: "Nanchital", destination: "Coatzacoalcos", date: "2026-08-12", cargo: "Carga general — 12 ton", status: "ongoing" },
-  { id: 2, unit: "Unidad 03", driver: "Diana Ruiz", origin: "Coatzacoalcos", destination: "Minatitlán", date: "2026-08-12", cargo: "Materiales de construcción — 8 ton", status: "ongoing" },
-  { id: 3, unit: "Unidad 21", driver: "José Torres", origin: "Nanchital", destination: "Coatzacoalcos", date: "2026-08-12", cargo: "Contenedor refrigerado", status: "ongoing" },
-  { id: 4, unit: "Unidad 07", driver: "Lucía Gómez", origin: "Coatzacoalcos", destination: "Acayucan", date: "2026-08-13", cargo: "Paquetería industrial", status: "scheduled" },
-  { id: 5, unit: "Unidad 09", driver: "Marco Aguilar", origin: "Patio Nanchital", destination: "Coatzacoalcos", date: "2026-08-10", cargo: "Equipo pesado", status: "completed" },
-];
-
-function TripFormModal({ vehicles, onSave, onClose }) {
-  const [tripType, setTripType] = useState("cargo");
-  const [unit, setUnit] = useState(vehicles[0]?.unit ?? "");
-  const [origin, setOrigin] = useState("");
-  const [destination, setDestination] = useState("");
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
-  const [cargo, setCargo] = useState("");
-  const [passengers, setPassengers] = useState("");
-  // Con chofer variable, quién maneja se anota en cada viaje.
-  const [tripDriver, setTripDriver] = useState("");
-  const selectedVehicle = vehicles.find((v) => v.unit === unit);
-
-  const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
-  const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
-
-  function handleSubmit(e) {
-    e.preventDefault();
-    if (!origin.trim() || !destination.trim()) return;
-    const driver = isVariableDriver(selectedVehicle) ? tripDriver.trim() : vehicleDriverName(selectedVehicle);
-    const cargoLabel = tripType === "passengers" ? (passengers.trim() || "Sin detalle de pasajeros") : cargo.trim();
-    onSave({ unit, driver, tripType, origin: origin.trim(), destination: destination.trim(), date, cargo: cargoLabel, status: "scheduled" });
-  }
-
-  return (
-    <Modal title="Nuevo Traslado" onClose={onClose}>
-      <form onSubmit={handleSubmit} className="space-y-3">
-        <div className="flex gap-1.5 rounded-xl bg-slate-100 p-1">
-          {[
-            { id: "cargo", label: "Carga" },
-            { id: "passengers", label: "Pasajeros" },
-          ].map((o) => (
-            <button
-              key={o.id}
-              type="button"
-              onClick={() => setTripType(o.id)}
-              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-                tripType === o.id ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-700"
-              }`}
-            >
-              {o.label}
-            </button>
-          ))}
-        </div>
-        <div>
-          <label className={labelClass}>Unidad</label>
-          <select value={unit} onChange={(e) => setUnit(e.target.value)} className={inputClass}>
-            {vehicles.map((v) => (
-              <option key={v.unit} value={v.unit}>
-                {v.unit} — {vehicleDriverLabel(v)}
-              </option>
-            ))}
-          </select>
-        </div>
-        {isVariableDriver(selectedVehicle) && (
-          <div>
-            <label className={labelClass}>Chofer de este viaje</label>
-            <input value={tripDriver} onChange={(e) => setTripDriver(e.target.value)} placeholder="Nombre de quien maneja" className={inputClass} />
-          </div>
-        )}
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className={labelClass}>Origen</label>
-            <input value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder="Ej. Nanchital" className={inputClass} />
-          </div>
-          <div>
-            <label className={labelClass}>Destino</label>
-            <input value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="Ej. Coatzacoalcos" className={inputClass} />
-          </div>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className={labelClass}>Fecha</label>
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inputClass} />
-          </div>
-          {tripType === "cargo" ? (
-            <div>
-              <label className={labelClass}>Carga</label>
-              <input value={cargo} onChange={(e) => setCargo(e.target.value)} placeholder="Ej. Carga general — 10 ton" className={inputClass} />
-            </div>
-          ) : (
-            <div>
-              <label className={labelClass}>Pasajeros</label>
-              <input value={passengers} onChange={(e) => setPassengers(e.target.value)} placeholder="Ej. 4 pasajeros — personal administrativo" className={inputClass} />
-            </div>
-          )}
-        </div>
-        <div className="flex justify-end gap-2 pt-1">
-          <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
-            Cancelar
-          </button>
-          <button type="submit" className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
-            Asignar Traslado
-          </button>
-        </div>
-      </form>
-    </Modal>
-  );
-}
-
-function TransfersPage({ vehicles, trips, insertTrip, updateTrip }) {
-  const { format } = useDateFormat();
-  const { showToast } = useToast();
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [modalOpen, setModalOpen] = useState(false);
-
-  const filtered = statusFilter === "all" ? trips : trips.filter((t) => t.status === statusFilter);
-  const order = ["scheduled", "ongoing", "completed"];
-
-  async function addTrip(trip) {
-    try {
-      await insertTrip(trip);
-      setModalOpen(false);
-    } catch (err) {
-      showToast(`Error al asignar traslado: ${err.message}`);
-    }
-  }
-  async function advanceStatus(trip) {
-    const idx = order.indexOf(trip.status);
-    if (idx === -1 || idx === order.length - 1) return;
-    try {
-      await updateTrip(trip.id, { status: order[idx + 1] });
-    } catch (err) {
-      showToast(`Error al actualizar traslado: ${err.message}`);
-    }
-  }
-  async function cancelTrip(trip) {
-    try {
-      await updateTrip(trip.id, { status: "cancelled" });
-    } catch (err) {
-      showToast(`Error al cancelar traslado: ${err.message}`);
-    }
-  }
-
-  return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold text-slate-900">Traslados</h1>
-          <p className="mt-1 text-sm text-slate-500">Asignación de viajes, rutas y carga por unidad.</p>
-        </div>
-        <button
-          onClick={() => setModalOpen(true)}
-          className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
-        >
-          <Plus size={15} /> Nuevo Traslado
-        </button>
-      </div>
-
-      <div className="flex flex-wrap gap-2">
-        {TRIP_STATUS_FILTERS.map((f) => (
-          <button
-            key={f.id}
-            onClick={() => setStatusFilter(f.id)}
-            className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
-              statusFilter === f.id ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-            }`}
-          >
-            {f.label}
-          </button>
-        ))}
-      </div>
-
-      <div className="space-y-3">
-        {filtered.map((t) => {
-          const s = TRIP_STATUS_STYLES[t.status];
-          const canAdvance = order.includes(t.status) && order.indexOf(t.status) < order.length - 1;
-          const canCancel = t.status !== "completed" && t.status !== "cancelled";
-          return (
-            <div key={t.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <p className="text-xs font-bold text-slate-800">
-                    {t.unit} <span className="font-medium text-slate-400">· {t.driver}</span>
-                  </p>
-                  <span
-                    className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${
-                      (t.tripType ?? "cargo") === "passengers"
-                        ? "bg-indigo-50 text-indigo-700 ring-indigo-200"
-                        : "bg-slate-100 text-slate-600 ring-slate-200"
-                    }`}
-                  >
-                    {(t.tripType ?? "cargo") === "passengers" ? <User size={10} /> : <Truck size={10} />}
-                    {(t.tripType ?? "cargo") === "passengers" ? "Pasajeros" : "Carga"}
-                  </span>
-                </div>
-                <p className="mt-1 flex items-center gap-1.5 text-sm font-semibold text-slate-700">
-                  {t.origin} <Navigation size={13} className="text-blue-500" /> {t.destination}
-                </p>
-                <p className="mt-0.5 text-[11px] text-slate-400">
-                  {t.cargo} · {formatDate(t.date, format)}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ${s.className}`}>{s.label}</span>
-                {canAdvance && (
-                  <button
-                    onClick={() => advanceStatus(t)}
-                    className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
-                  >
-                    Avanzar Estado
-                  </button>
-                )}
-                {canCancel && (
-                  <button
-                    onClick={() => cancelTrip(t)}
-                    className="rounded-lg border border-rose-200 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
-                  >
-                    Cancelar
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-        {filtered.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Sin traslados en este estado.</p>}
-      </div>
-
-      {modalOpen && <TripFormModal vehicles={vehicles} onSave={addTrip} onClose={() => setModalOpen(false)} />}
-    </div>
-  );
-}
-
 /* ---------------------------------------------------------------------- */
 /*  Incidencias                                                            */
 /* ---------------------------------------------------------------------- */
@@ -9570,12 +7043,6 @@ const INCIDENT_STATUS_STYLES = {
   resolved: { label: "Resuelta", className: "bg-emerald-50 text-emerald-700 ring-emerald-200" },
 };
 
-const INCIDENTS_SEED = [
-  { id: 1, unit: "Unidad 21", severity: "high", status: "attending", description: "Tráfico intenso y posible retención en puente peatonal", reportedBy: "José Torres", date: "2026-08-12" },
-  { id: 2, unit: "Unidad 09", severity: "critical", status: "open", description: "Falla mecánica — sobrecalentamiento de motor", reportedBy: "Marco Aguilar", date: "2026-08-10" },
-  { id: 3, unit: "Unidad 07", severity: "medium", status: "resolved", description: "Ponchadura de llanta trasera derecha", reportedBy: "Lucía Gómez", date: "2026-08-05" },
-  { id: 4, unit: "Unidad 12", severity: "low", status: "resolved", description: "Retraso menor por cierre parcial de vialidad", reportedBy: "Ricardo Pérez", date: "2026-08-02" },
-];
 
 function IncidentFormModal({ vehicles, onSave, onClose }) {
   const [unit, setUnit] = useState(vehicles[0]?.unit ?? "");
@@ -9750,532 +7217,6 @@ function IncidentsPage({ vehicles, incidents, insertIncident, updateIncident }) 
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Configuración / Cuenta / Reporte de problemas                         */
-/* ---------------------------------------------------------------------- */
-
-const CURRENCY_OPTIONS = [
-  { code: "MXN", label: "Peso mexicano (MXN)" },
-  { code: "USD", label: "Dólar estadounidense (USD)" },
-  { code: "EUR", label: "Euro (EUR)" },
-  { code: "GTQ", label: "Quetzal guatemalteco (GTQ)" },
-  { code: "COP", label: "Peso colombiano (COP)" },
-];
-
-function CompanyCurrencySetting() {
-  const { profile, updateCompanyCurrency } = useAuth();
-  const { showToast } = useToast();
-  const [saving, setSaving] = useState(false);
-  const currentCurrency = profile?.company?.currency || "MXN";
-  const isCompanyAdmin = !!(profile?.isSuperAdmin || profile?.companyRole === "admin");
-
-  async function handleChange(e) {
-    const currency = e.target.value;
-    setSaving(true);
-    try {
-      await updateCompanyCurrency(currency);
-      showToast(`Moneda de la empresa actualizada a ${currency}.`);
-    } catch (err) {
-      showToast(`Error al actualizar moneda: ${err.message}`);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="mb-1 text-sm font-bold text-slate-800">Moneda de la empresa</h2>
-      <p className="mb-3 text-xs text-slate-500">Se usa para mostrar montos en Facturas, Mantenimiento y Trámites.</p>
-      {isCompanyAdmin ? (
-        <select
-          value={currentCurrency}
-          onChange={handleChange}
-          disabled={saving}
-          className="w-full max-w-xs rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none disabled:opacity-60"
-        >
-          {CURRENCY_OPTIONS.map((c) => (
-            <option key={c.code} value={c.code}>
-              {c.label}
-            </option>
-          ))}
-        </select>
-      ) : (
-        <p className="text-xs font-medium text-slate-600">
-          {CURRENCY_OPTIONS.find((c) => c.code === currentCurrency)?.label || currentCurrency}
-          <span className="ml-1.5 text-[11px] font-normal text-slate-400">— solo un administrador de la empresa puede cambiarla.</span>
-        </p>
-      )}
-    </div>
-  );
-}
-
-const TEAM_ROLES = [
-  { id: "admin", label: "Administrador — sube y aprueba" },
-  { id: "member", label: "Usuario — sube, no aprueba" },
-];
-
-function TeamSetting() {
-  const { user, profile } = useAuth();
-  const { showToast } = useToast();
-  const isCompanyAdmin = !!(profile?.isSuperAdmin || profile?.companyRole === "admin");
-  const companyId = profile?.companyId;
-  const [members, setMembers] = useState(null);
-  const [inviteCode, setInviteCode] = useState("");
-  const [savingId, setSavingId] = useState(null);
-
-  const loadMembers = useCallback(async () => {
-    const { data, error } = await supabase.rpc("list_company_members");
-    if (error) showToast(`Error al cargar el equipo: ${error.message}`);
-    setMembers(data ?? []);
-  }, []);
-
-  useEffect(() => {
-    if (!isCompanyAdmin || !companyId) return;
-    loadMembers();
-    supabase
-      .from("companies")
-      .select("inviteCode")
-      .eq("id", companyId)
-      .single()
-      .then(({ data }) => setInviteCode(data?.inviteCode ?? ""));
-  }, [isCompanyAdmin, companyId, loadMembers]);
-
-  async function changeRole(member, role) {
-    setSavingId(member.id);
-    const { error } = await supabase.rpc("set_member_role", { target_user: member.id, new_role: role });
-    if (error) showToast(`Error al cambiar el rol: ${error.message}`);
-    else showToast("Rol actualizado.");
-    await loadMembers();
-    setSavingId(null);
-  }
-
-  function copyCode() {
-    navigator.clipboard?.writeText(inviteCode);
-    showToast("Código copiado.");
-  }
-
-  if (!isCompanyAdmin) return null;
-
-  return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="mb-1 text-sm font-bold text-slate-800">Equipo</h2>
-      <p className="mb-3 text-xs text-slate-500">Administrador: sube, aprueba, rechaza y anula facturas. Usuario: sube y verifica, pero no aprueba.</p>
-
-      {inviteCode && (
-        <div className="mb-3">
-          <p className="mb-1 text-[11px] font-semibold text-slate-500">Código de invitación</p>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">{inviteCode}</code>
-            <button onClick={copyCode} className="rounded-lg border border-slate-200 px-2.5 py-2 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
-              Copiar
-            </button>
-          </div>
-          <p className="mt-1 text-[11px] text-slate-400">Quien cree su cuenta con este código entra como Usuario.</p>
-        </div>
-      )}
-
-      {members === null && <p className="text-xs text-slate-400">Cargando...</p>}
-      <div className="space-y-2">
-        {members?.map((member) => (
-          <div key={member.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 px-3 py-2">
-            <div className="min-w-0">
-              <p className="truncate text-xs font-semibold text-slate-700">
-                {member.fullName || "Sin nombre"}
-                {member.id === user?.id && <span className="ml-1.5 font-normal text-slate-400">(tú)</span>}
-              </p>
-              <p className="truncate text-[11px] text-slate-400">{member.email}</p>
-            </div>
-            {member.id === user?.id ? (
-              <span className="text-[11px] font-medium text-slate-500">{TEAM_ROLES.find((r) => r.id === member.companyRole)?.label}</span>
-            ) : (
-              <select
-                value={member.companyRole}
-                disabled={savingId === member.id}
-                onChange={(e) => changeRole(member, e.target.value)}
-                className="max-w-full rounded-lg border border-slate-200 px-2 py-1.5 text-[11px] focus:border-blue-400 focus:outline-none disabled:opacity-60"
-              >
-                {TEAM_ROLES.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function BotLinkSetting() {
-  const { profile, unlinkCompanyBot } = useAuth();
-  const { showToast } = useToast();
-  const [unlinking, setUnlinking] = useState(false);
-  const isCompanyAdmin = !!(profile?.isSuperAdmin || profile?.companyRole === "admin");
-  const company = profile?.company;
-  const connected = !!(company?.botChannel && company?.botChatId);
-
-  function copyCode() {
-    if (!company?.botLinkCode) return;
-    navigator.clipboard?.writeText(company.botLinkCode);
-    showToast("Código copiado.");
-  }
-
-  async function handleUnlink() {
-    setUnlinking(true);
-    try {
-      await unlinkCompanyBot();
-      showToast("Bot desvinculado.");
-    } catch (err) {
-      showToast(`Error al desvincular: ${err.message}`);
-    } finally {
-      setUnlinking(false);
-    }
-  }
-
-  return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="mb-1 text-sm font-bold text-slate-800">Bot de ingesta (Telegram)</h2>
-      <p className="mb-3 text-xs text-slate-500">
-        Envía fotos, PDFs o texto de facturas por chat y Navío las registra automáticamente como pendientes de revisión.
-      </p>
-
-      {connected ? (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2.5">
-          <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
-            <CheckCircle2 size={14} /> Conectado por Telegram
-          </span>
-          {isCompanyAdmin && (
-            <button
-              onClick={handleUnlink}
-              disabled={unlinking}
-              className="rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-60"
-            >
-              {unlinking ? "Desvinculando..." : "Desvincular"}
-            </button>
-          )}
-        </div>
-      ) : isCompanyAdmin ? (
-        <div className="space-y-2.5">
-          <p className="text-xs text-slate-600">
-            1. Abre Telegram y busca al bot de Navío. 2. Envíale este mensaje:
-          </p>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">
-              /vincular {company?.botLinkCode || "—"}
-            </code>
-            <button
-              onClick={copyCode}
-              className="rounded-lg border border-slate-200 px-2.5 py-2 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
-            >
-              Copiar
-            </button>
-          </div>
-          <p className="text-[11px] text-slate-400">
-            Este código es solo para tu empresa — no lo compartas fuera de tu equipo.
-          </p>
-        </div>
-      ) : (
-        <p className="text-xs font-medium text-slate-600">
-          Sin conectar todavía. <span className="text-[11px] font-normal text-slate-400">— solo un administrador de la empresa puede vincularlo.</span>
-        </p>
-      )}
-    </div>
-  );
-}
-
-function SettingsPage() {
-  const [notifPrefs, setNotifPrefs] = useState({ email: true, whatsapp: true, criticalOnly: false });
-
-  function toggle(key) {
-    setNotifPrefs((prev) => ({ ...prev, [key]: !prev[key] }));
-  }
-
-  const options = [
-    { key: "email", label: "Notificaciones por correo electrónico" },
-    { key: "whatsapp", label: "Notificaciones por WhatsApp" },
-    { key: "criticalOnly", label: "Solo alertas críticas" },
-  ];
-
-  return (
-    <div className="max-w-xl space-y-5">
-      <div>
-        <h1 className="text-xl font-bold text-slate-900">Configuración</h1>
-        <p className="mt-1 text-sm text-slate-500">Preferencias regionales y de notificaciones de la plataforma.</p>
-      </div>
-
-      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="mb-3 text-sm font-bold text-slate-800">Formato de fecha regional</h2>
-        <DateFormatToggle />
-      </div>
-
-      <TeamSetting />
-
-      <CompanyCurrencySetting />
-
-      <BotLinkSetting />
-
-      <div className="space-y-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="mb-1 text-sm font-bold text-slate-800">Notificaciones</h2>
-        {options.map((o) => (
-          <label key={o.key} className="flex cursor-pointer items-center justify-between rounded-xl border border-slate-100 px-3 py-2.5 hover:bg-slate-50">
-            <span className="text-xs font-medium text-slate-600">{o.label}</span>
-            <input type="checkbox" checked={notifPrefs[o.key]} onChange={() => toggle(o.key)} className="h-4 w-4 accent-blue-600" />
-          </label>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function MfaEnrollModal({ onClose, onEnrolled }) {
-  const { enrollMFA, verifyFactor } = useAuth();
-  const [step, setStep] = useState("loading"); // loading | scan | error
-  const [factorId, setFactorId] = useState(null);
-  const [qrCode, setQrCode] = useState("");
-  const [secret, setSecret] = useState("");
-  const [code, setCode] = useState("");
-  const [error, setError] = useState("");
-  const [verifying, setVerifying] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    enrollMFA()
-      .then((data) => {
-        if (cancelled) return;
-        setFactorId(data.id);
-        setQrCode(data.totp.qr_code);
-        setSecret(data.totp.secret);
-        setStep("scan");
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setError(translateAuthError(err));
-        setStep("error");
-      });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function handleVerify(e) {
-    e.preventDefault();
-    setError("");
-    setVerifying(true);
-    try {
-      await verifyFactor(factorId, code.trim());
-      onEnrolled();
-    } catch (err) {
-      setError(translateAuthError(err));
-    } finally {
-      setVerifying(false);
-    }
-  }
-
-  return (
-    <Modal title="Activar verificación en dos pasos" onClose={onClose}>
-      {step === "loading" && <p className="py-4 text-center text-xs text-slate-400">Generando código QR...</p>}
-      {step === "error" && <AuthErrorMessage message={error} />}
-      {step === "scan" && (
-        <div className="space-y-3">
-          <p className="text-xs text-slate-500">
-            Escanea este código con Google Authenticator, Authy o cualquier app compatible con TOTP.
-          </p>
-          <div className="flex justify-center rounded-xl border border-slate-100 bg-white p-3">
-            {qrCode.startsWith("data:") ? (
-              <img src={qrCode} alt="Código QR" className="h-40 w-40" />
-            ) : (
-              <div className="h-40 w-40" dangerouslySetInnerHTML={{ __html: qrCode }} />
-            )}
-          </div>
-          <p className="text-center text-[10px] text-slate-400">
-            ¿No puedes escanear? Ingresa este código manualmente:
-            <br />
-            <span className="font-mono font-semibold text-slate-600">{secret}</span>
-          </p>
-          <form onSubmit={handleVerify} className="space-y-2">
-            <label className="mb-1 block text-[11px] font-semibold text-slate-500">Código de 6 dígitos</label>
-            <input
-              value={code}
-              onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-              inputMode="numeric"
-              autoFocus
-              placeholder="123456"
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-center text-lg tracking-[0.5em] focus:border-blue-400 focus:outline-none"
-            />
-            <AuthErrorMessage message={error} />
-            <div className="flex justify-end gap-2 pt-1">
-              <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
-                Cancelar
-              </button>
-              <button
-                type="submit"
-                disabled={verifying || code.length < 6}
-                className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
-              >
-                {verifying ? "Verificando..." : "Activar"}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-    </Modal>
-  );
-}
-
-function AccountPage({ userName, userEmail, userAvatar, onSignOut, companyName, isSuperAdmin, isCompanyAdmin }) {
-  const { listMFAFactors, unenrollMFA } = useAuth();
-  const { showToast } = useToast();
-  const [signingOut, setSigningOut] = useState(false);
-  const [factors, setFactors] = useState([]);
-  const [loadingFactors, setLoadingFactors] = useState(true);
-  const [enrollOpen, setEnrollOpen] = useState(false);
-
-  const loadFactors = useCallback(() => {
-    setLoadingFactors(true);
-    listMFAFactors()
-      .then((data) => setFactors((data?.totp ?? []).filter((f) => f.status === "verified")))
-      .catch(() => {})
-      .finally(() => setLoadingFactors(false));
-  }, [listMFAFactors]);
-
-  useEffect(() => {
-    loadFactors();
-  }, [loadFactors]);
-
-  async function handleRemoveFactor(factorId) {
-    try {
-      await unenrollMFA(factorId);
-      showToast("Verificación en dos pasos desactivada.");
-      loadFactors();
-    } catch (err) {
-      showToast(`Error: ${err.message}`);
-    }
-  }
-
-  async function handleSignOut() {
-    setSigningOut(true);
-    try {
-      await onSignOut();
-    } finally {
-      setSigningOut(false);
-    }
-  }
-
-  return (
-    <div className="max-w-xl space-y-5">
-      <div>
-        <h1 className="text-xl font-bold text-slate-900">Cuenta</h1>
-        <p className="mt-1 text-sm text-slate-500">Perfil y permisos del usuario activo.</p>
-      </div>
-
-      <div className="flex items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <img src={userAvatar} alt={userName} className="h-16 w-16 rounded-full bg-blue-50 ring-2 ring-blue-100" />
-        <div>
-          <p className="text-sm font-bold text-slate-800">{userName}</p>
-          <p className="text-xs text-slate-400">
-            {companyName ? `${companyName} · ` : ""}
-            {userEmail}
-          </p>
-          <div className="mt-1 flex flex-wrap gap-1.5">
-            {isSuperAdmin && (
-              <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700 ring-1 ring-blue-200">
-                <Shield size={10} /> Super-administrador
-              </span>
-            )}
-            <span
-              className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${
-                isCompanyAdmin ? "bg-emerald-50 text-emerald-700 ring-emerald-200" : "bg-slate-100 text-slate-600 ring-slate-200"
-              }`}
-            >
-              {isCompanyAdmin ? "Administrador de empresa" : "Usuario de empresa"}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="mb-3 text-sm font-bold text-slate-800">Permisos del rol</h2>
-        <div className="space-y-1.5 text-xs text-slate-600">
-          <p className="flex items-center gap-2"><CheckCircle2 size={13} className="text-emerald-600" /> Ver todos los módulos de tu empresa</p>
-          <p className="flex items-center gap-2"><CheckCircle2 size={13} className="text-emerald-600" /> Subir facturas y verificar los datos que lee la IA</p>
-          <p className="flex items-center gap-2"><CheckCircle2 size={13} className="text-emerald-600" /> Agregar unidades, traslados e incidencias</p>
-          <p className="flex items-center gap-2">
-            {isCompanyAdmin ? (
-              <CheckCircle2 size={13} className="text-emerald-600" />
-            ) : (
-              <X size={13} className="text-slate-300" />
-            )}
-            Editar o eliminar unidades de la flota
-          </p>
-          <p className="flex items-center gap-2">
-            {isCompanyAdmin ? <CheckCircle2 size={13} className="text-emerald-600" /> : <X size={13} className="text-slate-300" />}
-            Aprobar, rechazar y anular facturas
-          </p>
-          <p className="flex items-center gap-2">
-            {isCompanyAdmin ? <CheckCircle2 size={13} className="text-emerald-600" /> : <X size={13} className="text-slate-300" />}
-            Gestionar el equipo y sus roles
-          </p>
-        </div>
-      </div>
-
-      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="mb-1 text-sm font-bold text-slate-800">Seguridad</h2>
-        <p className="mb-3 text-xs text-slate-500">
-          Verificación en dos pasos con una app de autenticación (Google Authenticator, Authy, etc.).
-        </p>
-        {loadingFactors ? (
-          <p className="text-xs text-slate-400">Cargando...</p>
-        ) : factors.length > 0 ? (
-          <div className="space-y-2">
-            {factors.map((f) => (
-              <div key={f.id} className="flex items-center justify-between rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2.5">
-                <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
-                  <ShieldCheck size={14} /> Activa — {f.friendly_name || "App de autenticación"}
-                </span>
-                <button
-                  onClick={() => handleRemoveFactor(f.id)}
-                  className="rounded-lg border border-rose-200 px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
-                >
-                  Desactivar
-                </button>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <button
-            onClick={() => setEnrollOpen(true)}
-            className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-          >
-            <Lock size={14} /> Activar verificación en dos pasos
-          </button>
-        )}
-      </div>
-
-      <button
-        onClick={handleSignOut}
-        disabled={signingOut}
-        className="flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-2 text-xs font-semibold text-rose-600 hover:bg-rose-100 disabled:opacity-60"
-      >
-        <LogOut size={14} /> {signingOut ? "Cerrando sesión..." : "Cerrar Sesión"}
-      </button>
-
-      {enrollOpen && (
-        <MfaEnrollModal
-          onClose={() => setEnrollOpen(false)}
-          onEnrolled={() => {
-            setEnrollOpen(false);
-            showToast("Verificación en dos pasos activada.");
-            loadFactors();
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
 /*  Comunidad — feedback + roadmap (inspirado en FODI)                    */
 /* ---------------------------------------------------------------------- */
 
@@ -10295,58 +7236,6 @@ const COMMUNITY_STATUS = [
 ];
 const COMMUNITY_STATUS_MAP = Object.fromEntries(COMMUNITY_STATUS.map((s) => [s.id, s]));
 
-const COMMUNITY_POSTS_SEED = [
-  {
-    id: 1,
-    title: "Exportar historial de mantenimiento en PDF",
-    description: "Sería útil poder exportar el historial de servicios de una unidad directamente en PDF para compartirlo con el cliente.",
-    category: "feature",
-    status: "next",
-    votes: 7,
-    author: "Johana",
-    date: "2026-08-05",
-  },
-  {
-    id: 2,
-    title: "La confirmación de tickets tarda en reflejarse",
-    description: "A veces al confirmar un ticket de combustible el estado no cambia hasta recargar la página.",
-    category: "bug",
-    status: "in-progress",
-    votes: 4,
-    author: "Ricardo Pérez",
-    date: "2026-08-02",
-  },
-  {
-    id: 3,
-    title: "Notificaciones push para vencimientos",
-    description: "Agregar notificaciones push (no solo la campanita) cuando una tenencia o póliza esté por vencer.",
-    category: "feature",
-    status: "backlog",
-    votes: 5,
-    author: "Lucía Gómez",
-    date: "2026-07-28",
-  },
-  {
-    id: 4,
-    title: "Modo oscuro",
-    description: "El dashboard se usa mucho de noche en la central de monitoreo; un modo oscuro ayudaría bastante a la vista.",
-    category: "feature",
-    status: "backlog",
-    votes: 3,
-    author: "José Torres",
-    date: "2026-07-20",
-  },
-  {
-    id: 5,
-    title: "Historial de documentos no carga en móvil",
-    description: "En pantallas pequeñas la sección de Trámites del expediente no muestra el historial de documentos anteriores.",
-    category: "bug",
-    status: "done",
-    votes: 6,
-    author: "Marco Aguilar",
-    date: "2026-07-10",
-  },
-];
 
 function openMailto(subject, body) {
   window.location.href = `mailto:${COMMUNITY_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
@@ -10734,7 +7623,7 @@ const BOT_MODULE_ICON = { fuel: "⛽", maintenance: "🔧", compliance: "📋", 
 function BotFeedPanel() {
   const { profile } = useAuth();
   const [ingestions, setIngestions] = useState([]);
-  const connected = !!(profile?.company?.botChannel && profile?.company?.botChatId);
+  const connected = !!profile?.company?.botChannel;
 
   const load = useCallback(() => {
     if (!supabase || !profile?.companyId) return;
@@ -10746,11 +7635,13 @@ function BotFeedPanel() {
       .then(({ data }) => setIngestions(data ?? []));
   }, [profile?.companyId]);
 
+  // Se consulta al abrir y al volver a la pestaña, no cada tantos segundos.
   useEffect(() => {
-    if (!connected) return;
+    if (!connected) return undefined;
     load();
-    const interval = window.setInterval(load, 30000);
-    return () => window.clearInterval(interval);
+    const onVisible = () => document.visibilityState === "visible" && load();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, [connected, load]);
 
   if (!connected) {
@@ -10874,6 +7765,7 @@ function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLo
               >
                 <Icon size={18} className="shrink-0" />
                 {open && <span className="flex-1 truncate text-left">{item.label}</span>}
+                {open && <NavBadge id={item.id} />}
                 {open && hasChildren && (
                   expanded[item.id] ? <ChevronUp size={14} className="shrink-0" /> : <ChevronDown size={14} className="shrink-0" />
                 )}
@@ -11094,14 +7986,7 @@ function Header({
           >
             NAVIO
           </button>
-          <button
-            onClick={() => setNotifOpen((v) => !v)}
-            className="relative flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
-            aria-label="Notificaciones"
-          >
-            <Bell size={19} />
-            <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-rose-500 ring-2 ring-white" />
-          </button>
+          <BellButton onClick={() => setNotifOpen((v) => !v)} />
           <div className="hidden items-center gap-2.5 sm:flex">
             <img src={userAvatar} alt={userName} className="h-9 w-9 rounded-full bg-blue-50 ring-2 ring-blue-100" />
             <div className="leading-tight">
@@ -11147,415 +8032,31 @@ function Header({
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Admin — aprobación de empresas                                        */
-/* ---------------------------------------------------------------------- */
-
-function AdminCompaniesPage() {
-  const { approveCompany, rejectCompany } = useAuth();
-  const { showToast } = useToast();
-  const [companies, setCompanies] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
-  const [filter, setFilter] = useState("pending");
-  const [busyId, setBusyId] = useState(null);
-
-  const load = useCallback(() => {
-    if (!supabase) return;
-    setLoading(true);
-    supabase
-      .from("companies")
-      .select("*")
-      .order("createdAt", { ascending: false })
-      .then(({ data, error }) => {
-        if (error) setLoadError(error.message);
-        else setCompanies(data ?? []);
-        setLoading(false);
-      });
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const counts = useMemo(
-    () => ({
-      pending: companies.filter((c) => c.status === "pending").length,
-      approved: companies.filter((c) => c.status === "approved").length,
-      rejected: companies.filter((c) => c.status === "rejected").length,
-    }),
-    [companies]
-  );
-
-  const filtered = filter === "all" ? companies : companies.filter((c) => c.status === filter);
-
-  async function handleApprove(company) {
-    setBusyId(company.id);
-    try {
-      const code = await approveCompany(company.id);
-      showToast(`${company.name} aprobada. Código de invitación: ${code}`);
-      load();
-    } catch (err) {
-      showToast(`Error al aprobar: ${err.message}`);
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  async function handleReject(company) {
-    setBusyId(company.id);
-    try {
-      await rejectCompany(company.id);
-      showToast(`${company.name} rechazada.`);
-      load();
-    } catch (err) {
-      showToast(`Error al rechazar: ${err.message}`);
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  return (
-    <div className="space-y-5">
-      <div>
-        <h1 className="text-xl font-bold text-slate-900">Administración de empresas</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          Revisa las solicitudes de alta de empresas y aprueba o rechaza el acceso a Navío.
-        </p>
-      </div>
-
-      <div className="grid grid-cols-3 gap-3">
-        <KpiCard widget={{ label: "Pendientes", value: counts.pending, detail: "Por revisar", icon: Clock, tone: "amber" }} />
-        <KpiCard widget={{ label: "Aprobadas", value: counts.approved, detail: "Con acceso activo", icon: CheckCircle2, tone: "emerald" }} />
-        <KpiCard widget={{ label: "Rechazadas", value: counts.rejected, detail: "Solicitud denegada", icon: AlertTriangle, tone: "rose" }} />
-      </div>
-
-      <div className="flex flex-wrap gap-2">
-        {["pending", "approved", "rejected", "all"].map((f) => (
-          <button
-            key={f}
-            onClick={() => setFilter(f)}
-            className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
-              filter === f ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-            }`}
-          >
-            {f === "pending" ? "Pendientes" : f === "approved" ? "Aprobadas" : f === "rejected" ? "Rechazadas" : "Todas"}
-          </button>
-        ))}
-      </div>
-
-      {loadError && (
-        <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-600">
-          No se pudo cargar la lista de empresas: {loadError}
-        </div>
-      )}
-
-      {loading ? (
-        <p className="py-10 text-center text-xs text-slate-400">Cargando empresas...</p>
-      ) : filtered.length === 0 ? (
-        <p className="py-10 text-center text-xs text-slate-400">No hay empresas en este filtro.</p>
-      ) : (
-        <div className="space-y-3">
-          {filtered.map((c) => {
-            const statusMeta = COMPANY_STATUS_META[c.status] ?? COMPANY_STATUS_META.pending;
-            return (
-              <div key={c.id} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-sm font-bold text-slate-800">{c.name}</p>
-                      <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${statusMeta.className}`}>{statusMeta.label}</span>
-                    </div>
-                    <p className="mt-1 text-xs text-slate-500">
-                      {c.industry || "Giro sin especificar"} · {c.fleetSize || "Tamaño de flota sin especificar"}
-                    </p>
-                    <p className="mt-1 text-xs text-slate-500">
-                      {c.contactName || "Sin contacto"} · {c.contactEmail || "sin correo"} · {c.contactPhone || "sin teléfono"}
-                    </p>
-                    {c.needs && <p className="mt-2 rounded-lg bg-slate-50 p-2 text-xs text-slate-600">"{c.needs}"</p>}
-                    {c.status === "approved" && c.inviteCode && (
-                      <p className="mt-2 flex items-center gap-1.5 text-[11px] font-semibold text-emerald-700">
-                        <ShieldCheck size={12} /> Código de invitación: <span className="font-mono">{c.inviteCode}</span>
-                      </p>
-                    )}
-                  </div>
-                  {c.status === "pending" && (
-                    <div className="flex shrink-0 gap-2">
-                      <button
-                        onClick={() => handleApprove(c)}
-                        disabled={busyId === c.id}
-                        className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100 disabled:opacity-60"
-                      >
-                        Aprobar
-                      </button>
-                      <button
-                        onClick={() => handleReject(c)}
-                        disabled={busyId === c.id}
-                        className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-100 disabled:opacity-60"
-                      >
-                        Rechazar
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
-/*  App móvil — Modo de campo (celular)                                   */
-/* ---------------------------------------------------------------------- */
-
-const MOBILE_TABS = [
-  { id: "home", label: "Inicio", icon: Home },
-  { id: "trip", label: "Viaje", icon: Navigation },
-  { id: "register", label: "Registrar", icon: Plus },
-  { id: "account", label: "Cuenta", icon: User },
-];
-
-function MobileBottomNav({ tab, onChange }) {
-  return (
-    <nav
-      className="fixed inset-x-0 bottom-0 z-40 flex border-t border-slate-200 bg-white shadow-[0_-2px_10px_rgba(0,0,0,0.05)]"
-      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
-    >
-      {MOBILE_TABS.map((t) => {
-        const Icon = t.icon;
-        const active = tab === t.id;
-        return (
-          <button
-            key={t.id}
-            onClick={() => onChange(t.id)}
-            className={`flex flex-1 flex-col items-center gap-1 py-2.5 text-[11px] font-semibold ${active ? "text-blue-600" : "text-slate-400"}`}
-          >
-            <Icon size={20} />
-            {t.label}
-          </button>
-        );
-      })}
-    </nav>
-  );
-}
-
-function MobileHomeTab({ vehicles, userName, companyName, onOpenTrip }) {
-  return (
-    <div className="space-y-4 p-4 pb-24">
-      <div>
-        <p className="text-sm text-slate-500">Hola,</p>
-        <h1 className="text-xl font-bold text-slate-900">{userName}</h1>
-        {companyName && <p className="text-xs text-slate-400">{companyName}</p>}
-      </div>
-
-      <button onClick={onOpenTrip} className="flex w-full items-center justify-between rounded-2xl bg-blue-600 p-4 text-white shadow-sm">
-        <span className="text-left">
-          <span className="block text-xs font-medium text-blue-100">¿Vas a manejar?</span>
-          <span className="block text-sm font-bold">Iniciar o finalizar viaje</span>
-        </span>
-        <Navigation size={22} />
-      </button>
-
-      <div>
-        <h2 className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Flota ({vehicles.length})</h2>
-        <div className="space-y-2">
-          {vehicles.map((v) => {
-            const health = HEALTH_TONE(v.healthScore);
-            return (
-              <div key={v.id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-3">
-                <div>
-                  <p className="text-xs font-bold text-slate-800">
-                    {v.unit} <span className="font-medium text-slate-400">· {v.plate}</span>
-                  </p>
-                  <p className="text-[11px] text-slate-500">{vehicleDriverLabel(v)}</p>
-                </div>
-                <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${health.className}`}>{v.healthScore}%</span>
-              </div>
-            );
-          })}
-          {vehicles.length === 0 && <p className="py-6 text-center text-xs text-slate-400">Sin unidades registradas todavía.</p>}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function MobileTripTab({ vehicles }) {
-  const [vehicleId, setVehicleId] = useState(vehicles[0]?.id ?? null);
-  const { tracking, pointCount, lastFix, error, start, stop } = useDriverTracking(vehicleId);
-
-  return (
-    <div className="space-y-4 p-4 pb-24">
-      <h1 className="text-xl font-bold text-slate-900">Viaje</h1>
-      <div>
-        <label className="mb-1 block text-[11px] font-semibold text-slate-500">Unidad</label>
-        <select
-          value={vehicleId ?? ""}
-          onChange={(e) => setVehicleId(Number(e.target.value))}
-          disabled={tracking}
-          className="w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm focus:border-blue-400 focus:outline-none disabled:bg-slate-50"
-        >
-          {vehicles.map((v) => (
-            <option key={v.id} value={v.id}>
-              {v.unit} — {v.plate}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {tracking ? (
-        <div className="space-y-2 rounded-2xl bg-emerald-50 p-4 text-sm text-emerald-700 ring-1 ring-emerald-200">
-          <p className="flex items-center gap-2 text-base font-bold">
-            <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-emerald-500" /> Rastreando en vivo
-          </p>
-          <p>Puntos registrados: {pointCount}</p>
-          {lastFix && (
-            <p className="text-xs">
-              {lastFix.lat.toFixed(5)}, {lastFix.lng.toFixed(5)}
-              {lastFix.speed != null && ` · ${lastFix.speed.toFixed(0)} km/h`}
-            </p>
-          )}
-        </div>
-      ) : (
-        <p className="text-sm text-slate-400">Sin viaje activo.</p>
-      )}
-
-      {error && (
-        <p className="flex items-center gap-1.5 rounded-lg bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
-          <AlertTriangle size={13} /> {error}
-        </p>
-      )}
-
-      {tracking ? (
-        <button onClick={stop} className="w-full rounded-2xl bg-rose-600 py-4 text-base font-bold text-white shadow-sm">
-          Finalizar Viaje
-        </button>
-      ) : (
-        <button onClick={start} className="w-full rounded-2xl bg-blue-600 py-4 text-base font-bold text-white shadow-sm">
-          Iniciar Viaje
-        </button>
-      )}
-    </div>
-  );
-}
-
-function MobileRegisterTab({ onOpenForm, maintenanceRecords, complianceRecords, fuelRecords, travelExpenses }) {
-  const pendingCount =
-    maintenanceRecords.filter((r) => r.status === "pending").length +
-    complianceRecords.filter((r) => r.status === "pending").length +
-    fuelRecords.filter((r) => r.status === "pending").length +
-    travelExpenses.filter((r) => r.status === "pending").length;
-
-  const options = [
-    { module: "fuel", label: "Combustible", icon: Fuel, tone: "bg-sky-50 text-sky-600" },
-    { module: "maintenance", label: "Mantenimiento", icon: Wrench, tone: "bg-amber-50 text-amber-600" },
-    { module: "compliance", label: "Trámites", icon: ShieldCheck, tone: "bg-emerald-50 text-emerald-600" },
-    { module: "travel", label: "Viáticos", icon: Receipt, tone: "bg-violet-50 text-violet-600" },
-  ];
-
-  return (
-    <div className="space-y-4 p-4 pb-24">
-      <h1 className="text-xl font-bold text-slate-900">Registrar</h1>
-      <p className="text-sm text-slate-500">Sube una factura o registra un gasto directo desde aquí.</p>
-      {pendingCount > 0 && (
-        <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700 ring-1 ring-amber-200">
-          {pendingCount} registro{pendingCount === 1 ? "" : "s"} pendiente{pendingCount === 1 ? "" : "s"} de confirmar.
-        </p>
-      )}
-      <div className="space-y-2">
-        {options.map((o) => {
-          const Icon = o.icon;
-          return (
-            <button
-              key={o.module}
-              onClick={() => onOpenForm(o.module)}
-              className="flex w-full items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm"
-            >
-              <span className={`flex h-10 w-10 items-center justify-center rounded-xl ${o.tone}`}>
-                <Icon size={18} />
-              </span>
-              <span className="text-sm font-bold text-slate-800">Agregar {o.label}</span>
-              <ChevronRight size={16} className="ml-auto text-slate-300" />
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function MobileAppShell({
-  vehicles,
-  maintenanceRecords,
-  complianceRecords,
-  fuelRecords,
-  travelExpenses,
-  userName,
-  userEmail,
-  userAvatar,
-  companyName,
-  isSuperAdmin,
-  isCompanyAdmin,
-  onSignOut,
-  onOpenRecordForm,
-}) {
-  const [tab, setTab] = useSessionState("navio.nav.mobileTab", "home");
-
-  return (
-    <div className="min-h-screen bg-[#f8fafc]">
-      <header className="sticky top-0 z-30 flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
-        <div className="flex items-center gap-2">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600 text-xs font-extrabold text-white">N</div>
-          <span className="text-sm font-extrabold tracking-tight text-blue-700">NAVIO</span>
-        </div>
-        <img src={userAvatar} alt={userName} className="h-8 w-8 rounded-full bg-blue-50 ring-2 ring-blue-100" />
-      </header>
-
-      <main>
-        {tab === "home" && (
-          <MobileHomeTab vehicles={vehicles} userName={userName} companyName={companyName} onOpenTrip={() => setTab("trip")} />
-        )}
-        {tab === "trip" && <MobileTripTab vehicles={vehicles} />}
-        {tab === "register" && (
-          <MobileRegisterTab
-            onOpenForm={onOpenRecordForm}
-            maintenanceRecords={maintenanceRecords}
-            complianceRecords={complianceRecords}
-            fuelRecords={fuelRecords}
-            travelExpenses={travelExpenses}
-          />
-        )}
-        {tab === "account" && (
-          <div className="p-4 pb-24">
-            <AccountPage
-              userName={userName}
-              userEmail={userEmail}
-              userAvatar={userAvatar}
-              onSignOut={onSignOut}
-              companyName={companyName}
-              isSuperAdmin={isSuperAdmin}
-              isCompanyAdmin={isCompanyAdmin}
-            />
-          </div>
-        )}
-      </main>
-
-      <MobileBottomNav tab={tab} onChange={setTab} />
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
 /*  Root component                                                        */
 /* ---------------------------------------------------------------------- */
+
+// Lo que comparten todas las pantallas una vez dentro: la gente de la
+// empresa, la bandeja (alertas, mensajes, tareas) y el rastreo del viaje.
+function AppProviders({ fleet, children }) {
+  return (
+    <PeopleProvider>
+      <InboxProvider>
+        <TrackingProvider>
+          <FleetDataProvider value={fleet}>{children}</FleetDataProvider>
+          <IdleGuard />
+          <LegalAcceptanceGate />
+          <CookieNotice />
+        </TrackingProvider>
+      </InboxProvider>
+    </PeopleProvider>
+  );
+}
 
 function NavioApp() {
   const { user, signOut, profile } = useAuth();
   const currentUserName = user?.user_metadata?.full_name?.trim() || user?.email?.split("@")[0] || "Usuario";
   const currentUserEmail = user?.email ?? "";
-  const currentUserAvatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(user?.id ?? currentUserName)}`;
+  const currentUserAvatar = avatarUrl(currentUserName);
   const isMobileViewport = useIsMobileViewport();
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -11577,6 +8078,7 @@ function NavioApp() {
     insertRow: insertVehicle,
     updateRow: updateVehicleRow,
     removeRow: removeVehicleRow,
+    refresh: refreshVehicles,
   } = useSupabaseTable("vehicles", { orderBy: "id", ascending: true, companyId });
   const {
     rows: maintenanceRecords,
@@ -11624,7 +8126,7 @@ function NavioApp() {
   // Igual que las anteriores: sin la migración v16, todos los proyectos salen activos.
   const { rows: projectSettings, refresh: refreshProjectSettings } = useSupabaseTable("project_settings", { orderBy: "project", companyId });
   const [invoiceNav, setInvoiceNav] = useSessionState("navio.nav.invoices", INVOICE_NAV_START);
-  const reminders = useSupabaseTable("user_reminders");
+  const reminders = useSupabaseTable("user_reminders", { enabled: activeTab === "fuel" });
   const invoices = useMemo(
     () => normalizeInvoices({ fuel: fuelRecords, travel: travelExpenses, misc: miscExpenses }),
     [fuelRecords, travelExpenses, miscExpenses]
@@ -11648,20 +8150,33 @@ function NavioApp() {
     loading: tripsLoading,
     insertRow: insertTrip,
     updateRow: updateTrip,
+    removeRow: removeTrip,
+    refresh: refreshTrips,
   } = useSupabaseTable("trips", { companyId });
+  // Al iniciar o terminar un viaje, el servidor cambia el traslado y el
+  // kilometraje de la unidad: se vuelven a leer.
+  useEffect(() => {
+    const reload = () => {
+      refreshTrips();
+      refreshVehicles();
+    };
+    window.addEventListener("navio:trips-changed", reload);
+    return () => window.removeEventListener("navio:trips-changed", reload);
+  }, [refreshTrips, refreshVehicles]);
+  const [driverModeOpen, setDriverModeOpen] = useState(false);
   const {
     rows: incidents,
     loading: incidentsLoading,
     insertRow: insertIncident,
     updateRow: updateIncident,
-  } = useSupabaseTable("incidents", { companyId });
+  } = useSupabaseTable("incidents", { companyId, enabled: activeTab === "incidents" });
   const {
     rows: communityPosts,
     loading: communityLoading,
     insertRow: insertCommunityPost,
     updateRow: updateCommunityPost,
     refresh: refreshCommunityPosts,
-  } = useSupabaseTable("community_posts");
+  } = useSupabaseTable("community_posts", { enabled: activeTab === "support" });
 
   const dataLoading =
     vehiclesLoading ||
@@ -11826,7 +8341,7 @@ function NavioApp() {
           driver: {
             name: "Sin asignar",
             phone: "",
-            photo: "https://api.dicebear.com/7.x/avataaars/svg?seed=SinAsignar",
+            photo: avatarUrl("Sin asignar"),
             license: "",
             licenseExpiry: "",
           },
@@ -11855,10 +8370,10 @@ function NavioApp() {
   }
 
   // Cambios puntuales desde el expediente (por ejemplo, subir una foto).
-  async function handleUpdateVehicle(id, patch) {
+  async function handleUpdateVehicle(id, patch, message = "Foto guardada.") {
     try {
       await updateVehicleRow(id, patch);
-      showToast("Foto guardada.");
+      showToast(message);
       return true;
     } catch (err) {
       showToast(`Error al guardar: ${err.message}`);
@@ -11900,10 +8415,22 @@ function NavioApp() {
 
   const activeSubId = activeTab === "maintenance" ? maintenanceView : activeTab === "compliance" ? complianceDocFilter : undefined;
 
+  // Lo que consultan el expediente de una unidad y las garantías.
+  const fleetData = useMemo(
+    () => ({ maintenanceRecords, complianceRecords, fuelRecords: countableFuelRecords, trips, vehicles, isAdmin: isCompanyAdmin, onNavigate: goToTab }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [maintenanceRecords, complianceRecords, countableFuelRecords, trips, vehicles, isCompanyAdmin]
+  );
+  const pendingReviewCount = [maintenanceRecords, complianceRecords, fuelRecords, travelExpenses, miscExpenses].reduce(
+    (sum, rows) => sum + rows.filter((r) => r.status === "pending").length,
+    0
+  );
+
   if (isMobileViewport) {
     return (
       <DateFormatContext.Provider value={{ format: dateFormat, setFormat: setDateFormat }}>
         <ToastContext.Provider value={{ showToast }}>
+          <AppProviders fleet={fleetData}>
           {dataLoading && !vehiclesError && (
             <div className="flex min-h-screen items-center justify-center">
               <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">
@@ -11923,10 +8450,8 @@ function NavioApp() {
           {!dataLoading && !vehiclesError && (
             <MobileAppShell
               vehicles={vehicles}
-              maintenanceRecords={maintenanceRecords}
-              complianceRecords={complianceRecords}
-              fuelRecords={fuelRecords}
-              travelExpenses={travelExpenses}
+              trips={trips}
+              pendingCount={pendingReviewCount}
               userName={currentUserName}
               userEmail={currentUserEmail}
               userAvatar={currentUserAvatar}
@@ -11953,6 +8478,7 @@ function NavioApp() {
             />
           )}
           <ToastHost toast={toast} onDismiss={() => setToast(null)} />
+          </AppProviders>
         </ToastContext.Provider>
       </DateFormatContext.Provider>
     );
@@ -11961,6 +8487,7 @@ function NavioApp() {
   return (
     <DateFormatContext.Provider value={{ format: dateFormat, setFormat: setDateFormat }}>
       <ToastContext.Provider value={{ showToast }}>
+        <AppProviders fleet={fleetData}>
         <div
           className="flex min-h-screen w-full bg-[#f8fafc]"
           onClick={(e) => {
@@ -12040,14 +8567,17 @@ function NavioApp() {
                       vehicles={vehicles}
                       maintenanceRecords={maintenanceRecords}
                       complianceRecords={complianceRecords}
-                      fuelRecords={countableFuelRecords}
+                      invoices={invoices}
                       trips={trips}
+                      currency={profile?.company?.currency || "MXN"}
+                      isAdmin={isCompanyAdmin}
                       onSelectVehicle={jumpToVehicle}
                       onNavigate={goToTab}
+                      onAddInvoice={handleAddInvoice}
                       userName={currentUserName}
                     />
                   )}
-                  {activeTab === "map" && <LiveMapPage vehicles={vehicles} onSelectVehicle={jumpToVehicle} />}
+                  {activeTab === "map" && <LiveMapPage vehicles={vehicles} trips={trips} isAdmin={isCompanyAdmin} onSelectVehicle={jumpToVehicle} />}
                   {activeTab === "fleet" && (
                     <FleetTabContainer
                       vehicles={vehicles}
@@ -12061,7 +8591,16 @@ function NavioApp() {
                     />
                   )}
                   {activeTab === "transfers" && (
-                    <TransfersPage vehicles={vehicles} trips={trips} insertTrip={insertTrip} updateTrip={updateTrip} />
+                    <TransfersPage
+                      vehicles={vehicles}
+                      trips={trips}
+                      insertTrip={insertTrip}
+                      updateTrip={updateTrip}
+                      removeTrip={removeTrip}
+                      isAdmin={isCompanyAdmin}
+                      projectOptions={projectOptions}
+                      onOpenDriverMode={() => setDriverModeOpen(true)}
+                    />
                   )}
                   {activeTab === "maintenance" && (
                     <MaintenanceSection
@@ -12072,6 +8611,7 @@ function NavioApp() {
                       onConfirm={(r) => handleConfirmRecord("maintenance", r)}
                       onEditClick={(r) => setFormModal({ mode: "edit", module: "maintenance", initial: r })}
                       onDeleteClick={(r) => setDeleteRecordTarget({ module: "maintenance", record: r })}
+                      onUpdateVehicle={handleUpdateVehicle}
                     />
                   )}
                   {activeTab === "incidents" && (
@@ -12106,6 +8646,8 @@ function NavioApp() {
                       onSetProjectClosed={handleSetProjectClosed}
                     />
                   )}
+                  {activeTab === "messages" && <MessagesPage isAdmin={isCompanyAdmin} />}
+                  {activeTab === "tasks" && <TasksPage isAdmin={isCompanyAdmin} />}
                   {activeTab === "settings" && <SettingsPage />}
                   {activeTab === "account" && (
                     <AccountPage
@@ -12135,21 +8677,8 @@ function NavioApp() {
           </div>
 
           {notifOpen && (
-            <div data-keep-open className="fixed right-6 top-16 z-40 w-80 rounded-2xl border border-slate-200 bg-white p-3 shadow-xl">
-              <p className="mb-2 px-1 text-xs font-semibold text-slate-400">Notificaciones</p>
-              <div className="space-y-1">
-                {[
-                  { title: "Licencia por vencer", body: "L. Gómez (Unidad 07) vence en 13 días", time: "hace 10 min" },
-                  { title: "Llanta bajo mínimo", body: "Unidad 07 — eje trasero 4.1 mm", time: "hace 1 h" },
-                  { title: "Póliza por vencer", body: "Unidad 07 — GNP Seguros, vence 30/08/2026", time: "hace 2 h" },
-                ].map((n) => (
-                  <div key={n.title} className="rounded-xl px-2.5 py-2 hover:bg-slate-50">
-                    <p className="text-xs font-semibold text-slate-700">{n.title}</p>
-                    <p className="text-[11px] text-slate-400">{n.body}</p>
-                    <p className="mt-0.5 text-[10px] text-slate-300">{n.time}</p>
-                  </div>
-                ))}
-              </div>
+            <div data-keep-open className="fixed right-6 top-16 z-40 w-96 max-w-[calc(100vw-3rem)] rounded-2xl border border-slate-200 bg-white p-3 shadow-xl">
+              <NotificationsPanel isAdmin={isCompanyAdmin} onNavigate={goToTab} onClose={() => setNotifOpen(false)} />
             </div>
           )}
 
@@ -12201,8 +8730,11 @@ function NavioApp() {
             />
           )}
 
+          <TrackingPill onOpen={() => setDriverModeOpen(true)} />
+          {driverModeOpen && <DriverModeModal vehicles={vehicles} trips={trips} onClose={() => setDriverModeOpen(false)} />}
           <ToastHost toast={toast} onDismiss={() => setToast(null)} />
         </div>
+        </AppProviders>
       </ToastContext.Provider>
     </DateFormatContext.Provider>
   );
@@ -12213,15 +8745,23 @@ function NavioApp() {
 /* ---------------------------------------------------------------------- */
 
 function AuthGate() {
-  const { user, loading, passwordRecovery, mfaRequired, mfaVerifying, profile, profileLoading } = useAuth();
+  const { user, loading, passwordRecovery, mfaRequired, profile, profileLoading, profileError, refreshProfile } = useAuth();
+  const waiting = loading || (!!user && !passwordRecovery && !mfaRequired && profileLoading);
+
+  // La animación de entrada se retira cuando ya hay algo que mostrar.
+  useEffect(() => {
+    if (!waiting) hideSplash();
+  }, [waiting]);
 
   if (!isSupabaseConfigured) return <SupabaseSetupNotice />;
-  if (loading) return <FullScreenLoader />;
+  if (waiting) return <FullScreenLoader />;
   if (passwordRecovery) return <UpdatePasswordPage />;
-  if (!user || mfaVerifying) return <LoginPage />;
+  if (!user) return <LoginPage />;
   if (mfaRequired) return <MfaChallengePage />;
-  if (profileLoading) return <FullScreenLoader />;
+  if (profileError) return <ConnectionErrorPage onRetry={refreshProfile} />;
   if (!profile?.companyId) return <OnboardingPage />;
+  // La empresa existe pero la base de datos no la entrega: está suspendida.
+  if (!profile.company) return <CompanyInactivePage />;
   return <NavioApp />;
 }
 
@@ -12232,3 +8772,61 @@ export default function NavioDashboard() {
     </AuthProvider>
   );
 }
+
+// Piezas compartidas con los demás archivos de src/ (y con las pruebas).
+export {
+  supabase,
+  AuthContext,
+  AuthProvider,
+  useAuth,
+  ToastContext,
+  useToast,
+  DateFormatContext,
+  useDateFormat,
+  DateFormatToggle,
+  HomeChartSlot,
+  NavioApp,
+  Modal,
+  ConfirmModal,
+  SegmentedControl,
+  PillTabs,
+  KpiCard,
+  TONE_CLASSES,
+  usePersistentState,
+  useSessionState,
+  useSupabaseTable,
+  useIsMobileViewport,
+  formatDate,
+  formatCurrency,
+  formatMoney,
+  localISODate,
+  parseISODate,
+  timeAgoLabel,
+  countLabel,
+  haversineKm,
+  avatarUrl,
+  personPhoto,
+  DocumentCell,
+  DocumentPreview,
+  sniffDocumentType,
+  DOCUMENT_EXTENSIONS,
+  DOCUMENT_ACCEPT,
+  DOCUMENT_MAX_MB,
+  VehiclePhoto,
+  isVariableDriver,
+  vehicleDriverName,
+  vehicleDriverLabel,
+  normalizeInvoices,
+  getDeadlineDays,
+  buildOrders,
+  buildProjects,
+  FuelPage,
+  RecordFormModal,
+  InvoiceDetailModal,
+  InvoiceDecisionModal,
+  INVOICE_NAV_START,
+  GPS_STATUS_STYLES,
+  LIVE_MAP_STATUS_STYLES,
+  FLEET_STATUS_FILTERS,
+  computeVehicleStatus,
+};
