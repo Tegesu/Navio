@@ -24,6 +24,7 @@ android {
         if (navioKeystore) {
             navio {
                 storeFile file(navioKeystore)
+                storeType "pkcs12"
                 storePassword System.getenv("NAVIO_KEYSTORE_PASSWORD")
                 keyAlias System.getenv("NAVIO_KEY_ALIAS") ?: "navio"
                 keyPassword System.getenv("NAVIO_KEYSTORE_PASSWORD")

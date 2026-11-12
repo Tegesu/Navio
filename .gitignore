@@ -18,3 +18,9 @@ tools/.tailwind.css
 
 # App de Android: sus dependencias se instalan con npm dentro de android-app/
 android-app/node_modules/
+
+# Llave de firma de la app de Android: NUNCA se sube (el repositorio es público)
+llave-android/
+*.p12
+*.jks
+*.keystore

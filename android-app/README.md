@@ -29,3 +29,8 @@ Secrets and variables → Actions, con dos secretos:
 
 Sin esos secretos se compila una versión de prueba que funciona igual, pero
 que hay que desinstalar antes de instalar otra.
+
+La llave (`navio-firma.p12`, alias `navio`, tipo PKCS12) se creó el
+2026-11-12 y vive fuera del repositorio, en la carpeta `llave-android/` de la
+computadora de quien administra Navio (excluida por `.gitignore`). Si se
+pierde, ya no se puede actualizar la app instalada: hay que reinstalarla.
