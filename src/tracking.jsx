@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
+import { Capacitor, CapacitorHttp, registerPlugin } from "@capacitor/core";
 import { AlertTriangle, Clock, Gauge, LocateFixed, MapPin, Navigation, Route, Truck, User, WifiOff, X } from "lucide-react";
 import {
   supabase,
@@ -22,15 +23,41 @@ import {
 // de sección. Los puntos se juntan en una cola que se guarda en el teléfono y
 // se mandan por lotes en una sola llamada, así que una zona sin señal no
 // pierde el recorrido: se envía al volver la conexión.
+//
+// La ubicación puede salir de tres lugares:
+//   - "app":     la app Navio para Android. Un servicio del teléfono sigue
+//                leyendo el GPS con la pantalla apagada o con otra app abierta.
+//   - "tracker": una app de rastreo aparte (Traccar Client) vinculada a la
+//                persona. Manda la ubicación directo al servidor; aquí solo se
+//                muestra el avance.
+//   - "browser": el navegador. Solo funciona con Navio en pantalla: ningún
+//                navegador entrega el GPS a una página que no se está viendo.
 const ACTIVE_KEY = "navio.tracking.active.v1";
 const QUEUE_KEY = "navio.tracking.queue.v1";
 const CONSENT_KEY = "navio.tracking.consent.v1";
 const MIN_POINT_MS = 5000; // un punto cada 5 s como mucho
 const FLUSH_MS = 15000; // se envía cada 15 s...
 const FLUSH_POINTS = 8; // ...o al juntar 8 puntos
+const FLUSH_TIMEOUT_MS = 25000; // un envío atorado no bloquea a los siguientes
 const MAX_BATCH = 200;
 const MAX_QUEUE = 3000; // ~4 horas sin señal
+const TRACKER_POLL_MS = 20000;
+const PAUSE_NOTICE_MS = 60000; // pausas más cortas no vale la pena avisarlas
 const NO_STATS = { distanceKm: 0, pointCount: 0, maxSpeed: 0 };
+
+export const ANDROID_APP_URL = "https://github.com/Tegesu/Navio/releases/latest/download/navio.apk";
+
+// ¿Navio está abierto dentro de su app de Android (o iOS)?
+export function isNativeApp() {
+  try {
+    return Capacitor.isNativePlatform();
+  } catch {
+    return false;
+  }
+}
+
+// El servicio de ubicación en segundo plano de la app.
+const BackgroundGeolocation = registerPlugin("BackgroundGeolocation");
 
 function readStored(key) {
   try {
@@ -56,6 +83,35 @@ const routeStats = (route) => ({
   maxSpeed: Number(route?.maxSpeed) || 0,
 });
 
+const withTimeout = (promise, ms) => Promise.race([promise, new Promise((_, reject) => window.setTimeout(() => reject(new Error("timeout")), ms))]);
+
+// Dentro de la app, con la pantalla apagada Android frena las conexiones de la
+// página. El envío de puntos sale por la red del teléfono, que no se frena.
+// Si algo no cuadra (sin sesión, token por vencer) se usa el camino normal.
+async function sendPoints(args) {
+  if (isNativeApp()) {
+    try {
+      const { data } = await supabase.auth.getSession();
+      const session = data?.session;
+      if (session?.access_token && (session.expires_at ?? 0) * 1000 - Date.now() > 90000) {
+        const response = await CapacitorHttp.request({
+          url: `${supabase.supabaseUrl}/rest/v1/rpc/track_route_points`,
+          method: "POST",
+          headers: { apikey: supabase.supabaseKey, Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
+          data: args,
+          connectTimeout: 15000,
+          readTimeout: 20000,
+        });
+        if (response.status >= 200 && response.status < 300) return { data: response.data, error: null };
+        if (response.status >= 400 && response.status < 500 && response.data?.message) return { data: null, error: { message: response.data.message } };
+      }
+    } catch {
+      // Se intenta por el camino normal.
+    }
+  }
+  return supabase.rpc("track_route_points", args);
+}
+
 const TrackingContext = createContext(null);
 
 export function useTracking() {
@@ -77,13 +133,23 @@ export function TrackingProvider({ children }) {
   const [error, setError] = useState("");
   const [orphan, setOrphan] = useState(null); // ruta abierta que este dispositivo no está siguiendo
   const [consent, setConsent] = useState(() => !!readStored(CONSENT_KEY));
+  const [tracker, setTracker] = useState(null); // teléfono vinculado con la app de rastreo (o null)
+  const [trackerSeenAt, setTrackerSeenAt] = useState(null); // último punto que llegó del rastreador en este viaje
+  const [pausedMs, setPausedMs] = useState(0); // tiempo que el navegador dejó de registrar en este viaje
 
   const activeRef = useRef(active);
   const queueRef = useRef(readStored(QUEUE_KEY) ?? []);
-  const watchRef = useRef(null);
+  const watchRef = useRef(null); // null | número (navegador) | "pending" | { nativeId }
   const lastPointRef = useRef(0);
   const flushingRef = useRef(false);
   const wakeLockRef = useRef(null);
+  const hiddenAtRef = useRef(null);
+
+  const native = isNativeApp();
+  // Con qué se registra el viaje en curso en este dispositivo.
+  const mode = !active ? null : active.source === "tracker" ? "tracker" : native ? "app" : "browser";
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
 
   function persistQueue() {
     if (queueRef.current.length > MAX_QUEUE) queueRef.current = queueRef.current.slice(-MAX_QUEUE);
@@ -92,18 +158,26 @@ export function TrackingProvider({ children }) {
   }
 
   async function holdScreenAwake() {
+    // Solo hace falta en el navegador: es lo único que evita que se pause.
+    if (isNativeApp() || activeRef.current?.source === "tracker") return;
     try {
-      if (!wakeLockRef.current && "wakeLock" in navigator) wakeLockRef.current = await navigator.wakeLock.request("screen");
+      if (!wakeLockRef.current && "wakeLock" in navigator) {
+        const lock = await navigator.wakeLock.request("screen");
+        lock.addEventListener?.("release", () => {
+          if (wakeLockRef.current === lock) wakeLockRef.current = null;
+        });
+        wakeLockRef.current = lock;
+      }
     } catch {
       // No todos los navegadores lo permiten; el rastreo funciona igual con la pantalla encendida.
     }
   }
 
   function clearWatch() {
-    if (watchRef.current != null) {
-      navigator.geolocation.clearWatch(watchRef.current);
-      watchRef.current = null;
-    }
+    const current = watchRef.current;
+    watchRef.current = null;
+    if (typeof current === "number") navigator.geolocation.clearWatch(current);
+    else if (current?.nativeId) BackgroundGeolocation.removeWatcher({ id: current.nativeId }).catch(() => {});
     wakeLockRef.current?.release?.().catch(() => {});
     wakeLockRef.current = null;
   }
@@ -117,23 +191,28 @@ export function TrackingProvider({ children }) {
     setActive(null);
     setStatus("idle");
     setLastFix(null);
+    setTrackerSeenAt(null);
+    setPausedMs(0);
+    hiddenAtRef.current = null;
   }
 
   const flush = useCallback(async () => {
     const current = activeRef.current;
-    if (!current || queueRef.current.length === 0) return true;
+    if (!current || current.source === "tracker" || queueRef.current.length === 0) return true;
     if (flushingRef.current) return false;
     flushingRef.current = true;
     try {
       while (queueRef.current.length > 0) {
         const batch = queueRef.current.slice(0, MAX_BATCH);
-        const { data, error: rpcError } = await supabase.rpc("track_route_points", {
-          target_route: current.routeId,
-          points: batch,
-          sent_at: new Date().toISOString(),
-        });
+        let result;
+        try {
+          result = await withTimeout(sendPoints({ target_route: current.routeId, points: batch, sent_at: new Date().toISOString() }), FLUSH_TIMEOUT_MS);
+        } catch {
+          result = { data: null, error: { message: "sin respuesta" } };
+        }
+        const { data, error: rpcError } = result;
         if (rpcError) {
-          if (/ya terminó|no pertenece/.test(rpcError.message)) {
+          if (/ya terminó|no pertenece|no existe/.test(rpcError.message)) {
             // El viaje se cerró desde otro dispositivo o lo terminó un administrador.
             stopLocal();
             setError("Este viaje ya se había terminado.");
@@ -177,12 +256,56 @@ export function TrackingProvider({ children }) {
   }
 
   function handleGeoError(geoError) {
-    if (geoError.code === 1) setError("Navio no tiene permiso para ver tu ubicación. Actívalo en los ajustes del navegador para este sitio.");
-    else if (geoError.code === 2) setError("No se pudo obtener la ubicación. Revisa que el GPS esté encendido.");
+    if (geoError.code === 1) {
+      setError(
+        isNativeApp()
+          ? "Navio no tiene permiso para usar la ubicación. Actívalo en los ajustes del teléfono para la app Navio."
+          : "Navio no tiene permiso para ver tu ubicación. Actívalo en los ajustes del navegador para este sitio."
+      );
+    } else if (geoError.code === 2) setError("No se pudo obtener la ubicación. Revisa que el GPS esté encendido.");
     else setError("Buscando señal GPS…");
   }
 
+  // Dentro de la app: el servicio del teléfono entrega la ubicación aunque la
+  // pantalla esté apagada. Muestra un aviso fijo mientras el viaje dura.
+  function startNativeWatch() {
+    if (watchRef.current != null) return;
+    watchRef.current = "pending";
+    BackgroundGeolocation.addWatcher(
+      {
+        backgroundTitle: "Navio: viaje en curso",
+        backgroundMessage: "Se está registrando el recorrido. Abre Navio para finalizar el viaje.",
+        requestPermissions: true,
+        stale: false,
+        distanceFilter: 10,
+      },
+      (location, watchError) => {
+        if (watchError) handleGeoError({ code: watchError.code === "NOT_AUTHORIZED" ? 1 : 2 });
+        else if (location) {
+          handleFix({
+            coords: { latitude: location.latitude, longitude: location.longitude, speed: location.speed, heading: location.bearing, accuracy: location.accuracy },
+            timestamp: location.time,
+          });
+        }
+      }
+    )
+      .then((id) => {
+        // Si el viaje se detuvo mientras el servicio arrancaba, se apaga.
+        if (watchRef.current === "pending") watchRef.current = { nativeId: id };
+        else BackgroundGeolocation.removeWatcher({ id }).catch(() => {});
+      })
+      .catch(() => {
+        if (watchRef.current === "pending") watchRef.current = null;
+        setError("No se pudo iniciar el registro en segundo plano. Cierra y vuelve a abrir Navio.");
+      });
+  }
+
   function startWatch() {
+    if (activeRef.current?.source === "tracker") return true; // la ubicación la manda la app de rastreo
+    if (isNativeApp()) {
+      startNativeWatch();
+      return true;
+    }
     if (!("geolocation" in navigator)) {
       setError("Este dispositivo no permite compartir la ubicación.");
       return false;
@@ -198,38 +321,70 @@ export function TrackingProvider({ children }) {
     return true;
   }
 
-  function follow(route, unit) {
-    const next = { routeId: route.id, vehicleId: route.vehicleId, tripId: route.tripId ?? null, unit, startedAt: route.startedAt, userId: user.id };
-    writeStored(ACTIVE_KEY, next);
-    activeRef.current = next;
-    setActive(next);
-    setStats(routeStats(route));
-    setOrphan(null);
-    setStatus("tracking");
-    startWatch();
-  }
-
-  async function start({ vehicleId, tripId = null, unit }) {
-    if (!("geolocation" in navigator)) {
-      setError("Este dispositivo no permite compartir la ubicación.");
-      return false;
+  // ¿Hay permiso de ubicación? Se pregunta antes de abrir el viaje: sin
+  // ubicación no tiene caso crearlo. Devuelve true si fue negado.
+  function locationDenied() {
+    if (isNativeApp()) {
+      return new Promise((resolve) => {
+        let done = false;
+        let watcherId = null;
+        const finish = (denied) => {
+          if (done) return;
+          done = true;
+          if (watcherId) BackgroundGeolocation.removeWatcher({ id: watcherId }).catch(() => {});
+          resolve(denied);
+        };
+        BackgroundGeolocation.addWatcher({ requestPermissions: true, stale: true }, (location, watchError) => {
+          if (watchError?.code === "NOT_AUTHORIZED") finish(true);
+          else if (location) finish(false);
+        })
+          .then((id) => {
+            watcherId = id;
+            if (done) BackgroundGeolocation.removeWatcher({ id }).catch(() => {});
+          })
+          .catch(() => finish(false));
+        window.setTimeout(() => finish(false), 12000);
+      });
     }
-    setStatus("starting");
-    setError("");
-    // Se pide el permiso antes de abrir el viaje: sin ubicación no tiene caso crearlo.
-    const denied = await new Promise((resolve) =>
+    return new Promise((resolve) =>
       navigator.geolocation.getCurrentPosition(
         () => resolve(false),
         (geoError) => resolve(geoError.code === 1),
         { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
       )
     );
-    if (denied) {
+  }
+
+  function follow(route, unit) {
+    const next = { routeId: route.id, vehicleId: route.vehicleId, tripId: route.tripId ?? null, unit, startedAt: route.startedAt, userId: user.id, source: route.source === "tracker" ? "tracker" : "phone" };
+    writeStored(ACTIVE_KEY, next);
+    activeRef.current = next;
+    setActive(next);
+    setStats(routeStats(route));
+    setTrackerSeenAt(next.source === "tracker" ? route.lastPointAt ?? null : null);
+    setPausedMs(0);
+    setOrphan(null);
+    setStatus("tracking");
+    startWatch();
+  }
+
+  // source: "phone" (este dispositivo) o "tracker" (la app de rastreo vinculada).
+  async function start({ vehicleId, tripId = null, unit, source = "phone" }) {
+    const byTracker = source === "tracker";
+    if (!byTracker && !isNativeApp() && !("geolocation" in navigator)) {
+      setError("Este dispositivo no permite compartir la ubicación.");
+      return false;
+    }
+    setStatus("starting");
+    setError("");
+    if (!byTracker && (await locationDenied())) {
       handleGeoError({ code: 1 });
       setStatus("idle");
       return false;
     }
-    const { data, error: rpcError } = await supabase.rpc("start_route", { target_vehicle: vehicleId, target_trip: tripId });
+    const args = { target_vehicle: vehicleId, target_trip: tripId };
+    if (byTracker) args.route_source = "tracker";
+    const { data, error: rpcError } = await supabase.rpc("start_route", args);
     const route = Array.isArray(data) ? data[0] : data;
     if (rpcError || !route) {
       setError(`No se pudo iniciar el viaje: ${rpcError?.message ?? "sin respuesta"}`);
@@ -286,6 +441,20 @@ export function TrackingProvider({ children }) {
     setConsent(true);
   }
 
+  // El teléfono vinculado con la app de rastreo, si lo hay. Antes de la
+  // migración v18 la tabla no existe: simplemente no hay ninguno.
+  const reloadTracker = useCallback(async () => {
+    if (!user) return null;
+    const { data } = await supabase.from("tracker_devices").select("id, createdAt, lastSeenAt").eq("userId", user.id).limit(1);
+    const device = data?.[0] ?? null;
+    setTracker(device);
+    return device;
+  }, [user]);
+
+  useEffect(() => {
+    if (user && profile?.companyId) reloadTracker();
+  }, [user, profile?.companyId, reloadTracker]);
+
   // Al abrir la app: ¿hay un viaje mío abierto? Si este dispositivo lo llevaba,
   // el rastreo se reanuda solo; si no, se ofrece continuarlo o terminarlo.
   useEffect(() => {
@@ -313,6 +482,7 @@ export function TrackingProvider({ children }) {
       const open = data?.[0] ?? null;
       if (mine && open && open.id === mine.routeId) {
         setStats(routeStats(open));
+        if (mine.source === "tracker") setTrackerSeenAt(open.lastPointAt ?? null);
         setStatus("tracking");
         startWatch();
       } else {
@@ -326,28 +496,73 @@ export function TrackingProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id, profile?.companyId]);
 
-  // Envío periódico, y al recuperar la señal o volver a la pestaña.
+  // Mientras hay viaje: envío periódico, y al recuperar la señal o volver a
+  // la app. En el navegador, al volver se reinicia la lectura del GPS (el
+  // teléfono la suelta cuando la página deja de verse) y se anota la pausa.
   useEffect(() => {
     if (status !== "tracking") return undefined;
     const timer = window.setInterval(flush, FLUSH_MS);
-    const wake = () => {
-      if (document.visibilityState === "visible") {
-        holdScreenAwake();
-        flush();
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") {
+        hiddenAtRef.current = Date.now();
+        flush(); // lo que haya, antes de que el teléfono duerma la página
+        return;
       }
+      if (modeRef.current === "browser") {
+        const hiddenAt = hiddenAtRef.current;
+        if (hiddenAt && Date.now() - hiddenAt >= PAUSE_NOTICE_MS) setPausedMs((total) => total + (Date.now() - hiddenAt));
+        if (typeof watchRef.current === "number") {
+          navigator.geolocation.clearWatch(watchRef.current);
+          watchRef.current = null;
+        }
+        lastPointRef.current = 0; // el primer punto al volver se guarda de inmediato
+        startWatch();
+      }
+      hiddenAtRef.current = null;
+      flush();
     };
     window.addEventListener("online", flush);
-    document.addEventListener("visibilitychange", wake);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.clearInterval(timer);
       window.removeEventListener("online", flush);
-      document.removeEventListener("visibilitychange", wake);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [status, flush]);
 
+  // Con la app de rastreo, los puntos llegan directo al servidor: aquí solo
+  // se consulta cómo va el viaje.
+  useEffect(() => {
+    if (status !== "tracking" || active?.source !== "tracker") return undefined;
+    let cancelled = false;
+    const check = async () => {
+      if (document.visibilityState !== "visible") return;
+      const { data } = await supabase.from("routes").select("*").eq("id", active.routeId).limit(1);
+      const route = data?.[0];
+      if (cancelled || !route) return;
+      if (route.status !== "active") {
+        stopLocal();
+        setError("Este viaje ya se había terminado.");
+        announceTripsChanged();
+        return;
+      }
+      setStats(routeStats(route));
+      setTrackerSeenAt(route.lastPointAt ?? null);
+    };
+    check();
+    const timer = window.setInterval(check, TRACKER_POLL_MS);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", check);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, active?.source, active?.routeId]);
+
   useEffect(() => clearWatch, []);
 
-  const value = { active, status, stats, lastFix, pending, error, orphan, consent, start, stop, follow, finishOrphan, giveConsent };
+  const value = { active, status, stats, lastFix, pending, error, orphan, consent, mode, native, tracker, trackerSeenAt, pausedMs, start, stop, follow, finishOrphan, giveConsent, reloadTracker };
   return <TrackingContext.Provider value={value}>{children}</TrackingContext.Provider>;
 }
 
@@ -376,12 +591,20 @@ export function TrackingLiveCard({ big = false }) {
   const tracking = useTracking();
   const elapsed = useElapsed(tracking.active?.startedAt);
   if (!tracking.active) return null;
-  const { stats, lastFix, pending, active } = tracking;
+  const { stats, lastFix, pending, active, mode, trackerSeenAt, pausedMs } = tracking;
+  const byTracker = mode === "tracker";
   const items = [
     ["Tiempo", elapsed],
     ["Distancia", formatKm(stats.distanceKm)],
-    ["Velocidad", lastFix?.speed != null ? `${Math.round(lastFix.speed)} km/h` : "—"],
+    byTracker ? ["Vel. máxima", stats.maxSpeed ? `${Math.round(stats.maxSpeed)} km/h` : "—"] : ["Velocidad", lastFix?.speed != null ? `${Math.round(lastFix.speed)} km/h` : "—"],
   ];
+  const signal = byTracker
+    ? trackerSeenAt
+      ? `Última señal de la app de rastreo ${timeAgoLabel(trackerSeenAt)}`
+      : "Esperando la primera señal de la app de rastreo…"
+    : lastFix
+    ? `Última ubicación ${timeAgoLabel(new Date(lastFix.at).toISOString())}`
+    : "Buscando señal GPS…";
   return (
     <div className={`rounded-2xl bg-emerald-50 text-emerald-800 ring-1 ring-emerald-200 ${big ? "p-4" : "p-3"}`}>
       <p className={`flex items-center gap-2 font-bold ${big ? "text-base" : "text-xs"}`}>
@@ -396,9 +619,12 @@ export function TrackingLiveCard({ big = false }) {
         ))}
       </div>
       <p className="mt-2 text-[11px] text-emerald-700">
-        {lastFix ? `Última ubicación ${timeAgoLabel(new Date(lastFix.at).toISOString())}` : "Buscando señal GPS…"}
+        {signal}
         {pending > 0 && ` · ${pending} punto${pending === 1 ? "" : "s"} por enviar`}
       </p>
+      {mode === "browser" && pausedMs > 0 && (
+        <p className="mt-1 text-[11px] font-semibold text-amber-700">El registro estuvo en pausa {formatDuration(pausedMs)}: Navio no estaba en pantalla.</p>
+      )}
     </div>
   );
 }
@@ -410,6 +636,35 @@ function TrackingError() {
     <p className="flex items-start gap-1.5 rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] font-medium text-amber-800">
       {error.startsWith("Sin conexión") ? <WifiOff size={13} className="mt-0.5 shrink-0" /> : <AlertTriangle size={13} className="mt-0.5 shrink-0" />}
       {error}
+    </p>
+  );
+}
+
+// Qué puede hacer la persona con el teléfono mientras dura el viaje.
+function TrackingModeNote() {
+  const { mode, trackerSeenAt, active } = useTracking();
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => tick((n) => n + 1), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+  if (mode === "app") {
+    return <p className="text-[11px] text-slate-500">Puedes apagar la pantalla o usar otras apps: Navio sigue registrando el viaje. Verás un aviso fijo en el teléfono mientras dure.</p>;
+  }
+  if (mode === "tracker") {
+    const since = trackerSeenAt ?? active?.startedAt;
+    const silent = since && Date.now() - new Date(since).getTime() > 3 * 60000;
+    return (
+      <p className={`text-[11px] ${silent ? "rounded-lg bg-amber-50 px-2.5 py-2 font-medium text-amber-800" : "text-slate-500"}`}>
+        {silent
+          ? "No ha llegado señal de tu app de rastreo en los últimos minutos. Ábrela y revisa que el servicio esté encendido y con permiso de ubicación “Siempre”."
+          : "El recorrido lo registra tu app de rastreo: puedes apagar la pantalla o usar otras apps. Vuelve a Navio para finalizar el viaje."}
+      </p>
+    );
+  }
+  return (
+    <p className="rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
+      Deja Navio abierto y la pantalla encendida: en el navegador el registro se pausa si se apaga la pantalla o abres otra app, y se reanuda al volver. Para que siga en segundo plano, activa el rastreo en Cuenta → Rastreo.
     </p>
   );
 }
@@ -446,6 +701,10 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
   const [choice, setChoice] = useState(() => (openTrips[0] ? `trip:${openTrips[0].id}` : "free"));
   const [vehicleId, setVehicleId] = useState(vehicles[0]?.id ?? null);
   const [confirming, setConfirming] = useState(false);
+  // Fuera de la app, quien vinculó su app de rastreo puede elegir con qué registra.
+  const canUseTracker = !tracking.native && !!tracking.tracker;
+  const [source, setSource] = useState("tracker");
+  const chosenSource = canUseTracker ? source : "phone";
   const busy = tracking.status === "starting" || tracking.status === "stopping";
   const chosenTrip = choice.startsWith("trip:") ? openTrips.find((t) => `trip:${t.id}` === choice) : null;
   const tripVehicle = chosenTrip ? vehicles.find((v) => v.id === chosenTrip.vehicleId) ?? vehicles.find((v) => v.unit === chosenTrip.unit) : null;
@@ -455,7 +714,7 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
 
   async function handleStart() {
     if (!vehicle) return;
-    await tracking.start({ vehicleId: vehicle.id, tripId: chosenTrip?.id ?? null, unit: vehicle.unit });
+    await tracking.start({ vehicleId: vehicle.id, tripId: chosenTrip?.id ?? null, unit: vehicle.unit, source: chosenSource });
   }
 
   async function handleStop() {
@@ -469,9 +728,7 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
       <div className="space-y-3">
         <TrackingLiveCard big={big} />
         <TrackingError />
-        <p className="text-[11px] text-slate-400">
-          Deja Navio abierto y la pantalla encendida mientras manejas: el navegador deja de ubicar el teléfono si se bloquea.
-        </p>
+        <TrackingModeNote />
         {confirming ? (
           <div className="space-y-2 rounded-2xl border border-slate-200 bg-white p-3">
             <p className="text-xs font-semibold text-slate-700">¿Terminar el viaje? El recorrido queda guardado.</p>
@@ -537,6 +794,20 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
         </div>
       )}
       {chosenTrip && !tripVehicle && <p className="text-[11px] font-medium text-rose-600">La unidad de este traslado ya no existe. Pide que lo corrijan.</p>}
+      {canUseTracker && (
+        <div>
+          <label className="mb-1 block text-[11px] font-semibold text-slate-500">¿Con qué se registra el recorrido?</label>
+          <select value={source} onChange={(e) => setSource(e.target.value)} className={fieldClass}>
+            <option value="tracker">Con mi app de rastreo (sigue con la pantalla apagada)</option>
+            <option value="phone">Con este navegador (pantalla encendida)</option>
+          </select>
+        </div>
+      )}
+      {!tracking.native && chosenSource === "phone" && (
+        <p className="rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
+          En el navegador el registro se pausa si apagas la pantalla o abres otra app. Para que siga en segundo plano, activa el rastreo en Cuenta → Rastreo.
+        </p>
+      )}
       <TrackingError />
       <button onClick={handleStart} disabled={busy || !vehicle} className={`${buttonClass} bg-blue-600 hover:bg-blue-700`}>
         {tracking.status === "starting" ? "Iniciando…" : "Iniciar viaje"}

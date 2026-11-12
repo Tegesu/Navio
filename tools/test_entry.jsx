@@ -1,5 +1,7 @@
 // Página de pruebas: la app real con una base de datos falsa en memoria.
-// ?member → usuario normal · ?mobile no hace falta (depende del ancho) · ?login → pantalla de acceso real
+// ?member → usuario normal · ?login → pantalla de acceso real · ?super → super-administrador · ?legal → sin términos aceptados
+// ?native → como dentro de la app de Android (ver test_native.js) · ?tracker → con la app de rastreo ya vinculada
+import "./test_native.js";
 import "leaflet/dist/leaflet.css";
 import "./.tailwind.css";
 import { useState } from "react";
@@ -93,6 +95,7 @@ const db = {
     { id: 2, companyId: COMPANY, vehicleId: 2, unit: "Unidad 07", item: "Balatas delanteras", kind: "part", vendor: "Refaccionaria Central", startDate: "2025-01-10", endDate: "2026-01-10", kmStart: null, kmLimit: null, status: "active", createdBy: "u2", createdAt: ago(900) },
   ],
   audit_log: [{ id: 1, companyId: COMPANY, actorId: "u1", actorName: "Johana Viras", action: "insert", entity: "vehicles", entityId: "1", summary: "Unidad 12", details: null, createdAt: ago(200) }],
+  tracker_devices: params.has("tracker") ? [{ id: 1, companyId: COMPANY, userId: isMember ? "u2" : "u1", createdAt: ago(48), lastSeenAt: ago(0.05) }] : [],
   legal_acceptances: params.has("legal") ? [] : [{ id: 1, userId: isMember ? "u2" : "u1", document: "terms", version: "2026-11-11", acceptedAt: ago(1) }, { id: 2, userId: isMember ? "u2" : "u1", document: "privacy", version: "2026-11-11", acceptedAt: ago(1) }],
   privacy_requests: [],
   company_secrets: [{ companyId: COMPANY, inviteCode: "ABCDEF123456", botLinkCode: "BOT123456789" }],
@@ -197,8 +200,9 @@ const km = (a, b) => {
 };
 const myName = () => db.profiles.find((p) => p.id === ME).fullName;
 const rpcs = {
-  start_route({ target_vehicle, target_trip }) {
-    const route = { id: nextId++, companyId: COMPANY, vehicleId: target_vehicle, driverName: myName(), status: "active", distanceKm: 0, startedAt: new Date().toISOString(), endedAt: null, createdBy: ME, tripId: target_trip, pointCount: 0, maxSpeed: 0 };
+  start_route({ target_vehicle, target_trip, route_source = "phone" }) {
+    if (route_source === "tracker" && !db.tracker_devices.some((d) => d.userId === ME)) throw new Error("Primero vincula tu app de rastreo en Cuenta → Rastreo.");
+    const route = { id: nextId++, companyId: COMPANY, vehicleId: target_vehicle, driverName: myName(), status: "active", distanceKm: 0, startedAt: new Date().toISOString(), endedAt: null, createdBy: ME, tripId: target_trip, pointCount: 0, maxSpeed: 0, source: route_source, lastPointAt: null };
     db.routes.unshift(route);
     const trip = db.trips.find((t) => t.id === target_trip);
     if (trip) Object.assign(trip, { status: "ongoing", startedAt: trip.startedAt ?? route.startedAt, routeId: route.id });
@@ -305,6 +309,12 @@ const rpcs = {
   admin_list_companies: () => db.companies.map((c) => ({ ...c, inviteCode: db.company_secrets.find((x) => x.companyId === c.id)?.inviteCode ?? null, members: db.profiles.filter((p) => p.companyId === c.id).length })),
   approve_company({ target_company_id }) { db.companies.find((c) => c.id === target_company_id).status = "approved"; return "NEWCODE12345"; },
   set_company_status({ target_company_id, new_status }) { db.companies.find((c) => c.id === target_company_id).status = new_status; return null; },
+  pair_tracker_device() {
+    db.tracker_devices = db.tracker_devices.filter((d) => d.userId !== ME);
+    db.tracker_devices.push({ id: nextId++, companyId: COMPANY, userId: ME, createdAt: new Date().toISOString(), lastSeenAt: null });
+    return Array.from({ length: 64 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
+  },
+  unpair_tracker_device() { db.tracker_devices = db.tracker_devices.filter((d) => d.userId !== ME); return null; },
   set_member_role({ target_user, new_role }) { db.profiles.find((p) => p.id === target_user).companyRole = new_role; return null; },
   remove_company_member({ target_user }) { db.profiles = db.profiles.filter((p) => p.id !== target_user); return null; },
 };
@@ -387,6 +397,23 @@ window.addEventListener("load", () => {
     // Solo afecta a las pruebas.
   }
 });
+
+// ---- Dentro de la app (?native): la red del teléfono llega a las mismas funciones ----
+window.__nativeHttp = async (options) => {
+  const { data, error } = await supabase.rpc(options.url.split("/rpc/")[1], options.data);
+  return error ? { status: 400, data: { message: error.message } } : { status: 200, data };
+};
+if (params.has("native")) supabase.auth.getSession = async () => ({ data: { session: { access_token: "token-de-prueba", expires_at: Math.floor(Date.now() / 1000) + 3600 } }, error: null });
+// La app de rastreo manda un punto al viaje en curso (como lo haría el servidor).
+window.__trackerPoint = (lat, lng, kmh = 60) => {
+  const route = db.routes.find((r) => r.createdBy === ME && r.status === "active" && r.source === "tracker");
+  if (!route) return "idle";
+  const last = db.route_points.filter((p) => p.routeId === route.id).at(-1);
+  if (last) route.distanceKm = Math.round((route.distanceKm + km(last, { lat, lng })) * 1000) / 1000;
+  db.route_points.push({ id: nextId++, routeId: route.id, companyId: COMPANY, lat, lng, speed: kmh, recordedAt: new Date().toISOString(), source: "tracker" });
+  Object.assign(route, { pointCount: route.pointCount + 1, maxSpeed: Math.max(route.maxSpeed, kmh), lastPointAt: new Date().toISOString() });
+  return "tracking";
+};
 
 // ---- Sesión simulada ----
 window.__auth = { factors: [], signedOut: 0, userUpdates: [] };

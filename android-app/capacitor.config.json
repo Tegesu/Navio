@@ -1,0 +1,13 @@
+{
+  "appId": "mx.navio.app",
+  "appName": "Navio",
+  "webDir": "www",
+  "server": {
+    "url": "https://navio-fyj2.vercel.app",
+    "androidScheme": "https",
+    "allowNavigation": ["navio-fyj2.vercel.app"]
+  },
+  "android": {
+    "useLegacyBridge": true
+  }
+}

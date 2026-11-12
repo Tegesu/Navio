@@ -15,6 +15,7 @@ import { usePeople } from "./people.jsx";
 import { useTracking } from "./tracking.jsx";
 import { LEGAL_DOCS, LEGAL_VERSION, LegalModal } from "./legal.jsx";
 import { MIN_PASSWORD, translateAuthError } from "./auth.jsx";
+import { BackgroundTrackingPanel } from "./background.jsx";
 
 const card = "rounded-2xl border border-slate-200 bg-white p-4 shadow-sm";
 const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none disabled:bg-slate-50 disabled:text-slate-500";
@@ -405,6 +406,7 @@ const AUDIT_ENTITIES = {
   profiles: "Equipo",
   companies: "Empresa",
   notifications: "Alerta",
+  tracker_devices: "Rastreo",
 };
 const AUDIT_ACTIONS = { insert: "Alta", update: "Cambio", delete: "Eliminación" };
 
@@ -1080,6 +1082,7 @@ export function AccountPage({ userName, userEmail, userAvatar, onSignOut, compan
         tabs={[
           { id: "profile", label: "Perfil" },
           { id: "security", label: "Seguridad" },
+          { id: "tracking", label: "Rastreo" },
           { id: "role", label: "Mi rol" },
           { id: "privacy", label: "Privacidad" },
         ]}
@@ -1094,6 +1097,7 @@ export function AccountPage({ userName, userEmail, userAvatar, onSignOut, compan
           <PasswordCard />
         </div>
       )}
+      {tab === "tracking" && <BackgroundTrackingPanel />}
       {tab === "role" && (
         <div className={card}>
           <h2 className="mb-3 text-sm font-bold text-slate-800">Lo que puedes hacer como {isCompanyAdmin ? "administrador" : "usuario"}</h2>

@@ -15,3 +15,6 @@ tools/node_modules/
 _test.html
 assets/test-*
 tools/.tailwind.css
+
+# App de Android: sus dependencias se instalan con npm dentro de android-app/
+android-app/node_modules/

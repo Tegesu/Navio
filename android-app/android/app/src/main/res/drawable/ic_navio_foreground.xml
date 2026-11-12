@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- La "N" de Navio para el ícono adaptable (zona segura: los 66dp del centro). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M39,71 L39,37 L46.5,37 L61.5,59 L61.5,37 L69,37 L69,71 L61.5,71 L46.5,49 L46.5,71 Z" />
+</vector>
