@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, Clock, Eye, EyeOff, FileCheck2, MapPin, RefreshCw, ShieldCheck } from "lucide-react";
 import { supabase, useAuth } from "./NavioDashboard.jsx";
 import { CookieNotice, LEGAL_VERSION, LegalLinks, LegalModal } from "./legal.jsx";
+import { AndroidAppDownload } from "./background.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Pantallas de entrada: iniciar sesión, crear cuenta, unirse a empresa  */
@@ -430,6 +431,9 @@ export function LoginPage() {
           </button>
         )}
       </p>
+      <div className="mt-6 border-t border-slate-100 pt-4 text-center">
+        <AndroidAppDownload variant="link" label="¿Manejas? Descarga la app para Android" />
+      </div>
       {legalDoc && <LegalModal doc={legalDoc} onClose={() => setLegalDoc(null)} />}
     </AuthLayout>
   );

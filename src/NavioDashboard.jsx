@@ -8,6 +8,7 @@ import { hideSplash, FullScreenLoader, SupabaseSetupNotice, LoginPage, UpdatePas
 import { SettingsPage, AccountPage, IdleGuard } from "./settings.jsx";
 import { AdminCompaniesPage } from "./admin.jsx";
 import { MobileAppShell } from "./mobile.jsx";
+import { AndroidAppDownload } from "./background.jsx";
 import { CookieNotice, LegalAcceptanceGate } from "./legal.jsx";
 import { HomePage } from "./home.jsx";
 import { FleetDataProvider, VehicleStatusChip, FleetStatusSummary, VehicleDocsTab, VehicleServiceTab, VehicleTiresTab, VehicleHistoryTab, VehicleLocationPanel, WarrantiesPanel, WarrantiesPage, MaintenanceUnitDetail } from "./vehicle.jsx";
@@ -7833,6 +7834,7 @@ function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLo
             {open && <span className="truncate">Administración</span>}
           </button>
         )}
+        <AndroidAppDownload variant="nav" label="App para Android" collapsed={!open} />
       </div>
 
       {open ? (

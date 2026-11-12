@@ -2,7 +2,36 @@ import { useMemo, useState } from "react";
 import qrcode from "qrcode-generator";
 import { CheckCircle2, Copy, Download, Smartphone } from "lucide-react";
 import { supabase, useToast, ConfirmModal, timeAgoLabel } from "./NavioDashboard.jsx";
-import { useTracking, ANDROID_APP_URL } from "./tracking.jsx";
+import { useTracking, isNativeApp, ANDROID_APP_URL } from "./tracking.jsx";
+
+export const isAndroidDevice = () => typeof navigator !== "undefined" && /android/i.test(navigator.userAgent);
+
+// Botón para descargar la app de Android. No aparece dentro de la propia app.
+//   variant "button": botón azul · "link": enlace discreto · "nav": renglón de la barra lateral
+export function AndroidAppDownload({ variant = "button", label = "Descargar la app para Android", collapsed = false, className = "" }) {
+  if (isNativeApp()) return null;
+  const common = { href: ANDROID_APP_URL, target: "_blank", rel: "noopener noreferrer", title: "Descargar la app Navio para Android" };
+  if (variant === "link") {
+    return (
+      <a {...common} className={`inline-flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-700 ${className}`}>
+        <Smartphone size={14} /> {label}
+      </a>
+    );
+  }
+  if (variant === "nav") {
+    return (
+      <a {...common} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-xs font-medium text-slate-500 transition hover:bg-slate-50 hover:text-slate-700 ${collapsed ? "justify-center" : ""} ${className}`}>
+        <Smartphone size={16} className="shrink-0" />
+        {!collapsed && <span className="truncate">{label}</span>}
+      </a>
+    );
+  }
+  return (
+    <a {...common} className={`inline-flex items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700 ${className}`}>
+      <Download size={14} /> {label}
+    </a>
+  );
+}
 
 /* ---------------------------------------------------------------------- */
 /*  Rastreo en segundo plano: que el viaje siga con la pantalla apagada   */
@@ -85,9 +114,7 @@ function AndroidAppCard() {
         </p>
       ) : (
         <>
-          <a href={ANDROID_APP_URL} target="_blank" rel="noopener noreferrer" className={primaryButton}>
-            <Download size={14} /> Descargar la app para Android
-          </a>
+          <AndroidAppDownload />
           <ol className="space-y-2">
             <Step number={1}>Abre este enlace desde el teléfono Android y descarga el archivo.</Step>
             <Step number={2}>Al abrirlo, Android pedirá permiso para “instalar apps de esta fuente”: acéptalo solo para esta instalación.</Step>

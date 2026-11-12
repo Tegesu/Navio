@@ -804,9 +804,17 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
         </div>
       )}
       {!tracking.native && chosenSource === "phone" && (
-        <p className="rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
-          En el navegador el registro se pausa si apagas la pantalla o abres otra app. Para que siga en segundo plano, activa el rastreo en Cuenta → Rastreo.
-        </p>
+        <div className="space-y-2 rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
+          <p>
+            En el navegador el registro se pausa si apagas la pantalla o abres otra app.{" "}
+            {/android/i.test(navigator.userAgent) ? "Con la app de Android sigue registrando en segundo plano." : "Para que siga en segundo plano, activa el rastreo en Cuenta → Rastreo."}
+          </p>
+          {/android/i.test(navigator.userAgent) && (
+            <a href={ANDROID_APP_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700">
+              <Navigation size={12} /> Descargar la app para Android
+            </a>
+          )}
+        </div>
       )}
       <TrackingError />
       <button onClick={handleStart} disabled={busy || !vehicle} className={`${buttonClass} bg-blue-600 hover:bg-blue-700`}>

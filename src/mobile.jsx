@@ -6,6 +6,7 @@ import { useTracking, TrackingLiveCard, LiveMapPage } from "./tracking.jsx";
 import { MobileTripTab } from "./trips.jsx";
 import { AccountPage } from "./settings.jsx";
 import { LegalLinks } from "./legal.jsx";
+import { AndroidAppDownload, isAndroidDevice } from "./background.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Navio en el celular: lo que se usa en campo, a un toque               */
@@ -85,6 +86,14 @@ function HomeTab({ vehicles, trips, userName, companyName, pendingCount, isAdmin
           </span>
           <Navigation size={22} className="shrink-0" />
         </button>
+      )}
+
+      {isAndroidDevice() && !tracking?.native && (
+        <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4">
+          <p className="text-sm font-bold text-slate-800">Instala la app Navio</p>
+          <p className="mt-1 text-xs text-slate-600">Con la app, el viaje se sigue registrando aunque apagues la pantalla o uses otras apps.</p>
+          <AndroidAppDownload className="mt-3 w-full py-2.5" />
+        </div>
       )}
 
       <div className="grid grid-cols-3 gap-2">
