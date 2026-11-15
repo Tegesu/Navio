@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { CAPTCHA_SITE_KEY } from "./config.js";
 import { AlertTriangle, CheckCircle2, Clock, Eye, EyeOff, FileCheck2, MapPin, RefreshCw, ShieldCheck } from "lucide-react";
 import { supabase, useAuth } from "./NavioDashboard.jsx";
 import { CookieNotice, LEGAL_VERSION, LegalLinks, LegalModal } from "./legal.jsx";
@@ -31,6 +32,7 @@ export function translateAuthError(error) {
   if (low.includes("email not confirmed")) return "Confirma tu correo antes de iniciar sesión (revisa tu bandeja de entrada).";
   if (low.includes("rate limit") || low.includes("security purposes")) return "Demasiados intentos. Espera un momento y vuelve a intentar.";
   if (low.includes("totp") || low.includes("mfa")) return "El código no es correcto o ya caducó.";
+  if (low.includes("captcha")) return "No se pudo comprobar que no eres un robot. Vuelve a intentarlo.";
   if (low.includes("failed to fetch") || low.includes("network")) return "No hay conexión con el servidor. Revisa tu internet.";
   return msg || "Ocurrió un error inesperado. Intenta de nuevo.";
 }
@@ -296,6 +298,80 @@ function PasswordInput({ value, onChange, autoComplete, minLength, id }) {
   );
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Protección contra bots (Cloudflare Turnstile, si está activa)         */
+/* ---------------------------------------------------------------------- */
+
+const TURNSTILE_SRC = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+let turnstileLoading = null;
+
+function loadTurnstile() {
+  if (window.turnstile) return Promise.resolve(window.turnstile);
+  if (!turnstileLoading) {
+    turnstileLoading = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = TURNSTILE_SRC;
+      script.async = true;
+      script.onload = () => (window.turnstile ? resolve(window.turnstile) : reject(new Error("captcha")));
+      script.onerror = () => {
+        turnstileLoading = null;
+        reject(new Error("captcha"));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return turnstileLoading;
+}
+
+export const captchaEnabled = () => !!CAPTCHA_SITE_KEY;
+
+// Muestra la verificación y entrega el comprobante (un solo uso). Cambiar
+// "resetKey" pide uno nuevo.
+function Captcha({ onToken, resetKey }) {
+  const box = useRef(null);
+  const widget = useRef(null);
+  const tokenRef = useRef(onToken);
+  tokenRef.current = onToken;
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!CAPTCHA_SITE_KEY) return undefined;
+    let cancelled = false;
+    loadTurnstile()
+      .then((turnstile) => {
+        if (cancelled || !box.current) return;
+        widget.current = turnstile.render(box.current, {
+          sitekey: CAPTCHA_SITE_KEY,
+          language: "es",
+          theme: "light",
+          callback: (token) => tokenRef.current(token),
+          "expired-callback": () => tokenRef.current(""),
+          "error-callback": () => tokenRef.current(""),
+        });
+      })
+      .catch(() => !cancelled && setFailed(true));
+    return () => {
+      cancelled = true;
+      if (widget.current != null) window.turnstile?.remove(widget.current);
+      widget.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!resetKey || widget.current == null) return;
+    tokenRef.current("");
+    window.turnstile?.reset(widget.current);
+  }, [resetKey]);
+
+  if (!CAPTCHA_SITE_KEY) return null;
+  return (
+    <div>
+      <div ref={box} className="min-h-[65px]" />
+      {failed && <p className="mt-1 text-[11px] font-medium text-rose-600">No se pudo cargar la verificación. Revisa tu conexión y recarga la página.</p>}
+    </div>
+  );
+}
+
 const MODES = { SIGN_IN: "signin", SIGN_UP: "signup", FORGOT: "forgot" };
 const MODE_TEXT = {
   signin: { title: "Iniciar sesión", hint: "Entra a tu panel de Navio.", submit: "Entrar" },
@@ -314,6 +390,8 @@ export function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [captchaToken, setCaptchaToken] = useState("");
+  const [captchaReset, setCaptchaReset] = useState(0);
 
   function switchMode(next) {
     setError("");
@@ -330,16 +408,18 @@ export function LoginPage() {
       if (password.length < MIN_PASSWORD) return setError(`Usa una contraseña de al menos ${MIN_PASSWORD} caracteres.`);
       if (!accepted) return setError("Para crear tu cuenta necesitas aceptar los términos y el aviso de privacidad.");
     }
+    if (captchaEnabled() && !captchaToken) return setError("Espera a que termine la verificación de seguridad (abajo del formulario).");
+    const token = captchaToken || undefined;
     setLoading(true);
     try {
-      if (mode === MODES.SIGN_IN) await signIn(email.trim(), password);
+      if (mode === MODES.SIGN_IN) await signIn(email.trim(), password, token);
       else if (mode === MODES.SIGN_UP) {
-        await signUp(email.trim(), password, fullName.trim(), LEGAL_VERSION);
+        await signUp(email.trim(), password, fullName.trim(), LEGAL_VERSION, token);
         setPassword("");
         setNotice("Listo. Te enviamos un correo para confirmar tu cuenta; ábrelo y después inicia sesión.");
         setMode(MODES.SIGN_IN);
       } else {
-        await resetPassword(email.trim());
+        await resetPassword(email.trim(), token);
         // El mismo mensaje exista o no la cuenta: no se revela quién está registrado.
         setNotice("Si ese correo tiene una cuenta, recibirá un enlace para elegir una contraseña nueva.");
       }
@@ -347,6 +427,8 @@ export function LoginPage() {
       setError(translateAuthError(err));
     } finally {
       setLoading(false);
+      // Cada comprobante sirve una sola vez.
+      if (captchaEnabled()) setCaptchaReset((n) => n + 1);
     }
     return undefined;
   }
@@ -404,6 +486,8 @@ export function LoginPage() {
             </span>
           </label>
         )}
+
+        <Captcha onToken={setCaptchaToken} resetKey={captchaReset} />
 
         <AuthErrorMessage message={error} />
         {notice && (

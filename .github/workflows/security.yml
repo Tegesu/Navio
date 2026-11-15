@@ -1,0 +1,54 @@
+# Revisión de seguridad de las dependencias de Navio.
+#
+# Corre cada lunes y cada vez que cambian las listas de librerías o las
+# funciones del servidor. Si encuentra algo, la ejecución falla y GitHub
+# avisa por correo a quien administra el repositorio.
+name: Seguridad de dependencias
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 13 * * 1" # lunes, 7:00 hora del centro de México
+  push:
+    branches: [main]
+    paths:
+      - "tools/package*.json"
+      - "android-app/package*.json"
+      - "supabase/functions/**"
+      - ".github/workflows/security.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Librerías de la página (tools)
+        working-directory: tools
+        run: npm audit --audit-level=high --omit=optional
+
+      - name: Librerías de la app de Android
+        working-directory: android-app
+        run: npm audit --audit-level=high
+
+      - name: Funciones del servidor con versiones fijas
+        run: |
+          # Toda librería importada por las funciones debe llevar versión exacta
+          # (por ejemplo @2.118.0), para que nada cambie sin revisarlo.
+          if grep -rnE 'https://esm\.sh/[^"]*@[0-9]+(\.[0-9]+)?"' supabase/functions; then
+            echo "Hay importaciones sin versión exacta." >&2
+            exit 1
+          fi
+          if grep -rnE 'from "https://esm\.sh/[^@"]+"' supabase/functions; then
+            echo "Hay importaciones sin versión." >&2
+            exit 1
+          fi
+          echo "Todas las importaciones tienen versión exacta."

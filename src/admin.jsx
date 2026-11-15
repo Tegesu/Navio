@@ -32,7 +32,7 @@ function CompaniesPanel() {
   const load = useCallback(async () => {
     let { data, error } = await supabase.rpc("admin_list_companies");
     // Antes de la actualización de la base de datos esa función no existe.
-    if (error) ({ data, error } = await supabase.from("companies").select("*").order("createdAt", { ascending: false }));
+    if (error) ({ data, error } = await supabase.from("companies").select("id, name, industry, fleetSize, contactName, contactEmail, contactPhone, needs, status, createdAt, approvedAt").order("createdAt", { ascending: false }));
     setLoadError(error?.message ?? "");
     setCompanies(data ?? []);
   }, []);
@@ -198,7 +198,7 @@ function PrivacyRequestsPanel() {
   const [names, setNames] = useState({});
 
   const load = useCallback(async () => {
-    const { data } = await supabase.from("privacy_requests").select("*").order("createdAt", { ascending: false }).limit(200);
+    const { data } = await supabase.from("privacy_requests").select("id, userId, companyId, kind, detail, status, response, createdAt").order("createdAt", { ascending: false }).limit(200);
     setRows(data ?? []);
     // Para saber de quién es cada solicitud sin mostrar solo su identificador.
     const ids = [...new Set((data ?? []).map((row) => row.userId))];

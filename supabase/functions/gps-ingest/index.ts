@@ -22,9 +22,39 @@
 // Variables de entorno (ya existen en el proyecto): SUPABASE_URL y
 // SUPABASE_SERVICE_ROLE_KEY.
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+// Versión fija: una actualización de la librería no entra sin revisarla.
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.118.0";
 
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+
+// Quien prueba claves al azar: tras 30 claves desconocidas en 10 minutos
+// desde la misma dirección, se le contesta 429 sin consultar la base. (Es
+// por instancia de la función; el límite por teléfono vive en la base.)
+const BAD_TOKEN_LIMIT = 30;
+const BAD_TOKEN_WINDOW_MS = 10 * 60 * 1000;
+const badTokens = new Map<string, { count: number; since: number }>();
+
+function clientAddress(req: Request): string {
+  return (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || req.headers.get("cf-connecting-ip") || "desconocida";
+}
+
+function blocked(address: string): boolean {
+  const entry = badTokens.get(address);
+  if (!entry) return false;
+  if (Date.now() - entry.since > BAD_TOKEN_WINDOW_MS) {
+    badTokens.delete(address);
+    return false;
+  }
+  return entry.count >= BAD_TOKEN_LIMIT;
+}
+
+function countBadToken(address: string) {
+  const now = Date.now();
+  const entry = badTokens.get(address);
+  if (!entry || now - entry.since > BAD_TOKEN_WINDOW_MS) badTokens.set(address, { count: 1, since: now });
+  else entry.count += 1;
+  if (badTokens.size > 10_000) badTokens.clear(); // no crece sin límite
+}
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_POINTS = 500;
@@ -93,10 +123,17 @@ function pointsFromParams(params: URLSearchParams): Point[] {
   return point ? [point] : [];
 }
 
-const reply = (status: number, text = "") => new Response(text, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+const reply = (status: number, text = "") =>
+  new Response(text, {
+    status,
+    headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" },
+  });
 
 Deno.serve(async (req) => {
   if (req.method !== "GET" && req.method !== "POST") return reply(405, "Método no permitido");
+
+  const address = clientAddress(req);
+  if (blocked(address)) return reply(429, "Demasiados intentos");
 
   const url = new URL(req.url);
   let token = url.searchParams.get("id") ?? url.searchParams.get("deviceid") ?? "";
@@ -120,10 +157,15 @@ Deno.serve(async (req) => {
   }
 
   token = token.trim();
-  if (token.length < 32 || token.length > 128) return reply(404, "Teléfono no vinculado");
+  if (token.length < 32 || token.length > 128) {
+    countBadToken(address);
+    return reply(404, "Teléfono no vinculado");
+  }
 
   const { data, error } = await supabase.rpc("ingest_tracker_points", { device_token: token, points: points.slice(0, MAX_POINTS) });
   if (error) {
+    // Demasiados envíos de este teléfono: la app reintenta más tarde.
+    if (error.code === "P0429") return reply(429, "Demasiados envíos");
     console.error("ingest_tracker_points:", error.message);
     // Con un 500 la app de rastreo guarda el punto y lo reintenta después.
     return reply(500, "No se pudo guardar");
@@ -132,6 +174,9 @@ Deno.serve(async (req) => {
   // "unknown": la clave no existe → 404, para que se note en la app de rastreo.
   // Lo demás responde 200 aunque no se guarde nada (sin viaje en curso), para
   // que el teléfono no acumule ubicaciones de fuera de un viaje.
-  if (data?.status === "unknown") return reply(404, "Teléfono no vinculado");
+  if (data?.status === "unknown") {
+    countBadToken(address);
+    return reply(404, "Teléfono no vinculado");
+  }
   return reply(200);
 });

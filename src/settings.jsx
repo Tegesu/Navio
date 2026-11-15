@@ -419,7 +419,7 @@ function AuditPanel() {
     if (!isAdmin) return;
     supabase
       .from("audit_log")
-      .select("*")
+      .select("id, entity, action, summary, actorName, createdAt, details")
       .order("createdAt", { ascending: false })
       .limit(200)
       .then(({ data }) => setRows(data ?? []));
@@ -575,8 +575,8 @@ export function PrivacyPanel() {
 
   const load = useCallback(async () => {
     const [{ data: reqs }, { data: accepted }] = await Promise.all([
-      supabase.from("privacy_requests").select("*").eq("userId", user.id).order("createdAt", { ascending: false }),
-      supabase.from("legal_acceptances").select("*").eq("userId", user.id).order("acceptedAt", { ascending: false }),
+      supabase.from("privacy_requests").select("id, kind, detail, status, response, createdAt").eq("userId", user.id).order("createdAt", { ascending: false }),
+      supabase.from("legal_acceptances").select("document, version, acceptedAt").eq("userId", user.id).order("acceptedAt", { ascending: false }),
     ]);
     setRequests(reqs ?? []);
     setAcceptances(accepted ?? []);
@@ -902,7 +902,7 @@ function PasswordCard() {
       await updatePassword(password);
       setPassword("");
       setRepeat("");
-      showToast("Contraseña actualizada.");
+      showToast("Contraseña actualizada. Se cerró tu sesión en los demás dispositivos.");
     } catch (err) {
       setError(translateAuthError(err));
     } finally {

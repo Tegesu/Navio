@@ -10,7 +10,8 @@
 // diseño — la empresa correcta se determina SIEMPRE a partir de
 // "botChatId", nunca de un dato que mande el propio mensaje.
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+// Versión fija: una actualización de la librería no entra sin revisarla.
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.118.0";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -62,6 +63,46 @@ const TRAVEL_EXPENSE_TYPES = ["viaticos", "hotel", "alimentos", "transporte", "o
 // Un archivo puede traer varias facturas. El tope evita que uno enorme deje
 // la función sin tiempo antes de contestar.
 const MAX_INVOICES_PER_DOCUMENT = 10;
+
+// Cada documento cuesta una lectura de IA: límite por empresa.
+const COMPANY_LIMITS = [
+  { bucket: "bot_hour", max: 40, per: "1 hour", message: "Llegaste al límite de 40 documentos por hora para tu empresa. Intenta un poco más tarde." },
+  { bucket: "bot_day", max: 300, per: "1 day", message: "Llegaste al límite de 300 documentos por día para tu empresa. Intenta mañana." },
+];
+// Telegram solo deja descargar archivos de hasta 20 MB.
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_TEXT_CHARS = 4000;
+
+// El tipo real del archivo se reconoce por sus primeros bytes, no por el
+// nombre: solo se aceptan PDF e imágenes JPG, PNG o WEBP.
+function sniffMimeType(bytes: Uint8Array): string | null {
+  const starts = (...sig: number[]) => sig.every((b, i) => bytes[i] === b);
+  if (starts(0x25, 0x50, 0x44, 0x46)) return "application/pdf";
+  if (starts(0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
+  if (starts(0x52, 0x49, 0x46, 0x46) && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+  return null;
+}
+
+// Devuelve el mensaje para el chat si la empresa ya llegó a su límite.
+async function companyLimitReached(companyId: number): Promise<string | null> {
+  for (const limit of COMPANY_LIMITS) {
+    const { error } = await supabase.rpc("hit_rate_limit", {
+      limit_bucket: limit.bucket,
+      limit_subject: String(companyId),
+      max_hits: limit.max,
+      per_window: limit.per,
+      message: limit.message,
+    });
+    if (!error) continue;
+    if (error.code === "P0429" || error.message === limit.message) return limit.message;
+    // Si el límite no se puede consultar (por ejemplo, falta la migración
+    // v19), el bot sigue funcionando.
+    console.error("hit_rate_limit:", error.message);
+    return null;
+  }
+  return null;
+}
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -236,7 +277,7 @@ function base64ToBytes(base64: string): Uint8Array {
 }
 
 async function uploadDocument(companyId: number, module: string, file: { base64: string; mimeType: string }): Promise<string | null> {
-  const ext = file.mimeType === "application/pdf" ? "pdf" : file.mimeType === "image/png" ? "png" : "jpg";
+  const ext = { "application/pdf": "pdf", "image/png": "png", "image/webp": "webp" }[file.mimeType] ?? "jpg";
   const path = `${companyId}/${module}/${crypto.randomUUID()}.${ext}`;
   const { error } = await supabase.storage.from("documents").upload(path, base64ToBytes(file.base64), {
     contentType: file.mimeType,
@@ -257,23 +298,24 @@ async function sendMessage(chatId: string, text: string) {
   });
 }
 
-async function fetchTelegramFileBase64(fileId: string): Promise<{ base64: string; mimeType: string } | null> {
-  const infoRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+async function fetchTelegramFileBase64(fileId: string): Promise<{ base64: string; mimeType: string } | { rejected: string } | null> {
+  const infoRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
   const info = await infoRes.json();
   const filePath = info?.result?.file_path;
   if (!filePath) {
     console.error("Telegram getFile sin file_path", JSON.stringify(info));
     return null;
   }
+  if (Number(info?.result?.file_size) > MAX_FILE_BYTES) return { rejected: "too_big" };
 
   const fileRes = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`);
   const buf = new Uint8Array(await fileRes.arrayBuffer());
+  if (buf.length > MAX_FILE_BYTES) return { rejected: "too_big" };
+  const mimeType = sniffMimeType(buf);
+  if (!mimeType) return { rejected: "type" };
   let binary = "";
   for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
-  const base64 = btoa(binary);
-  const ext = filePath.split(".").pop()?.toLowerCase();
-  const mimeType = ext === "png" ? "image/png" : ext === "pdf" ? "application/pdf" : "image/jpeg";
-  return { base64, mimeType };
+  return { base64: btoa(binary), mimeType };
 }
 
 const EXTRACTION_PROMPT = `Lee TODO este documento (normalmente uno o varios CFDI mexicanos) relacionado con una flotilla vehicular o el viaje de un conductor, y extrae toda la información importante. Un mismo archivo puede traer VARIAS facturas distintas, por ejemplo un PDF con varias facturas del mismo servicio. Responde ÚNICAMENTE con JSON válido, sin texto adicional ni explicaciones, exactamente con esta forma:
@@ -459,7 +501,7 @@ Deno.serve(async (req) => {
   }
 
   const chatId = String(message.chat.id);
-  const text = (message.text || message.caption || "").trim();
+  const text = (message.text || message.caption || "").trim().slice(0, MAX_TEXT_CHARS);
 
   // --- Vincular un chat a una empresa ---
   if (text.toLowerCase().startsWith("/vincular")) {
@@ -521,9 +563,34 @@ Deno.serve(async (req) => {
   }
 
   const fileId = message.photo?.at(-1)?.file_id || message.document?.file_id;
+  if (!fileId && !text) {
+    await sendMessage(chatId, "Mándame una foto o PDF de la factura, o descríbela en texto (monto, unidad, fecha, concepto).");
+    return new Response("ok");
+  }
+  if (Number(message.document?.file_size) > MAX_FILE_BYTES) {
+    await sendMessage(chatId, "El archivo pesa más de 20 MB. Mándalo más ligero (por ejemplo, una foto o un PDF por factura).");
+    return new Response("ok");
+  }
+
+  const limitMessage = await companyLimitReached(company.id);
+  if (limitMessage) {
+    await sendMessage(chatId, limitMessage);
+    return new Response("ok");
+  }
+
   let file: { base64: string; mimeType: string } | null = null;
   if (fileId) {
-    file = await fetchTelegramFileBase64(fileId);
+    const fetched = await fetchTelegramFileBase64(fileId);
+    if (fetched && "rejected" in fetched) {
+      await sendMessage(
+        chatId,
+        fetched.rejected === "too_big"
+          ? "El archivo pesa más de 20 MB. Mándalo más ligero (por ejemplo, una foto o un PDF por factura)."
+          : "Solo puedo leer PDF o fotos (JPG, PNG o WEBP). Mándame la factura en uno de esos formatos."
+      );
+      return new Response("ok");
+    }
+    file = fetched;
   }
 
   if (!file && !text) {

@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 import { Cookie, FileText, ShieldCheck } from "lucide-react";
 import { supabase, useAuth, Modal } from "./NavioDashboard.jsx";
+import { CAPTCHA_SITE_KEY } from "./config.js";
+
+// Si la verificación contra bots está activa, se menciona a Cloudflare.
+const CAPTCHA_PROVIDER = "Cloudflare (Turnstile): verificación contra programas automáticos al iniciar sesión, crear una cuenta o recuperar la contraseña. Analiza señales técnicas del navegador, incluida tu dirección IP, solo para ese fin.";
 
 /* ---------------------------------------------------------------------- */
 /*  Avisos legales                                                        */
@@ -75,6 +79,7 @@ const privacy = () => ({
         "Google: lectura automática de documentos (Gemini).",
         "Telegram: solo si tu empresa usa el bot para enviar documentos.",
         "OpenStreetMap: imágenes del mapa. Al abrir un mapa, tu navegador les pide las imágenes de la zona que estás viendo, por lo que reciben tu dirección IP.",
+        ...(CAPTCHA_SITE_KEY ? [CAPTCHA_PROVIDER] : []),
       ],
       after: [
         "Algunos de estos proveedores están fuera de México, por lo que tus datos pueden tratarse en otros países con medidas de seguridad equivalentes. Fuera de estos casos, los datos solo se entregan a una autoridad competente cuando la ley lo exige.",
@@ -237,6 +242,7 @@ const cookies = () => ({
       title: "Servicios de terceros",
       text: [
         "Al abrir un mapa, tu navegador descarga las imágenes de OpenStreetMap, que recibe tu dirección IP. No se cargan herramientas de analítica ni de publicidad de terceros.",
+        ...(CAPTCHA_SITE_KEY ? [CAPTCHA_PROVIDER] : []),
       ],
     },
     {

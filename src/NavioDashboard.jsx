@@ -400,18 +400,19 @@ function AuthProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function signIn(email, password) {
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+  // captchaToken: la verificación contra bots, si está activa (src/config.js).
+  async function signIn(email, password, captchaToken) {
+    const { error } = await supabase.auth.signInWithPassword({ email, password, options: captchaToken ? { captchaToken } : undefined });
     if (error) throw error;
     // Si la cuenta tiene verificación en dos pasos, sigue la pantalla del código.
     await refreshAal();
   }
 
-  async function signUp(email, password, fullName, legalVersion) {
+  async function signUp(email, password, fullName, legalVersion, captchaToken) {
     const { error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { full_name: fullName, legal_version: legalVersion ?? null }, emailRedirectTo: window.location.origin },
+      options: { data: { full_name: fullName, legal_version: legalVersion ?? null }, emailRedirectTo: window.location.origin, ...(captchaToken ? { captchaToken } : {}) },
     });
     if (error) throw error;
   }
@@ -420,9 +421,10 @@ function AuthProvider({ children }) {
     await supabase.auth.signOut();
   }
 
-  async function resetPassword(email) {
+  async function resetPassword(email, captchaToken) {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
       redirectTo: window.location.origin + window.location.pathname,
+      ...(captchaToken ? { captchaToken } : {}),
     });
     if (error) throw error;
   }
@@ -430,6 +432,9 @@ function AuthProvider({ children }) {
   async function updatePassword(newPassword) {
     const { error } = await supabase.auth.updateUser({ password: newPassword });
     if (error) throw error;
+    // Con la contraseña nueva se cierran las demás sesiones abiertas (por
+    // ejemplo, la de alguien que conocía la anterior). Esta sigue activa.
+    await supabase.auth.signOut({ scope: "others" }).catch(() => {});
     setPasswordRecovery(false);
   }
 

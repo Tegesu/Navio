@@ -102,6 +102,7 @@ const db = {
   companies: [{ id: COMPANY, name: "Empresa de prueba", currency: "MXN", status: "approved", botChannel: null, botChatId: null, contactName: "Johana", contactEmail: "j@x.test", contactPhone: "", legalName: "", rfc: "", address: "", settings: {} }],
 };
 window.__db = db;
+window.__supabase = supabase;
 window.__writes = [];
 window.__fail = {}; // { tabla o rpc: "mensaje" } para simular errores
 

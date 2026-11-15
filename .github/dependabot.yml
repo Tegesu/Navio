@@ -1,0 +1,30 @@
+# Dependabot vigila las librerías de Navio.
+#
+# "open-pull-requests-limit: 0" apaga las actualizaciones de rutina: solo se
+# abren propuestas cuando hay una vulnerabilidad conocida (requiere activar
+# "Dependabot security updates" en GitHub → Settings → Code security).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /tools
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: npm
+    directory: /android-app
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: gradle
+    directory: /android-app/android
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
