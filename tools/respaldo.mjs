@@ -4,39 +4,83 @@
 // Solo LEE: no cambia ni borra nada en Supabase.
 //
 // Uso (PowerShell, desde la carpeta de Navio):
-//   $env:NAVIO_SERVICE_KEY = "<llave secreta de Supabase>"
 //   D:\Nueva\Node\node.exe tools\respaldo.mjs
-//   Remove-Item Env:NAVIO_SERVICE_KEY
+// El script pide la llave secreta: pégala con clic derecho y presiona Enter.
+// No se ve en pantalla ni queda en el historial de PowerShell.
 //
 // La llave secreta está en Supabase → Project Settings → API Keys
-// ("service_role" o "Secret key"). No la guardes en archivos ni la compartas.
+// ("Secret keys", empieza con sb_secret_; o la "service_role" antigua, que
+// empieza con eyJ). No la guardes en archivos ni la compartas.
 //
-// Opcional: NAVIO_BACKUP_DIR para elegir otra carpeta de destino
-// (por omisión, D:\Navio-respaldos\<fecha y hora>).
+// Opcional: NAVIO_SERVICE_KEY con la llave (si no se quiere escribir),
+// NAVIO_BACKUP_DIR para elegir otra carpeta de destino (por omisión,
+// D:\Navio-respaldos\<fecha y hora>).
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const SUPABASE_URL = process.env.NAVIO_SUPABASE_URL || "https://bwvetvomcfmolhfrrlcx.supabase.co";
-const KEY = (process.env.NAVIO_SERVICE_KEY || "").trim();
 const BUCKETS = ["documents"];
 const PAGE = 1000;
 const STORAGE_PAGE = 100;
 
+// Pide la llave sin mostrarla (ni asteriscos).
+function askHidden(question) {
+  if (!process.stdin.isTTY) return Promise.resolve("");
+  process.stdout.write(question);
+  return new Promise((resolve) => {
+    let value = "";
+    const finish = () => {
+      process.stdin.off("data", onData);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdout.write("\n");
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === "\r" || ch === "\n") return finish();
+        if (ch === "\u0003") {
+          process.stdout.write("\nCancelado.\n");
+          process.exit(1);
+        }
+        if (ch === "\u0008" || ch === "\u007f") value = value.slice(0, -1);
+        else if (ch >= " ") value += ch;
+      }
+      return undefined;
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", onData);
+    process.stdin.resume();
+  });
+}
+
+let KEY = (process.env.NAVIO_SERVICE_KEY || "").trim();
+if (!KEY) KEY = (await askHidden("Pega la llave secreta de Supabase (clic derecho) y presiona Enter. No se verá: ")).trim();
+
 if (!KEY) {
-  console.error("Falta la llave. En PowerShell escribe primero:");
-  console.error('  $env:NAVIO_SERVICE_KEY = "<llave secreta de Supabase>"');
+  console.error("No se recibió ninguna llave. Vuelve a correr el comando y pégala cuando la pida.");
   process.exit(1);
 }
+if (KEY.startsWith("sb_publishable_")) {
+  console.error("Esa es la llave pública (publishable). Se necesita la secreta: Project Settings → API Keys → Secret keys.");
+  process.exit(1);
+}
+if (!/^(sb_secret_|eyJ)[A-Za-z0-9._-]{20,}$/.test(KEY)) {
+  console.error("Eso no parece una llave secreta de Supabase (debe empezar con sb_secret_ o eyJ y no llevar espacios). Vuelve a copiarla.");
+  process.exit(1);
+}
+console.log(`Llave recibida: ${KEY.slice(0, 10)}… (${KEY.length} caracteres)`);
 
 const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
 const OUT = process.env.NAVIO_BACKUP_DIR || path.join("D:\\Navio-respaldos", stamp);
 mkdirSync(path.join(OUT, "tablas"), { recursive: true });
 mkdirSync(path.join(OUT, "archivos"), { recursive: true });
 
-// Las llaves nuevas ("sb_secret_…") van solo en "apikey"; las antiguas
-// (JWT "eyJ…") también como "Authorization".
-const headers = { apikey: KEY, ...(KEY.startsWith("eyJ") ? { Authorization: `Bearer ${KEY}` } : {}) };
+// Igual que la librería oficial de Supabase: la llave va en "apikey" y en
+// "Authorization" (el almacén de archivos exige esta última).
+const headers = { apikey: KEY, Authorization: `Bearer ${KEY}` };
 const summary = { fecha: new Date().toISOString(), proyecto: SUPABASE_URL, tablas: {}, cuentas: 0, archivos: { total: 0, bytes: 0 }, errores: [] };
 
 async function getJson(url, extra = {}) {
