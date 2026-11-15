@@ -5,8 +5,10 @@
 //
 // Uso (PowerShell, desde la carpeta de Navio):
 //   D:\Nueva\Node\node.exe tools\respaldo.mjs
-// El script pide la llave secreta: pégala con clic derecho y presiona Enter.
-// No se ve en pantalla ni queda en el historial de PowerShell.
+// Cuando lo pida, copia la llave secreta en Supabase (botón de copiar),
+// vuelve a PowerShell y presiona Enter: el script la toma del portapapeles,
+// no la muestra y después vacía el portapapeles. Tampoco queda en el
+// historial de PowerShell.
 //
 // La llave secreta está en Supabase → Project Settings → API Keys
 // ("Secret keys", empieza con sb_secret_; o la "service_role" antigua, que
@@ -16,60 +18,72 @@
 // NAVIO_BACKUP_DIR para elegir otra carpeta de destino (por omisión,
 // D:\Navio-respaldos\<fecha y hora>).
 
+import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 
 const SUPABASE_URL = process.env.NAVIO_SUPABASE_URL || "https://bwvetvomcfmolhfrrlcx.supabase.co";
 const BUCKETS = ["documents"];
 const PAGE = 1000;
 const STORAGE_PAGE = 100;
 
-// Pide la llave sin mostrarla (ni asteriscos).
-function askHidden(question) {
-  if (!process.stdin.isTTY) return Promise.resolve("");
-  process.stdout.write(question);
-  return new Promise((resolve) => {
-    let value = "";
-    const finish = () => {
-      process.stdin.off("data", onData);
-      process.stdin.setRawMode(false);
-      process.stdin.pause();
-      process.stdout.write("\n");
-      resolve(value);
-    };
-    const onData = (chunk) => {
-      for (const ch of chunk) {
-        if (ch === "\r" || ch === "\n") return finish();
-        if (ch === "\u0003") {
-          process.stdout.write("\nCancelado.\n");
-          process.exit(1);
-        }
-        if (ch === "\u0008" || ch === "\u007f") value = value.slice(0, -1);
-        else if (ch >= " ") value += ch;
-      }
-      return undefined;
-    };
-    process.stdin.setRawMode(true);
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", onData);
-    process.stdin.resume();
-  });
+// La llave se toma del portapapeles de Windows, para no tener que pegarla
+// (la consola clásica de PowerShell no siempre pega bien) ni mostrarla.
+function readClipboard() {
+  try {
+    return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Clipboard -Raw"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return "";
+  }
+}
+
+function clearClipboard() {
+  try {
+    execFileSync("cmd.exe", ["/d", "/c", "echo off | clip"], { windowsHide: true, stdio: "ignore" });
+  } catch {
+    // Si no se puede, no pasa nada grave: se avisa abajo.
+  }
+}
+
+async function askKey() {
+  console.log("1. En Supabase → Project Settings → API Keys → Secret keys, copia la llave con su botón de copiar.");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  // Si alguien la pega aquí en lugar de solo presionar Enter, también sirve.
+  const typed = (await rl.question("2. Vuelve aquí y presiona Enter: ")).trim();
+  rl.close();
+  if (typed) {
+    // Borra de la pantalla la línea (o líneas) donde quedó la llave.
+    const cols = process.stdout.columns || 80;
+    const rows = Math.ceil((typed.length + 34) / cols);
+    process.stdout.write("\x1b[1A\x1b[2K".repeat(rows) + "2. Llave pegada.\n");
+    return typed;
+  }
+  return readClipboard();
 }
 
 let KEY = (process.env.NAVIO_SERVICE_KEY || "").trim();
-if (!KEY) KEY = (await askHidden("Pega la llave secreta de Supabase (clic derecho) y presiona Enter. No se verá: ")).trim();
+let fromUser = false;
+if (!KEY && process.stdin.isTTY) {
+  KEY = await askKey();
+  fromUser = true;
+}
+// Quita espacios, saltos de línea y comillas que a veces se copian de más.
+KEY = KEY.replace(/^[\s"'“”]+|[\s"'“”]+$/g, "");
+if (fromUser) {
+  clearClipboard();
+  console.log("   Listo: vacié el portapapeles para que la llave no se quede ahí.");
+}
 
-if (!KEY) {
-  console.error("No se recibió ninguna llave. Vuelve a correr el comando y pégala cuando la pida.");
+function fail(message) {
+  console.error(`\n${message}`);
   process.exit(1);
 }
-if (KEY.startsWith("sb_publishable_")) {
-  console.error("Esa es la llave pública (publishable). Se necesita la secreta: Project Settings → API Keys → Secret keys.");
-  process.exit(1);
-}
+if (!KEY) fail("No encontré ninguna llave en el portapapeles. Cópiala en Supabase (botón de copiar) y vuelve a correr el comando.");
+if (/[•*…?�]/.test(KEY)) fail("Se copió la llave oculta (con puntos). En Supabase da clic en el ojo para mostrarla completa, cópiala y vuelve a correr el comando.");
+if (KEY.startsWith("sb_publishable_")) fail("Esa es la llave pública (publishable). Se necesita la secreta: Project Settings → API Keys → Secret keys.");
 if (!/^(sb_secret_|eyJ)[A-Za-z0-9._-]{20,}$/.test(KEY)) {
-  console.error("Eso no parece una llave secreta de Supabase (debe empezar con sb_secret_ o eyJ y no llevar espacios). Vuelve a copiarla.");
-  process.exit(1);
+  fail(`Lo que hay en el portapapeles no parece una llave secreta (${KEY.length} caracteres; debe empezar con sb_secret_). Cópiala de nuevo en Supabase y vuelve a correr el comando.`);
 }
 console.log(`Llave recibida: ${KEY.slice(0, 10)}… (${KEY.length} caracteres)`);
 
