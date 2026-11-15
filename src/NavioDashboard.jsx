@@ -4,7 +4,7 @@ import { PeopleProvider } from "./people.jsx";
 import { TrackingProvider, TrackingPill, DriverModeModal, LiveMapPage } from "./tracking.jsx";
 import { TransfersPage } from "./trips.jsx";
 import { InboxProvider, NavBadge, BellButton, NotificationsPanel, MessagesPage, TasksPage } from "./inbox.jsx";
-import { hideSplash, FullScreenLoader, SupabaseSetupNotice, LoginPage, UpdatePasswordPage, MfaChallengePage, OnboardingPage, CompanyInactivePage, ConnectionErrorPage } from "./auth.jsx";
+import { hideSplash, FullScreenLoader, SupabaseSetupNotice, LoginPage, UpdatePasswordPage, MfaChallengePage, OnboardingPage, CompanyInactivePage, ConnectionErrorPage, WeakPasswordPrompt } from "./auth.jsx";
 import { SettingsPage, AccountPage, IdleGuard } from "./settings.jsx";
 import { AdminCompaniesPage } from "./admin.jsx";
 import { MobileAppShell } from "./mobile.jsx";
@@ -8484,6 +8484,7 @@ function NavioApp() {
               onClose={() => setFormModal(null)}
             />
           )}
+          <WeakPasswordPrompt />
           <ToastHost toast={toast} onDismiss={() => setToast(null)} />
           </AppProviders>
         </ToastContext.Provider>
@@ -8739,6 +8740,7 @@ function NavioApp() {
 
           <TrackingPill onOpen={() => setDriverModeOpen(true)} />
           {driverModeOpen && <DriverModeModal vehicles={vehicles} trips={trips} onClose={() => setDriverModeOpen(false)} />}
+          <WeakPasswordPrompt />
           <ToastHost toast={toast} onDismiss={() => setToast(null)} />
         </div>
         </AppProviders>

@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CAPTCHA_SITE_KEY } from "./config.js";
 import { AlertTriangle, CheckCircle2, Clock, Eye, EyeOff, FileCheck2, MapPin, RefreshCw, ShieldCheck } from "lucide-react";
-import { supabase, useAuth } from "./NavioDashboard.jsx";
+import { supabase, useAuth, useToast } from "./NavioDashboard.jsx";
 import { CookieNotice, LEGAL_VERSION, LegalLinks, LegalModal } from "./legal.jsx";
 import { AndroidAppDownload } from "./background.jsx";
+import { MIN_PASSWORD, PasswordChecklist, hasWeakPasswordFlag, passwordProblem, setWeakPasswordFlag } from "./password.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Pantallas de entrada: iniciar sesión, crear cuenta, unirse a empresa  */
 /* ---------------------------------------------------------------------- */
 
-export const MIN_PASSWORD = 10;
+export { MIN_PASSWORD };
 
 // La animación de entrada ("NAVIO" → "N") vive en index.html para verse desde
 // el primer instante. Aquí solo se retira cuando la app ya tiene qué mostrar,
@@ -27,7 +28,9 @@ export function translateAuthError(error) {
   const low = msg.toLowerCase();
   if (low.includes("invalid login credentials")) return "Correo o contraseña incorrectos.";
   if (low.includes("user already registered")) return "Ya existe una cuenta con ese correo.";
-  if (low.includes("password should be at least") || low.includes("weak")) return "La contraseña es demasiado corta o fácil de adivinar.";
+  if (low.includes("should contain at least one character")) return "La contraseña debe incluir minúsculas, mayúsculas, números y un símbolo (! @ # $ % & * ? -).";
+  if (low.includes("longer than 72")) return "La contraseña es demasiado larga (máximo 72 caracteres).";
+  if (low.includes("password should be at least") || low.includes("weak") || error?.code === "weak_password") return "La contraseña es demasiado corta o fácil de adivinar.";
   if (low.includes("different from the old")) return "La nueva contraseña debe ser distinta de la anterior.";
   if (low.includes("email not confirmed")) return "Confirma tu correo antes de iniciar sesión (revisa tu bandeja de entrada).";
   if (low.includes("rate limit") || low.includes("security purposes")) return "Demasiados intentos. Espera un momento y vuelve a intentar.";
@@ -405,15 +408,19 @@ export function LoginPage() {
     setNotice("");
     if (mode === MODES.SIGN_UP) {
       if (fullName.trim().length < 2) return setError("Escribe tu nombre completo.");
-      if (password.length < MIN_PASSWORD) return setError(`Usa una contraseña de al menos ${MIN_PASSWORD} caracteres.`);
+      const problem = passwordProblem(password, { email, name: fullName });
+      if (problem) return setError(problem);
       if (!accepted) return setError("Para crear tu cuenta necesitas aceptar los términos y el aviso de privacidad.");
     }
     if (captchaEnabled() && !captchaToken) return setError("Espera a que termine la verificación de seguridad (abajo del formulario).");
     const token = captchaToken || undefined;
     setLoading(true);
     try {
-      if (mode === MODES.SIGN_IN) await signIn(email.trim(), password, token);
-      else if (mode === MODES.SIGN_UP) {
+      if (mode === MODES.SIGN_IN) {
+        await signIn(email.trim(), password, token);
+        // Contraseñas creadas antes de las reglas actuales: se sugiere cambiarla.
+        setWeakPasswordFlag(!!passwordProblem(password, { email }));
+      } else if (mode === MODES.SIGN_UP) {
         await signUp(email.trim(), password, fullName.trim(), LEGAL_VERSION, token);
         setPassword("");
         setNotice("Listo. Te enviamos un correo para confirmar tu cuenta; ábrelo y después inicia sesión.");
@@ -467,7 +474,7 @@ export function LoginPage() {
               )}
             </div>
             <PasswordInput id="auth-password" value={password} onChange={setPassword} autoComplete={mode === MODES.SIGN_UP ? "new-password" : "current-password"} minLength={mode === MODES.SIGN_UP ? MIN_PASSWORD : undefined} />
-            {mode === MODES.SIGN_UP && <p className="mt-1 text-[11px] text-slate-400">Al menos {MIN_PASSWORD} caracteres. Una frase larga funciona muy bien.</p>}
+            {mode === MODES.SIGN_UP && <PasswordChecklist password={password} email={email} name={fullName} />}
           </div>
         )}
         {mode === MODES.SIGN_UP && (
@@ -524,16 +531,18 @@ export function LoginPage() {
 }
 
 export function UpdatePasswordPage() {
-  const { updatePassword } = useAuth();
+  const { updatePassword, user } = useAuth();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const who = { email: user?.email, name: user?.user_metadata?.full_name };
 
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
-    if (password.length < MIN_PASSWORD) return setError(`Usa al menos ${MIN_PASSWORD} caracteres.`);
+    const problem = passwordProblem(password, who);
+    if (problem) return setError(problem);
     if (password !== confirm) return setError("Las dos contraseñas no coinciden.");
     setLoading(true);
     try {
@@ -556,6 +565,7 @@ export function UpdatePasswordPage() {
             Contraseña nueva
           </label>
           <PasswordInput id="new-password" value={password} onChange={setPassword} autoComplete="new-password" minLength={MIN_PASSWORD} />
+          <PasswordChecklist password={password} email={who.email} name={who.name} />
         </div>
         <div>
           <label htmlFor="repeat-password" className={labelClass}>
@@ -569,6 +579,86 @@ export function UpdatePasswordPage() {
         </button>
       </form>
     </AuthLayout>
+  );
+}
+
+// Si alguien entra con una contraseña anterior a las reglas actuales, se le
+// pide cambiarla una vez por inicio de sesión. Puede dejarlo para después.
+export function WeakPasswordPrompt() {
+  const { updatePassword, user, profile } = useAuth();
+  const { showToast } = useToast();
+  const [open, setOpen] = useState(hasWeakPasswordFlag);
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const who = { email: user?.email, name: profile?.fullName || user?.user_metadata?.full_name };
+
+  if (!open) return null;
+
+  function later() {
+    setWeakPasswordFlag(false);
+    setOpen(false);
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    const problem = passwordProblem(password, who);
+    if (problem) return setError(problem);
+    if (password !== confirm) return setError("Las dos contraseñas no coinciden.");
+    setSaving(true);
+    try {
+      await updatePassword(password);
+      setWeakPasswordFlag(false);
+      setOpen(false);
+      showToast("Contraseña actualizada. Se cerró tu sesión en los demás dispositivos.");
+    } catch (err) {
+      setError(translateAuthError(err));
+    } finally {
+      setSaving(false);
+    }
+    return undefined;
+  }
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 px-4" role="dialog" aria-modal="true" aria-labelledby="weak-password-title">
+      <form onSubmit={handleSubmit} className="max-h-[92vh] w-full max-w-md space-y-4 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 shadow-xl">
+        <div className="flex items-start gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-600">
+            <ShieldCheck size={18} />
+          </div>
+          <div>
+            <h2 id="weak-password-title" className="text-sm font-bold text-slate-800">
+              Actualiza tu contraseña
+            </h2>
+            <p className="mt-1 text-xs leading-relaxed text-slate-500">Navio ahora pide contraseñas más seguras. La tuya sigue funcionando, pero no cumple con todo lo de abajo: te recomendamos cambiarla ahora.</p>
+          </div>
+        </div>
+        <div>
+          <label htmlFor="upgrade-password" className={labelClass}>
+            Contraseña nueva
+          </label>
+          <PasswordInput id="upgrade-password" value={password} onChange={setPassword} autoComplete="new-password" />
+          <PasswordChecklist password={password} email={who.email} name={who.name} />
+        </div>
+        <div>
+          <label htmlFor="upgrade-repeat" className={labelClass}>
+            Repítela
+          </label>
+          <PasswordInput id="upgrade-repeat" value={confirm} onChange={setConfirm} autoComplete="new-password" />
+        </div>
+        <AuthErrorMessage message={error} />
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <button type="button" onClick={later} className="rounded-lg border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-50">
+            Más tarde
+          </button>
+          <button type="submit" disabled={saving} className="rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
+            {saving ? "Guardando…" : "Cambiar contraseña"}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 

@@ -14,7 +14,8 @@ import {
 import { usePeople } from "./people.jsx";
 import { useTracking } from "./tracking.jsx";
 import { LEGAL_DOCS, LEGAL_VERSION, LegalModal } from "./legal.jsx";
-import { MIN_PASSWORD, translateAuthError } from "./auth.jsx";
+import { translateAuthError } from "./auth.jsx";
+import { PasswordChecklist, passwordProblem, setWeakPasswordFlag } from "./password.jsx";
 import { BackgroundTrackingPanel } from "./background.jsx";
 
 const card = "rounded-2xl border border-slate-200 bg-white p-4 shadow-sm";
@@ -879,17 +880,19 @@ function ProfileCard({ userEmail }) {
 }
 
 function PasswordCard() {
-  const { updatePassword } = useAuth();
+  const { updatePassword, user, profile } = useAuth();
   const { showToast } = useToast();
   const [password, setPassword] = useState("");
   const [repeat, setRepeat] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const who = { email: user?.email, name: profile?.fullName };
 
   async function handleSave(e) {
     e.preventDefault();
-    if (password.length < MIN_PASSWORD) {
-      setError(`Usa al menos ${MIN_PASSWORD} caracteres.`);
+    const problem = passwordProblem(password, who);
+    if (problem) {
+      setError(problem);
       return;
     }
     if (password !== repeat) {
@@ -900,6 +903,7 @@ function PasswordCard() {
     setError("");
     try {
       await updatePassword(password);
+      setWeakPasswordFlag(false);
       setPassword("");
       setRepeat("");
       showToast("Contraseña actualizada. Se cerró tu sesión en los demás dispositivos.");
@@ -914,7 +918,7 @@ function PasswordCard() {
     <form onSubmit={handleSave} className={`${card} space-y-3`}>
       <div>
         <h2 className="text-sm font-bold text-slate-800">Cambiar contraseña</h2>
-        <p className="text-xs text-slate-500">Al menos {MIN_PASSWORD} caracteres. Una frase larga es más segura y fácil de recordar que símbolos raros.</p>
+        <p className="text-xs text-slate-500">Mezcla mayúsculas, minúsculas, números y símbolos. Una frase con algún cambio (por ejemplo, Mi-camion-azul-2026) es segura y fácil de recordar.</p>
       </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div>
@@ -926,6 +930,7 @@ function PasswordCard() {
           <input type="password" value={repeat} onChange={(e) => setRepeat(e.target.value)} autoComplete="new-password" className={inputClass} />
         </div>
       </div>
+      <PasswordChecklist password={password} email={who.email} name={who.name} />
       {error && <p className="rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] font-medium text-rose-700">{error}</p>}
       <div className="flex justify-end">
         <button type="submit" disabled={saving || !password} className={primaryButton}>
