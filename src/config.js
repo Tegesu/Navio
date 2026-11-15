@@ -10,4 +10,4 @@
 //   3. En Supabase → Authentication → Attack Protection, activa "Enable
 //      Captcha protection", elige Turnstile y pega la Secret Key.
 // Las dos cosas van juntas: con solo una, nadie podrá entrar.
-export const CAPTCHA_SITE_KEY = "";
+export const CAPTCHA_SITE_KEY = "0x4AAAAAAGBuPt13hXJQVLnz";
