@@ -471,8 +471,9 @@ function AuthProvider({ children }) {
   async function joinCompanyWithCode(code) {
     const { data, error } = await supabase.rpc("join_company_with_code", { invite_code: code.trim() });
     if (error) throw error;
-    // Sin empresa de vuelta, el código no existe (o ya no está vigente).
-    if (data == null) throw new Error("Ese código no es válido. Revisa que esté bien escrito o pide uno nuevo a tu administrador.");
+    // Sin empresa de vuelta, el código no existe o ya venció. Si sirve, queda
+    // una solicitud en espera de que un administrador la apruebe.
+    if (data == null) throw new Error("Ese código no es válido o ya venció. Revisa que esté bien escrito o pide uno nuevo a tu administrador.");
     await refreshProfile(session.user.id);
     return data;
   }
@@ -2316,9 +2317,10 @@ const vehicleDriverName = (vehicle) => (isVariableDriver(vehicle) ? "" : vehicle
 const vehicleDriverLabel = (vehicle) => (isVariableDriver(vehicle) ? "Chofer variable" : vehicle?.driver?.name || "Sin asignar");
 
 // Las fotos subidas se guardan en el bucket privado con la ruta de la empresa
-// ("3/vehicles/....jpg"). Las de demostración (picsum) no son de la unidad.
+// ("3/vehicles/....jpg"). Solo esas se muestran: una dirección de internet
+// (demostración, o algo que alguien escribió a mano) no es foto de la unidad.
 const isStoredImage = (src) => typeof src === "string" && /^\d+\//.test(src);
-const vehicleImage = (src) => (src && !/picsum\.photos/.test(src) ? src : null);
+const vehicleImage = (src) => (isStoredImage(src) ? src : null);
 const VEHICLE_PHOTO_MAX_MB = 10;
 const storedImages = new Map();
 

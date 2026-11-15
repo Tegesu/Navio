@@ -290,11 +290,23 @@ async function uploadDocument(companyId: number, module: string, file: { base64:
   return path;
 }
 
+// Telegram convierte en enlace cualquier dirección, correo o @usuario. Las
+// respuestas repiten datos leídos del documento (emisor, conceptos…), así que
+// un PDF malicioso podría poner un enlace de phishing en el chat de la
+// empresa. Se "desactivan" para que se lean pero no se puedan abrir:
+// pagos-pemex[.]com, ＠SoporteFalso, https[://]…
+function defangLinks(text: string): string {
+  return text
+    .replace(/:\/\//g, "[://]")
+    .replace(/([\p{L}\p{N}_-])\.(?=\p{L}{2,})/gu, "$1[.]")
+    .replace(/@(?=[\p{L}\p{N}_])/gu, "＠");
+}
+
 async function sendMessage(chatId: string, text: string) {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify({ chat_id: chatId, text: defangLinks(text), link_preview_options: { is_disabled: true } }),
   });
 }
 

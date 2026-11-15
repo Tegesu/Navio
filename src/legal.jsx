@@ -235,6 +235,7 @@ const cookies = () => ({
         "Preferencias (funcional): formato de fecha, columnas y contadores que elegiste, tu último reporte y los datos que excluyes del Excel. Nunca salen de tu dispositivo.",
         "Dónde te quedaste (funcional): la pantalla abierta, para regresar a ella si la pestaña se recarga. Se borra al cerrar la pestaña.",
         "Viaje en curso (necesario durante un viaje): los puntos de ubicación que todavía no se envían por falta de señal. Se borran al enviarse o al finalizar el viaje.",
+        "Seguridad (necesario): la hora de tu última actividad, para cerrar la sesión por inactividad si está activada, y si debemos recordarte cambiar tu contraseña durante esta visita. Nunca salen de tu dispositivo.",
         "Este aviso (funcional): que ya lo viste, para no mostrarlo de nuevo.",
       ],
     },

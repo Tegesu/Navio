@@ -1,12 +1,14 @@
 // Página de pruebas: la app real con una base de datos falsa en memoria.
 // ?member → usuario normal · ?login → pantalla de acceso real · ?super → super-administrador · ?legal → sin términos aceptados
 // ?native → como dentro de la app de Android (ver test_native.js) · ?tracker → con la app de rastreo ya vinculada
+// ?requests → con solicitudes para unirse · ?expired → código de invitación vencido · ?onboarding → cuenta sin empresa
 import "./test_native.js";
 import "leaflet/dist/leaflet.css";
 import "./.tailwind.css";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import NavioDashboard, { supabase, AuthContext, NavioApp } from "../src/NavioDashboard.jsx";
+import { OnboardingPage } from "../src/auth.jsx";
 
 const params = new URLSearchParams(location.search);
 const isMember = params.has("member");
@@ -98,7 +100,13 @@ const db = {
   tracker_devices: params.has("tracker") ? [{ id: 1, companyId: COMPANY, userId: isMember ? "u2" : "u1", createdAt: ago(48), lastSeenAt: ago(0.05) }] : [],
   legal_acceptances: params.has("legal") ? [] : [{ id: 1, userId: isMember ? "u2" : "u1", document: "terms", version: "2026-11-11", acceptedAt: ago(1) }, { id: 2, userId: isMember ? "u2" : "u1", document: "privacy", version: "2026-11-11", acceptedAt: ago(1) }],
   privacy_requests: [],
-  company_secrets: [{ companyId: COMPANY, inviteCode: "ABCDEF123456", botLinkCode: "BOT123456789" }],
+  company_secrets: [{ companyId: COMPANY, inviteCode: "ABCDEF123456", botLinkCode: "BOT123456789", inviteExpiresAt: params.has("expired") ? ago(30) : ago(-24 * 5) }],
+  join_requests: params.has("requests")
+    ? [
+        { id: 501, companyId: COMPANY, userId: "u8", fullName: "Pedro Nuevo", email: "pedro@x.test", status: "pending", createdAt: ago(0.2) },
+        { id: 502, companyId: COMPANY, userId: "u9", fullName: "Desconocido", email: "alguien@otro.test", status: "pending", createdAt: ago(26) },
+      ]
+    : [],
   companies: [{ id: COMPANY, name: "Empresa de prueba", currency: "MXN", status: "approved", botChannel: null, botChatId: null, contactName: "Johana", contactEmail: "j@x.test", contactPhone: "", legalName: "", rfc: "", address: "", settings: {} }],
 };
 window.__db = db;
@@ -302,10 +310,32 @@ const rpcs = {
   },
   list_company_members: () => db.profiles.map((p) => ({ ...p, email: `${p.id}@x.test` })),
   get_company_codes: () => db.company_secrets,
-  rotate_company_code({ which }) {
+  rotate_company_code({ which, valid_days = 7 }) {
+    if (which === "invite" && (valid_days < 1 || valid_days > 30)) throw new Error("El código de invitación puede durar de 1 a 30 días.");
     const code = Math.random().toString(16).slice(2, 14).toUpperCase();
     db.company_secrets[0][which === "invite" ? "inviteCode" : "botLinkCode"] = code;
+    if (which === "invite") db.company_secrets[0].inviteExpiresAt = new Date(Date.now() + valid_days * 864e5).toISOString();
     return code;
+  },
+  join_company_with_code({ invite_code }) {
+    const s = db.company_secrets[0];
+    if (invite_code.trim().toUpperCase() !== s.inviteCode || new Date(s.inviteExpiresAt) < new Date()) return null;
+    db.join_requests.forEach((r) => r.userId === ME && r.status === "pending" && (r.status = "cancelled"));
+    db.join_requests.push({ id: nextId++, companyId: COMPANY, userId: ME, fullName: myName(), email: "demo@example.test", status: "pending", createdAt: new Date().toISOString() });
+    return COMPANY;
+  },
+  my_join_request() {
+    const r = db.join_requests.filter((x) => x.userId === ME && x.status !== "cancelled").at(-1);
+    return r ? [{ id: r.id, companyName: db.companies[0].name, status: r.status, createdAt: r.createdAt, decidedAt: r.decidedAt ?? null }] : [];
+  },
+  cancel_join_request() { db.join_requests.forEach((r) => r.userId === ME && r.status === "pending" && (r.status = "cancelled")); return null; },
+  list_join_requests: () => db.join_requests.filter((r) => r.status === "pending").map(({ id, userId, fullName, email, createdAt }) => ({ id, userId, fullName, email, createdAt })),
+  decide_join_request({ request_id, approve }) {
+    const r = db.join_requests.find((x) => x.id === request_id);
+    if (!r || r.status !== "pending") throw new Error("Esa solicitud ya fue atendida.");
+    r.status = approve ? "approved" : "rejected";
+    if (approve) db.profiles.push({ id: r.userId, fullName: r.fullName, companyId: COMPANY, companyRole: "member", jobTitle: "", phone: "" });
+    return null;
   },
   admin_list_companies: () => db.companies.map((c) => ({ ...c, inviteCode: db.company_secrets.find((x) => x.companyId === c.id)?.inviteCode ?? null, members: db.profiles.filter((p) => p.companyId === c.id).length })),
   approve_company({ target_company_id }) { db.companies.find((c) => c.id === target_company_id).status = "approved"; return "NEWCODE12345"; },
@@ -449,12 +479,16 @@ function Root() {
     verifyFactor: async (factorId, code) => { if (code !== "123456") throw new Error("Invalid TOTP code entered"); window.__auth.factors.find((f) => f.id === factorId).status = "verified"; },
     unenrollMFA: async (factorId) => { window.__auth.factors = window.__auth.factors.filter((f) => f.id !== factorId); },
     unlinkCompanyBot: async () => { db.companies[0].botChannel = null; setProfile(readProfile()); },
-    joinCompanyWithCode: async () => {},
+    joinCompanyWithCode: async (code) => {
+      const { data } = await supabase.rpc("join_company_with_code", { invite_code: code });
+      if (data == null) throw new Error("Ese código no es válido o ya venció. Revisa que esté bien escrito o pide uno nuevo a tu administrador.");
+      return data;
+    },
     requestCompany: async () => {},
   };
   return (
     <AuthContext.Provider value={value}>
-      <NavioApp />
+      {params.has("onboarding") ? <OnboardingPage /> : <NavioApp />}
     </AuthContext.Provider>
   );
 }

@@ -739,11 +739,13 @@ const COMPANY_INDUSTRIES = ["Transporte de carga", "Transporte de pasajeros", "L
 const FLEET_SIZE_RANGES = ["1-5 unidades", "6-20 unidades", "21-50 unidades", "Más de 50 unidades"];
 
 export function OnboardingPage() {
-  const { user, joinCompanyWithCode, requestCompany, signOut } = useAuth();
+  const { user, joinCompanyWithCode, requestCompany, signOut, refreshProfile } = useAuth();
   const [tab, setTab] = useState("join");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [myRequest, setMyRequest] = useState(undefined); // undefined = cargando, null = sin solicitud
+  const [joinRequest, setJoinRequest] = useState(undefined); // solicitud para unirse con código
+  const [checking, setChecking] = useState(false);
   const [code, setCode] = useState("");
   const [form, setForm] = useState({ name: "", industry: COMPANY_INDUSTRIES[0], fleetSize: FLEET_SIZE_RANGES[0], contactName: "", contactEmail: user?.email ?? "", contactPhone: "", needs: "" });
   const set = (key) => (e) => setForm((prev) => ({ ...prev, [key]: e.target.value }));
@@ -759,9 +761,32 @@ export function OnboardingPage() {
       .then(({ data }) => setMyRequest(data?.[0] ?? null));
   }, [user]);
 
+  // Si la base todavía no tiene esta función, se sigue como antes (sin espera).
+  const loadJoinRequest = useCallback(async () => {
+    if (!supabase || !user) return;
+    const { data, error: rpcError } = await supabase.rpc("my_join_request");
+    setJoinRequest(rpcError ? null : (Array.isArray(data) ? data[0] : data) ?? null);
+  }, [user]);
+
   useEffect(() => {
     loadMyRequest();
-  }, [loadMyRequest]);
+    loadJoinRequest();
+  }, [loadMyRequest, loadJoinRequest]);
+
+  // En espera: se revisa sola cada 30 segundos. Al aprobarla, el perfil ya
+  // trae la empresa y la app abre sin hacer nada más.
+  const waiting = joinRequest?.status === "pending";
+  const checkApproval = useCallback(async () => {
+    if (!user) return;
+    await refreshProfile(user.id);
+    await loadJoinRequest();
+  }, [user, refreshProfile, loadJoinRequest]);
+
+  useEffect(() => {
+    if (!waiting) return undefined;
+    const timer = window.setInterval(checkApproval, 30000);
+    return () => window.clearInterval(timer);
+  }, [waiting, checkApproval]);
 
   async function handleJoin(e) {
     e.preventDefault();
@@ -769,11 +794,26 @@ export function OnboardingPage() {
     setLoading(true);
     try {
       await joinCompanyWithCode(code);
+      setCode("");
+      await loadJoinRequest();
     } catch (err) {
       setError(err.message || "El código no es válido.");
     } finally {
       setLoading(false);
     }
+  }
+
+  async function checkNow() {
+    setChecking(true);
+    await checkApproval();
+    setChecking(false);
+  }
+
+  async function cancelJoin() {
+    setChecking(true);
+    await supabase.rpc("cancel_join_request");
+    await loadJoinRequest();
+    setChecking(false);
   }
 
   async function handleRequest(e) {
@@ -794,7 +834,31 @@ export function OnboardingPage() {
     }
   }
 
-  if (myRequest === undefined) return <FullScreenLoader />;
+  if (myRequest === undefined || joinRequest === undefined) return <FullScreenLoader />;
+
+  if (waiting && !(myRequest && myRequest.status !== "rejected")) {
+    return (
+      <AuthLayout>
+        <Clock size={26} className="mb-3 text-amber-500" />
+        <h1 className="text-xl font-bold text-slate-900">Esperando aprobación</h1>
+        <p className="mt-2 text-xs leading-relaxed text-slate-500">
+          Pediste unirte a <span className="font-semibold text-slate-700">{joinRequest.companyName}</span>. Un administrador de la empresa tiene que aprobar tu solicitud; en cuanto lo haga, entrarás desde esta misma pantalla.
+        </p>
+        <p className="mt-2 text-[11px] text-slate-400">Se revisa sola cada 30 segundos. Si tarda, avísale a tu administrador.</p>
+        <div className="mt-5 flex flex-col gap-2">
+          <button onClick={checkNow} disabled={checking} className={submitClass}>
+            {checking ? "Revisando…" : "Revisar ahora"}
+          </button>
+          <button onClick={cancelJoin} disabled={checking} className="w-full rounded-lg border border-slate-200 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60">
+            Cancelar solicitud
+          </button>
+        </div>
+        <button onClick={() => signOut()} className={`mt-5 text-left text-xs ${linkClass}`}>
+          Cerrar sesión
+        </button>
+      </AuthLayout>
+    );
+  }
 
   if (myRequest && myRequest.status !== "rejected") {
     return (
@@ -818,6 +882,9 @@ export function OnboardingPage() {
 
       {myRequest?.status === "rejected" && (
         <p className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-700">Tu solicitud anterior para "{myRequest.name}" no fue aprobada. Puedes enviar otra o unirte con un código.</p>
+      )}
+      {joinRequest?.status === "rejected" && (
+        <p className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-700">Un administrador de "{joinRequest.companyName}" no aprobó tu solicitud para unirte. Si crees que es un error, habla con tu administrador.</p>
       )}
 
       <div className="mt-5 flex gap-1.5 rounded-lg bg-slate-100 p-1" role="tablist">
@@ -848,11 +915,11 @@ export function OnboardingPage() {
               Código de invitación
             </label>
             <input id="join-code" value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} maxLength={40} autoComplete="off" autoCapitalize="characters" className={`${inputClass} font-mono tracking-wider`} />
-            <p className="mt-1 text-[11px] text-slate-400">Te lo da el administrador de tu empresa.</p>
+            <p className="mt-1 text-[11px] text-slate-400">Te lo da el administrador de tu empresa. Al escribirlo, le llegará tu solicitud para que la apruebe.</p>
           </div>
           <AuthErrorMessage message={error} />
           <button type="submit" disabled={loading || !code.trim()} className={submitClass}>
-            {loading ? "Verificando…" : "Unirme"}
+            {loading ? "Verificando…" : "Pedir unirme"}
           </button>
         </form>
       ) : (

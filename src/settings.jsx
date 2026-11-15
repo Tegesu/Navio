@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Building2, CheckCircle2, Copy, History, KeyRound, Lock, LogOut, RefreshCw, Shield, ShieldCheck, UserMinus, Users, X } from "lucide-react";
+import { AlertTriangle, Building2, CheckCircle2, Copy, History, KeyRound, Lock, LogOut, RefreshCw, Shield, ShieldCheck, UserMinus, UserPlus, Users, X } from "lucide-react";
 import {
   supabase,
   useAuth,
@@ -168,42 +168,144 @@ function useCompanyCodes(enabled) {
   return { codes, reload: load };
 }
 
-function CodeBox({ label, hint, value, prefix = "", which, onRotated }) {
+// Cuánto puede durar un código de invitación nuevo.
+const INVITE_VALIDITY = [
+  { days: 1, label: "1 día" },
+  { days: 7, label: "7 días" },
+  { days: 30, label: "30 días" },
+];
+
+function expiryInfo(iso) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  const ms = date.getTime() - Date.now();
+  const when = date.toLocaleString("es-MX", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  if (ms <= 0) return { expired: true, text: `Venció el ${when}. Genera uno nuevo para invitar a más personas.` };
+  const days = Math.round(ms / 864e5);
+  const left = days >= 1 ? `en ${days} ${days === 1 ? "día" : "días"}` : `en ${Math.max(1, Math.round(ms / 36e5))} h`;
+  return { expired: false, text: `Vence el ${when} (${left}).` };
+}
+
+function CodeBox({ label, hint, value, prefix = "", which, onRotated, expiresAt, withValidity = false }) {
   const { showToast } = useToast();
   const [confirming, setConfirming] = useState(false);
+  const [days, setDays] = useState(7);
+  const [rotating, setRotating] = useState(false);
+  const expiry = withValidity ? expiryInfo(expiresAt) : null;
+  const usable = value && !expiry?.expired;
 
   async function rotate() {
-    const { error } = await supabase.rpc("rotate_company_code", { which });
+    setRotating(true);
+    const { error } = await supabase.rpc("rotate_company_code", withValidity ? { which, valid_days: days } : { which });
+    setRotating(false);
     if (error) showToast(`No se pudo regenerar: ${error.message}`);
     else {
-      showToast("Código regenerado. El anterior dejó de funcionar.");
+      showToast(withValidity ? `Código nuevo listo. Sirve ${days === 1 ? "1 día" : `${days} días`}; el anterior dejó de funcionar.` : "Código regenerado. El anterior dejó de funcionar.");
       onRotated();
     }
     setConfirming(false);
   }
 
+  const warning = "El código actual dejará de funcionar de inmediato. Quien ya está dentro de la empresa no se ve afectado.";
   return (
     <div>
       <p className={labelClass}>{label}</p>
       <div className="flex flex-wrap items-center gap-2">
-        <code className="min-w-0 flex-1 truncate rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">
+        <code className={`min-w-0 flex-1 truncate rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold ${expiry?.expired ? "text-slate-400 line-through" : "text-slate-700"}`}>
           {value === undefined ? "Cargando…" : `${prefix}${value || "—"}`}
         </code>
-        <CopyButton text={value ? `${prefix}${value}` : ""} />
-        <button onClick={() => setConfirming(true)} className={`${plainButton} flex items-center gap-1`}>
-          <RefreshCw size={12} /> Regenerar
+        <CopyButton text={usable ? `${prefix}${value}` : ""} />
+        <button onClick={() => setConfirming(true)} className={`${expiry?.expired ? primaryButton : plainButton} flex items-center gap-1`}>
+          <RefreshCw size={12} /> {expiry?.expired ? "Generar código nuevo" : "Regenerar"}
         </button>
       </div>
+      {expiry && <p className={`mt-1 text-[11px] font-medium ${expiry.expired ? "text-rose-600" : "text-slate-500"}`}>{expiry.text}</p>}
       <p className="mt-1 text-[11px] text-slate-400">{hint}</p>
-      {confirming && (
-        <ConfirmModal
-          title="Regenerar código"
-          message="El código actual dejará de funcionar de inmediato. Quien ya está dentro de la empresa no se ve afectado."
-          confirmLabel="Regenerar"
-          onConfirm={rotate}
-          onClose={() => setConfirming(false)}
-        />
+      {confirming && !withValidity && <ConfirmModal title="Regenerar código" message={warning} confirmLabel="Regenerar" onConfirm={rotate} onClose={() => setConfirming(false)} />}
+      {confirming && withValidity && (
+        <Modal title="Generar código nuevo" width="max-w-sm" onClose={() => setConfirming(false)}>
+          <p className="text-xs text-slate-600">{warning}</p>
+          <label htmlFor="invite-validity" className={`${labelClass} mt-3`}>
+            ¿Cuánto tiempo servirá?
+          </label>
+          <select id="invite-validity" value={days} onChange={(e) => setDays(Number(e.target.value))} className={inputClass}>
+            {INVITE_VALIDITY.map((o) => (
+              <option key={o.days} value={o.days}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-[11px] text-slate-400">Mientras más corto, menos riesgo si alguien lo reenvía.</p>
+          <div className="mt-4 flex justify-end gap-2">
+            <button onClick={() => setConfirming(false)} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+              Cancelar
+            </button>
+            <button onClick={rotate} disabled={rotating} className={primaryButton}>
+              {rotating ? "Generando…" : "Generar código"}
+            </button>
+          </div>
+        </Modal>
       )}
+    </div>
+  );
+}
+
+// Personas que escribieron el código y esperan que un administrador las apruebe.
+function JoinRequestsCard({ onApproved }) {
+  const { showToast } = useToast();
+  const [requests, setRequests] = useState([]);
+  const [busyId, setBusyId] = useState(null);
+
+  const load = useCallback(async () => {
+    const { data, error } = await supabase.rpc("list_join_requests");
+    setRequests(error ? [] : data ?? []);
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function decide(request, approve) {
+    setBusyId(request.id);
+    const { error } = await supabase.rpc("decide_join_request", { request_id: request.id, approve });
+    const name = request.fullName || request.email || "La persona";
+    if (error) showToast(`No se pudo ${approve ? "aprobar" : "rechazar"}: ${error.message}`);
+    else showToast(approve ? `${name} ya forma parte de la empresa como Usuario.` : `Rechazaste la solicitud de ${name}.`);
+    setBusyId(null);
+    await load();
+    if (!error && approve) onApproved();
+  }
+
+  if (!requests.length) return null;
+  return (
+    <div className={`${card} space-y-3 !border-amber-200`}>
+      <div>
+        <h2 className="flex items-center gap-1.5 text-sm font-bold text-slate-800">
+          <UserPlus size={15} className="text-amber-500" /> Solicitudes para unirse ({requests.length})
+        </h2>
+        <p className="text-xs text-slate-500">Estas personas escribieron el código de invitación. Aprueba solo a quien conozcas: entrará como Usuario y verá la información de la empresa.</p>
+      </div>
+      <div className="space-y-2">
+        {requests.map((request) => (
+          <div key={request.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <img src={avatarUrl(request.fullName || request.email || "?")} alt="" className="h-8 w-8 shrink-0 rounded-full" />
+              <div className="min-w-0">
+                <p className="truncate text-xs font-semibold text-slate-700">{request.fullName || "Sin nombre"}</p>
+                <p className="truncate text-[11px] text-slate-400">{[request.email, timeAgoLabel(request.createdAt)].filter(Boolean).join(" · ")}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button onClick={() => decide(request, false)} disabled={busyId === request.id} className={plainButton}>
+                Rechazar
+              </button>
+              <button onClick={() => decide(request, true)} disabled={busyId === request.id} className={primaryButton}>
+                Aprobar
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -257,15 +359,24 @@ function TeamPanel() {
 
   return (
     <div className="space-y-4">
+      <JoinRequestsCard
+        onApproved={() => {
+          loadMembers();
+          refreshPeople();
+        }}
+      />
+
       <div className={`${card} space-y-3`}>
         <div>
           <h2 className="text-sm font-bold text-slate-800">Invitar personas</h2>
-          <p className="text-xs text-slate-500">Quien cree su cuenta y escriba este código entra a tu empresa como Usuario. Compártelo solo con tu gente.</p>
+          <p className="text-xs text-slate-500">Quien cree su cuenta y escriba este código te enviará una solicitud. Entra a la empresa (como Usuario) hasta que un administrador la apruebe aquí.</p>
         </div>
         <CodeBox
           label="Código de invitación"
           hint="Si se filtra o alguien deja la empresa, regenéralo: el anterior deja de servir."
           value={codes === null ? undefined : codes.inviteCode}
+          expiresAt={codes?.inviteExpiresAt}
+          withValidity
           which="invite"
           onRotated={reloadCodes}
         />
@@ -321,7 +432,7 @@ function TeamPanel() {
       {toRemove && (
         <ConfirmModal
           title="Dar de baja"
-          message={`${toRemove.fullName || "Esta persona"} perderá el acceso a la empresa de inmediato. Lo que registró (facturas, viajes, mensajes) se conserva. Si después debe volver, tendrá que unirse otra vez con el código de invitación.`}
+          message={`${toRemove.fullName || "Esta persona"} perderá el acceso a la empresa de inmediato. Lo que registró (facturas, viajes, mensajes) se conserva. Si después debe volver, tendrá que pedirlo otra vez con el código de invitación y esperar a que un administrador lo apruebe.`}
           confirmLabel="Dar de baja"
           danger
           onConfirm={removeMember}
@@ -484,6 +595,17 @@ const IDLE_OPTIONS = [
   { minutes: 30, label: "30 minutos" },
   { minutes: 60, label: "1 hora" },
 ];
+const IDLE_ADMIN_DEFAULT = 30;
+
+// Los administradores lo tienen activado (30 min) mientras no elijan otra
+// cosa; si eligen "Nunca", se respeta. Los usuarios, apagado por omisión.
+export function idleMinutesFor(profile) {
+  const chosen = profile?.preferences?.idleMinutes;
+  if (chosen === undefined || chosen === null || chosen === "") {
+    return profile?.isSuperAdmin || profile?.companyRole === "admin" ? IDLE_ADMIN_DEFAULT : 0;
+  }
+  return Number(chosen) || 0;
+}
 
 function useSavePreferences() {
   const { user, profile, refreshProfile } = useAuth();
@@ -501,7 +623,8 @@ function useSavePreferences() {
 function PreferencesPanel() {
   const { profile } = useAuth();
   const save = useSavePreferences();
-  const idleMinutes = Number(profile?.preferences?.idleMinutes) || 0;
+  const idleMinutes = idleMinutesFor(profile);
+  const adminDefault = profile?.preferences?.idleMinutes == null && idleMinutes === IDLE_ADMIN_DEFAULT;
   return (
     <div className="space-y-4">
       <div className={card}>
@@ -519,35 +642,59 @@ function PreferencesPanel() {
             </option>
           ))}
         </select>
+        {adminDefault && <p className="mt-1.5 text-[11px] text-slate-400">Por ser administrador viene activado en 30 minutos. Puedes cambiarlo.</p>}
       </div>
     </div>
   );
 }
 
+const ACTIVITY_KEY = "navio.lastActivity";
+const readSharedActivity = () => {
+  try {
+    return Number(localStorage.getItem(ACTIVITY_KEY)) || 0;
+  } catch {
+    return 0;
+  }
+};
+
 // Cierra la sesión si nadie toca la app durante el tiempo elegido.
+// La actividad se comparte entre pestañas (una pestaña olvidada no saca a
+// quien trabaja en otra) y se cierra solo la sesión de este navegador, no la
+// del celular u otros equipos.
 export function IdleGuard() {
-  const { profile, signOut } = useAuth();
+  const { profile } = useAuth();
   const tracking = useTracking();
-  const minutes = Number(profile?.preferences?.idleMinutes) || 0;
+  const minutes = idleMinutesFor(profile);
   const lastActivity = useRef(Date.now());
   const trackingActive = !!tracking?.active;
 
   useEffect(() => {
     if (!minutes || trackingActive) return undefined;
-    lastActivity.current = Date.now();
+    let lastShared = 0;
     const touch = () => {
-      lastActivity.current = Date.now();
+      const now = Date.now();
+      lastActivity.current = now;
+      if (now - lastShared > 15000) {
+        lastShared = now;
+        try {
+          localStorage.setItem(ACTIVITY_KEY, String(now));
+        } catch {
+          // Sin almacenamiento: cuenta solo esta pestaña.
+        }
+      }
     };
+    touch();
     const events = ["pointerdown", "keydown", "wheel", "touchstart"];
     events.forEach((name) => window.addEventListener(name, touch, { passive: true }));
     const timer = window.setInterval(() => {
-      if (Date.now() - lastActivity.current > minutes * 60000) signOut();
+      const last = Math.max(lastActivity.current, readSharedActivity());
+      if (Date.now() - last > minutes * 60000) supabase.auth.signOut({ scope: "local" });
     }, 30000);
     return () => {
       events.forEach((name) => window.removeEventListener(name, touch));
       window.clearInterval(timer);
     };
-  }, [minutes, trackingActive, signOut]);
+  }, [minutes, trackingActive]);
   return null;
 }
 
