@@ -8075,7 +8075,10 @@ function NavioApp() {
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
   // La pantalla abierta sobrevive a una recarga de la pestaña.
-  const [activeTab, setActiveTab] = useSessionState("navio.nav.tab", "home");
+  const [storedTab, setActiveTab] = useSessionState("navio.nav.tab", "home");
+  // Una pestaña que no existe (un dato viejo guardado o un enlace mal
+  // formado) lleva a Inicio en vez de dejar la página en blanco.
+  const activeTab = PAGE_META[storedTab] ? storedTab : "home";
   const [selectedVehicleId, setSelectedVehicleId] = useSessionState("navio.nav.vehicle", null);
   const [bentoOpen, setBentoOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);

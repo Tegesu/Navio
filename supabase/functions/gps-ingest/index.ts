@@ -34,8 +34,19 @@ const BAD_TOKEN_LIMIT = 30;
 const BAD_TOKEN_WINDOW_MS = 10 * 60 * 1000;
 const badTokens = new Map<string, { count: number; since: number }>();
 
+// Quién manda la petición, sin creerle a lo que ella misma dice. La primera
+// IP de "x-forwarded-for" la puede escribir cualquiera (bastaba cambiarla en
+// cada intento para saltarse el límite). Supabase recibe el tráfico a través
+// de Cloudflare, que pone la IP real en "cf-connecting-ip" y no deja
+// falsificarla. Si faltara, se usa "x-real-ip" o el último eslabón de la
+// cadena (lo agrega la infraestructura, no el cliente).
 function clientAddress(req: Request): string {
-  return (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || req.headers.get("cf-connecting-ip") || "desconocida";
+  const cloudflare = req.headers.get("cf-connecting-ip")?.trim();
+  if (cloudflare) return cloudflare;
+  const realIp = req.headers.get("x-real-ip")?.trim();
+  if (realIp) return realIp;
+  const chain = (req.headers.get("x-forwarded-for") ?? "").split(",").map((part) => part.trim()).filter(Boolean);
+  return chain.at(-1) || "desconocida";
 }
 
 function blocked(address: string): boolean {
