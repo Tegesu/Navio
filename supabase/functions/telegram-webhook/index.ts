@@ -522,29 +522,33 @@ Deno.serve(async (req) => {
       await sendMessage(chatId, "Usa: /vincular TU-CODIGO (lo encuentras en Navío → Configuración → Bot).");
       return new Response("ok");
     }
-    // Desde la migración v17 el código vive en "company_secrets", donde solo
-    // lo ven los administradores. Si esa tabla todavía no existe, se busca
-    // donde estaba antes.
-    const { data: secret, error: secretError } = await supabase
-      .from("company_secrets")
-      .select("companyId")
-      .eq("botLinkCode", code)
-      .maybeSingle();
-    let lookup = supabase.from("companies").select("id, name").eq("status", "approved");
-    lookup = secretError ? lookup.eq("botLinkCode", code) : lookup.eq("id", secret?.companyId ?? -1);
-    const { data: company } = await lookup.maybeSingle();
+    // Todo pasa en la base (migración v21), de una vez: el código sirve una
+    // sola vez (se genera otro), un chat pertenece a una sola empresa, queda
+    // en la bitácora y les llega un aviso a los administradores. Máximo 10
+    // intentos por hora desde un mismo chat.
+    const chatTitle = message.chat.title || [message.chat.first_name, message.chat.last_name].filter(Boolean).join(" ") || null;
+    const { data: linked, error: linkError } = await supabase.rpc("bot_link_chat", {
+      link_code: code,
+      chat_id: chatId,
+      chat_title: chatTitle,
+    });
 
-    if (!company) {
-      await sendMessage(chatId, "Código no válido. Verifícalo en Navío → Configuración → Bot.");
+    if (linkError) {
+      console.error("No se pudo vincular el chat", linkError.code, linkError.message);
+      await sendMessage(
+        chatId,
+        linkError.code === "P0429" ? linkError.message : "No pude vincular este chat en este momento. Intenta de nuevo en unos minutos."
+      );
+      return new Response("ok");
+    }
+    if (!linked) {
+      await sendMessage(chatId, "Código no válido o ya usado. Cada código sirve una sola vez: pide a un administrador el código actual (Navío → Configuración → Bot).");
       return new Response("ok");
     }
 
-    // Un chat pertenece a una sola empresa: si estaba ligado a otra, se suelta.
-    await supabase.from("companies").update({ botChannel: null, botChatId: null }).eq("botChatId", chatId).neq("id", company.id);
-    await supabase.from("companies").update({ botChannel: "telegram", botChatId: chatId }).eq("id", company.id);
     await sendMessage(
       chatId,
-      `Listo — este chat quedó vinculado a "${company.name}". Ya puedes enviarme fotos, PDFs o texto de facturas y las registro automáticamente como pendientes de revisión.`
+      `Listo — este chat quedó vinculado a "${linked.name}". Ya puedes enviarme fotos, PDFs o texto de facturas y las registro automáticamente como pendientes de revisión.`
     );
     return new Response("ok");
   }

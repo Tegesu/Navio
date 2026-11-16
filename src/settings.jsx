@@ -490,7 +490,7 @@ function BotPanel() {
       {isAdmin ? (
         <CodeBox
           label={connected ? "Para conectar otro chat, envíale esto al bot" : "Abre Telegram, busca al bot de Navio y envíale este mensaje"}
-          hint="El chat que mande este código queda ligado a tu empresa. No lo compartas fuera de tu equipo."
+          hint="Sirve una sola vez: el chat que lo mande queda ligado a tu empresa (en lugar del anterior) y aquí aparece uno nuevo. Cada vez que el bot cambie de chat les llega un aviso a los administradores. No lo compartas fuera de tu equipo."
           value={codes === null ? undefined : codes.botLinkCode}
           prefix="/vincular "
           which="bot"

@@ -451,6 +451,11 @@ function AuthProvider({ children }) {
     if (challengeError) throw challengeError;
     const { error: verifyError } = await supabase.auth.mfa.verify({ factorId, challengeId: challenge.id, code });
     if (verifyError) throw verifyError;
+    // Con solo la contraseña la base no entrega el perfil (migración v21):
+    // se vuelve a pedir ya con la sesión completa, antes de quitar la
+    // pantalla del código, para no mostrar un error de conexión de paso.
+    const { data } = await supabase.auth.getSession();
+    if (data.session) await refreshProfile(data.session.user.id);
     await refreshAal();
   }
 
