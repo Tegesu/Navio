@@ -17,6 +17,7 @@ import { LEGAL_DOCS, LEGAL_VERSION, LegalModal } from "./legal.jsx";
 import { translateAuthError } from "./auth.jsx";
 import { PasswordChecklist, passwordProblem, setWeakPasswordFlag } from "./password.jsx";
 import { BackgroundTrackingPanel } from "./background.jsx";
+import { SETTINGS_SECTIONS, ThemeSwitch } from "./navigation.jsx";
 
 const card = "rounded-2xl border border-slate-200 bg-white p-4 shadow-sm";
 const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none disabled:bg-slate-50 disabled:text-slate-500";
@@ -690,6 +691,13 @@ function PreferencesPanel() {
   return (
     <div className="space-y-4">
       <div className={card}>
+        <h2 className="mb-1 text-sm font-bold text-slate-800">Tema</h2>
+        <p className="mb-3 text-xs text-slate-500">Claro, oscuro o el mismo que tenga tu equipo. Se guarda en este navegador.</p>
+        <div className="max-w-sm">
+          <ThemeSwitch />
+        </div>
+      </div>
+      <div className={card}>
         <h2 className="mb-1 text-sm font-bold text-slate-800">Formato de fecha</h2>
         <p className="mb-3 text-xs text-slate-500">Cómo se muestran las fechas en este navegador.</p>
         <DateFormatToggle />
@@ -1312,24 +1320,139 @@ export function AccountPage({ userName, userEmail, userAvatar, onSignOut, compan
         </div>
       )}
       {tab === "tracking" && <BackgroundTrackingPanel />}
-      {tab === "role" && (
-        <div className={card}>
-          <h2 className="mb-3 text-sm font-bold text-slate-800">Lo que puedes hacer como {isCompanyAdmin ? "administrador" : "usuario"}</h2>
-          <div className="space-y-1.5 text-xs text-slate-600">
-            {ROLE_PERMISSIONS.map(([label, forEveryone]) => {
-              const allowed = forEveryone || isCompanyAdmin;
-              return (
-                <p key={label} className={`flex items-center gap-2 ${allowed ? "" : "text-slate-400"}`}>
-                  {allowed ? <CheckCircle2 size={13} className="shrink-0 text-emerald-600" /> : <X size={13} className="shrink-0 text-slate-300" />}
-                  {label}
-                </p>
-              );
-            })}
-          </div>
-          {!isCompanyAdmin && <p className="mt-3 text-[11px] text-slate-400">Si necesitas más permisos, pídeselos a un administrador de tu empresa.</p>}
-        </div>
-      )}
+      {tab === "role" && <RoleCard isCompanyAdmin={isCompanyAdmin} />}
       {tab === "privacy" && <PrivacyPanel />}
+    </div>
+  );
+}
+
+function RoleCard({ isCompanyAdmin }) {
+  return (
+    <div className={card}>
+      <h2 className="mb-3 text-sm font-bold text-slate-800">Lo que puedes hacer como {isCompanyAdmin ? "administrador" : "usuario"}</h2>
+      <div className="space-y-1.5 text-xs text-slate-600">
+        {ROLE_PERMISSIONS.map(([label, forEveryone]) => {
+          const allowed = forEveryone || isCompanyAdmin;
+          return (
+            <p key={label} className={`flex items-center gap-2 ${allowed ? "" : "text-slate-400"}`}>
+              {allowed ? <CheckCircle2 size={13} className="shrink-0 text-emerald-600" /> : <X size={13} className="shrink-0 text-slate-300" />}
+              {label}
+            </p>
+          );
+        })}
+      </div>
+      {!isCompanyAdmin && <p className="mt-3 text-[11px] text-slate-400">Si necesitas más permisos, pídeselos a un administrador de tu empresa.</p>}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Configuración: cuenta, empresa, preferencias y administración juntas  */
+/* ---------------------------------------------------------------------- */
+
+export function ConfigurationPage({ section = "profile", onSection, userName, userEmail, userAvatar, onSignOut, companyName, isSuperAdmin, isCompanyAdmin, renderAdmin }) {
+  const [signingOut, setSigningOut] = useState(false);
+  const sections = SETTINGS_SECTIONS.filter((s) => !s.superAdmin || isSuperAdmin);
+  const current = sections.find((s) => s.id === section) ?? sections[0];
+  const groups = [...new Set(sections.map((s) => s.group))];
+
+  async function handleSignOut() {
+    setSigningOut(true);
+    try {
+      await onSignOut();
+    } finally {
+      setSigningOut(false);
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className={`${card} flex flex-wrap items-center gap-4`}>
+        <img src={userAvatar} alt="" className="h-14 w-14 rounded-full" />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-bold text-slate-800">{userName}</p>
+          <p className="truncate text-xs text-slate-400">
+            {companyName ? `${companyName} · ` : ""}
+            {userEmail}
+          </p>
+          <div className="mt-1 flex flex-wrap gap-1.5">
+            {isSuperAdmin && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700 ring-1 ring-blue-200">
+                <Shield size={10} /> Super-administrador
+              </span>
+            )}
+            <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${isCompanyAdmin ? "bg-emerald-50 text-emerald-700 ring-emerald-200" : "bg-slate-100 text-slate-600 ring-slate-200"}`}>
+              {isCompanyAdmin ? "Administrador de empresa" : "Usuario de empresa"}
+            </span>
+          </div>
+        </div>
+        <button onClick={handleSignOut} disabled={signingOut} className="flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-2 text-xs font-semibold text-rose-600 hover:bg-rose-100 disabled:opacity-60">
+          <LogOut size={14} /> {signingOut ? "Cerrando…" : "Cerrar sesión"}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 items-start gap-5 lg:grid-cols-[220px_minmax(0,1fr)]">
+        {/* Pantalla angosta: lista desplegable. Ancha: menú a la izquierda. */}
+        <label className="block lg:hidden">
+          <span className="mb-1 block text-[11px] font-semibold text-slate-500">Apartado</span>
+          <select value={current.id} onChange={(e) => onSection(e.target.value)} className={inputClass}>
+            {groups.map((group) => (
+              <optgroup key={group} label={group}>
+                {sections
+                  .filter((s) => s.group === group)
+                  .map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.label}
+                    </option>
+                  ))}
+              </optgroup>
+            ))}
+          </select>
+        </label>
+        <nav aria-label="Apartados de configuración" className={`${card} sticky top-20 hidden space-y-3 p-3 lg:block`}>
+          {groups.map((group) => (
+            <div key={group}>
+              <p className="px-2 pb-1 text-[10px] font-bold uppercase tracking-wide text-slate-400">{group}</p>
+              {sections
+                .filter((s) => s.group === group)
+                .map((s) => {
+                  const Icon = s.icon;
+                  const active = s.id === current.id;
+                  return (
+                    <button
+                      key={s.id}
+                      onClick={() => onSection(s.id)}
+                      aria-current={active ? "page" : undefined}
+                      className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium transition ${active ? "bg-blue-50 text-blue-700" : "text-slate-600 hover:bg-slate-50"}`}
+                    >
+                      <Icon size={14} className={`shrink-0 ${active ? "text-blue-600" : "text-slate-400"}`} /> {s.label}
+                    </button>
+                  );
+                })}
+            </div>
+          ))}
+        </nav>
+
+        <div className="min-w-0 max-w-3xl space-y-4">
+          <h2 className="text-lg font-bold text-slate-900">{current.label}</h2>
+          {current.id === "profile" && <ProfileCard userEmail={userEmail} />}
+          {current.id === "security" && (
+            <>
+              <SecurityCard />
+              <PasswordCard />
+            </>
+          )}
+          {current.id === "tracking" && <BackgroundTrackingPanel />}
+          {current.id === "role" && <RoleCard isCompanyAdmin={isCompanyAdmin} />}
+          {current.id === "company" && <CompanyPanel />}
+          {current.id === "team" && <TeamPanel />}
+          {current.id === "bot" && <BotPanel />}
+          {current.id === "audit" && <AuditPanel />}
+          {current.id === "preferences" && <PreferencesPanel />}
+          {current.id === "privacy" && <PrivacyPanel />}
+          {current.id === "admin" && isSuperAdmin && renderAdmin?.()}
+        </div>
+      </div>
     </div>
   );
 }

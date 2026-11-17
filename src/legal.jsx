@@ -356,7 +356,7 @@ export function CookieNotice({ inline = false }) {
         className={
           inline
             ? "mb-3 flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-3"
-            : "fixed inset-x-3 bottom-3 z-[60] mx-auto flex max-w-2xl flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-white p-3.5 shadow-xl print:hidden sm:flex-nowrap"
+            : "cookie-notice fixed inset-x-3 bottom-3 z-[60] mx-auto flex max-w-2xl flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-white p-3.5 shadow-xl print:hidden sm:flex-nowrap"
         }
       >
         {!inline && <Cookie size={18} className="hidden shrink-0 text-blue-600 sm:block" />}

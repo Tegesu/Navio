@@ -5,10 +5,22 @@ import { TrackingProvider, TrackingPill, DriverModeModal, LiveMapPage } from "./
 import { TransfersPage } from "./trips.jsx";
 import { InboxProvider, NavBadge, BellButton, NotificationsPanel, MessagesPage, TasksPage } from "./inbox.jsx";
 import { hideSplash, FullScreenLoader, SupabaseSetupNotice, LoginPage, UpdatePasswordPage, MfaChallengePage, OnboardingPage, CompanyInactivePage, ConnectionErrorPage, WeakPasswordPrompt } from "./auth.jsx";
-import { SettingsPage, AccountPage, IdleGuard } from "./settings.jsx";
+import { ConfigurationPage, IdleGuard } from "./settings.jsx";
 import { AdminCompaniesPage } from "./admin.jsx";
 import { MobileAppShell } from "./mobile.jsx";
-import { AndroidAppDownload } from "./background.jsx";
+import { AndroidAppDownload, AppsPage } from "./background.jsx";
+import { Sidebar as NavSidebar, UserMenu, resolveRoute, DEFAULT_SUB } from "./navigation.jsx";
+import {
+  MaintenanceSearchPage,
+  ServiceDetailModal,
+  ScheduledServices,
+  CampaignsPage,
+  MaintenanceServiceFields,
+  serviceFromRecord,
+  cleanService,
+  serviceProblem,
+  presetMaintenanceSearch,
+} from "./maintenance.jsx";
 import { CookieNotice, LegalAcceptanceGate } from "./legal.jsx";
 import { HomePage } from "./home.jsx";
 import { FleetDataProvider, VehicleStatusChip, FleetStatusSummary, VehicleDocsTab, VehicleServiceTab, VehicleTiresTab, VehicleHistoryTab, VehicleLocationPanel, WarrantiesPanel, WarrantiesPage, MaintenanceUnitDetail } from "./vehicle.jsx";
@@ -158,19 +170,25 @@ function formatMoney(amount, currency = "MXN") {
 /*  Persistence — localStorage-backed state                               */
 /* ---------------------------------------------------------------------- */
 
-function useIsMobileViewport(breakpoint = 768) {
-  const [isMobile, setIsMobile] = useState(() => (typeof window !== "undefined" ? window.innerWidth < breakpoint : false));
-
+// ¿Se muestra la versión de teléfono? Solo en pantallas táctiles angostas (un
+// teléfono) o en ventanas muy angostas. Una computadora con la ventana a la
+// mitad conserva el diseño de computadora, acomodado a ese tamaño.
+const PHONE_QUERY = "(pointer: coarse) and (max-width: 900px), (max-width: 480px)";
+function useMediaQuery(query) {
+  const read = () => typeof window !== "undefined" && !!window.matchMedia?.(query).matches;
+  const [matches, setMatches] = useState(read);
   useEffect(() => {
-    function handleResize() {
-      setIsMobile(window.innerWidth < breakpoint);
-    }
-    handleResize();
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, [breakpoint]);
-
-  return isMobile;
+    const media = window.matchMedia?.(query);
+    if (!media) return undefined;
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, [query]);
+  return matches;
+}
+function useIsMobileViewport() {
+  return useMediaQuery(PHONE_QUERY);
 }
 
 function usePersistentState(key, initialValue) {
@@ -662,7 +680,7 @@ function getMaintenanceWidgets(records, vehicles) {
 /*  Trámites: tipos y resumen                                            */
 /* ---------------------------------------------------------------------- */
 
-const COMPLIANCE_DOC_TYPES = ["Tenencia", "Póliza de Seguro", "Verificación Vehicular", "Licencia de Conducir", "Tarjeta de Circulación"];
+const COMPLIANCE_DOC_TYPES = ["Tenencia", "Póliza de Seguro", "Verificación Vehicular", "Licencia de Conducir", "Tarjeta de Circulación", "Multa"];
 
 function getComplianceWidgets(records) {
   const tenenciaPending = records.filter((r) => r.docType === "Tenencia" && r.paymentStatus === "Pendiente de Pago").length;
@@ -1843,7 +1861,9 @@ function cfdiWarnings(cfdi) {
   return warnings;
 }
 
-function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpenseType, presetProject = "", initial, vehicles, orders = [], projectOptions = [], onSave, onClose }) {
+function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpenseType, presetProject = "", presetService = null, initial, vehicles, orders = [], projectOptions = [], campaigns = [], onSave, onClose }) {
+  // Datos del servicio de mantenimiento (reclamo, técnico, motor, fechas…).
+  const [service, setService] = useState(() => ({ ...serviceFromRecord(initial), ...(presetService ?? {}) }));
   const { profile } = useAuth();
   const { showToast } = useToast();
   const [moduleState, setModule] = useState(fixedModule ?? initial?.module ?? "maintenance");
@@ -1920,6 +1940,10 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
       setError("Indica los litros cargados para poder calcular el rendimiento.");
       return;
     }
+    if (module === "maintenance" && serviceProblem(service)) {
+      setError(serviceProblem(service));
+      return;
+    }
     setError("");
     setUploading(true);
     try {
@@ -1945,7 +1969,10 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
       // "fuel_records" no tiene columna "concept" — usa "station" como su
       // campo descriptivo. Mandarla ahí tira un error de esquema.
       if (module !== "fuel") base.concept = concept.trim();
-      if (module === "maintenance") base.category = category;
+      if (module === "maintenance") {
+        base.category = category;
+        Object.assign(base, cleanService(service));
+      }
       if (module === "compliance") {
         base.docType = docType;
         base.paymentStatus = paymentStatus;
@@ -2260,6 +2287,8 @@ function RecordFormModal({ mode, module: fixedModule, fixedCategory, presetExpen
             )}
           </details>
         )}
+
+        {module === "maintenance" && <MaintenanceServiceFields value={service} onChange={setService} projectOptions={projectOptions} campaigns={campaigns} />}
 
         <div>
           <label className={labelClass}>Notas (opcional)</label>
@@ -3217,7 +3246,7 @@ function ConfirmModal({ title, message, confirmLabel = "Confirmar", danger = fal
 /*  Maintenance module                                                    */
 /* ---------------------------------------------------------------------- */
 
-function MaintenanceOrdersTable({ records, vehicles, onAddClick, onConfirm, onEditClick, onDeleteClick }) {
+function MaintenanceOrdersTable({ records, vehicles, onAddClick, onConfirm, onEditClick, onDeleteClick, onOpenRecord }) {
   const maintenanceWidgets = useMemo(() => getMaintenanceWidgets(records, vehicles), [records, vehicles]);
   const { format } = useDateFormat();
   const { profile } = useAuth();
@@ -3233,6 +3262,19 @@ function MaintenanceOrdersTable({ records, vehicles, onAddClick, onConfirm, onEd
   }
 
   const columns = [
+    ...(onOpenRecord
+      ? [
+          {
+            key: "claimNumber",
+            label: "No. de reclamo",
+            render: (r) => (
+              <button onClick={() => onOpenRecord(r)} className="whitespace-nowrap font-semibold text-blue-600 underline-offset-2 hover:underline">
+                {r.claimNumber || `#${r.id}`}
+              </button>
+            ),
+          },
+        ]
+      : []),
     {
       key: "unit",
       label: "Unidad / Matrícula",
@@ -3263,7 +3305,7 @@ function MaintenanceOrdersTable({ records, vehicles, onAddClick, onConfirm, onEd
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Órdenes de Trabajo</h1>
+          <h1 className="text-xl font-bold text-slate-900">Servicios</h1>
           <p className="mt-1 text-sm text-slate-500">
             Servicios registrados a mano o recibidos por el bot de Telegram, con el origen y la revisión de cada dato.
           </p>
@@ -3400,8 +3442,8 @@ function MaintenanceUnitsGrid({ vehicles, records, onAddClick, onViewDetails }) 
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Mantenimiento — Servicios por Unidad</h1>
-          <p className="mt-1 text-sm text-slate-500">Desglose individual de motor, aceite, frenos y balatas por unidad.</p>
+          <h2 className="text-lg font-bold text-slate-900">Estado de servicio por unidad</h2>
+          <p className="mt-1 text-sm text-slate-500">Motor, aceite, frenos y balatas de cada unidad según su kilometraje.</p>
         </div>
         <button
           onClick={onAddClick}
@@ -6916,58 +6958,32 @@ function FuelPage({
 /*  Sidebar                                                                */
 /* ---------------------------------------------------------------------- */
 
-const NAV_ITEMS = [
-  { id: "home", label: "Inicio", icon: Home },
-  { id: "map", label: "Mapa en vivo", icon: MapPin },
-  { id: "fleet", label: "Gestión de flota", icon: Truck },
-  { id: "transfers", label: "Traslados", icon: Navigation },
-  { id: "fuel", label: "Facturas y Gastos", icon: Receipt },
-  {
-    id: "maintenance",
-    label: "Mantenimiento",
-    icon: Wrench,
-    children: [
-      { id: "servicios", label: "Servicios" },
-      { id: "garantias", label: "Garantías" },
-      { id: "ordenes", label: "Órdenes de trabajo" },
-    ],
-  },
-  {
-    id: "compliance",
-    label: "Trámites",
-    icon: ShieldCheck,
-    children: [
-      { id: "Tenencia", label: "Tenencias" },
-      { id: "Licencia de Conducir", label: "Licencias" },
-      { id: "Tarjeta de Circulación", label: "Tarjetas de circulación" },
-    ],
-  },
-  { id: "incidents", label: "Incidencias", icon: AlertTriangle },
-  { id: "messages", label: "Mensajes", icon: MessageSquare },
-  { id: "tasks", label: "Tareas", icon: ClipboardList },
-];
+// El menú lateral vive en navigation.jsx.
 
-const BOTTOM_NAV_ITEMS = [
-  { id: "settings", label: "Configuración", icon: Settings },
-  { id: "account", label: "Cuenta", icon: User },
-  { id: "support", label: "Comunidad", icon: HelpCircle },
-];
-
+// Datos del servicio que agrega la migración v24.
+const SERVICE_COLUMNS = ["project", "workOrder", "claimNumber", "technician", "engineNumber", "componentNumber", "serviceStart", "serviceEnd", "coverage", "campaignCode", "odometerKm", "serviceStatus"];
+function stripServiceFields(record) {
+  const out = { ...record };
+  for (const key of SERVICE_COLUMNS) delete out[key];
+  return out;
+}
 const PAGE_META = {
   home: { title: "Inicio", subtitle: "Lo que pasa hoy en tu operación y lo que necesita atención." },
   map: { title: "Mapa en vivo", subtitle: "Dónde está cada unidad y el recorrido de sus viajes." },
-  fleet: { title: "Gestión de Flota", subtitle: "Mosaico de unidades y expediente digital por vehículo." },
+  fleet: { title: "Gestión de flotas", subtitle: "Mosaico de unidades y expediente digital por vehículo." },
   transfers: { title: "Traslados", subtitle: "Asignación de viajes, rutas y carga por unidad." },
-  maintenance: { title: "Mantenimiento", subtitle: "Desglose por unidad: servicios, garantías y órdenes de trabajo." },
-  incidents: { title: "Incidencias", subtitle: "Reporte de fallos y emergencias en ruta." },
+  maintenance: { title: "Mantenimiento", subtitle: "Busca cualquier servicio por proyecto, orden, reclamo, técnico, motor o componente." },
+  services: { title: "Servicios", subtitle: "Todos los servicios de mantenimiento registrados." },
+  schedule: { title: "Programación de mantenimiento", subtitle: "Qué unidad necesita servicio y qué está programado." },
+  warranties: { title: "Garantías y campañas", subtitle: "Garantías vigentes y campañas de servicio del fabricante." },
+  incidents: { title: "Incidencias", subtitle: "Accidentes y fallas reportados en ruta." },
   messages: { title: "Mensajes", subtitle: "Conversaciones entre las personas de tu empresa." },
-  tasks: { title: "Tareas", subtitle: "Pendientes asignados a cada persona." },
-  compliance: { title: "Trámites", subtitle: "Tenencias, pólizas, verificaciones y licencias al día." },
-  fuel: { title: "Facturas y Gastos", subtitle: "Consumo de combustible, consumibles, refrigerante, refacciones y casetas." },
-  settings: { title: "Configuración", subtitle: "Tu empresa, tu equipo, el bot y la seguridad de la información." },
-  account: { title: "Cuenta", subtitle: "Tu perfil, tu seguridad y tus datos." },
+  tasks: { title: "Tareas", subtitle: "Pendientes asignados a cada persona, con su conversación." },
+  compliance: { title: "Trámites", subtitle: "Tenencias, licencias, tarjetas de circulación, multas y seguros al día." },
+  fuel: { title: "Facturas y gastos", subtitle: "Consumo de combustible, consumibles, refrigerante, refacciones y casetas." },
+  settings: { title: "Configuración", subtitle: "Tu cuenta, tu empresa, tu equipo y la seguridad de la información." },
   support: { title: "Comunidad", subtitle: "Comunidad y soporte técnico de Navio." },
-  admin: { title: "Administración", subtitle: "Empresas, suspensiones y solicitudes de privacidad." },
+  apps: { title: "App para Android y iOS", subtitle: "Navio en tu teléfono." },
 };
 
 /* ---------------------------------------------------------------------- */
@@ -7094,8 +7110,14 @@ const INCIDENT_STATUS_STYLES = {
 };
 
 
-function IncidentFormModal({ vehicles, onSave, onClose }) {
+const INCIDENT_KINDS = {
+  accident: { label: "Accidente", plural: "Accidentes", className: "bg-rose-50 text-rose-700 ring-rose-200" },
+  failure: { label: "Falla", plural: "Fallas", className: "bg-slate-100 text-slate-600 ring-slate-200" },
+};
+
+function IncidentFormModal({ vehicles, presetKind = "failure", onSave, onClose }) {
   const [unit, setUnit] = useState(vehicles[0]?.unit ?? "");
+  const [kind, setKind] = useState(presetKind === "accident" ? "accident" : "failure");
   const [severity, setSeverity] = useState("medium");
   const [description, setDescription] = useState("");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
@@ -7109,12 +7131,28 @@ function IncidentFormModal({ vehicles, onSave, onClose }) {
     e.preventDefault();
     if (!description.trim()) return;
     const driver = isVariableDriver(selectedVehicle) ? reporter.trim() : vehicleDriverName(selectedVehicle);
-    onSave({ unit, severity, status: "open", description: description.trim(), reportedBy: driver, date });
+    onSave({ unit, kind, severity, status: "open", description: description.trim(), reportedBy: driver, date });
   }
 
   return (
-    <Modal title="Reportar Incidencia" onClose={onClose}>
+    <Modal title="Reportar incidencia" onClose={onClose}>
       <form onSubmit={handleSubmit} className="space-y-3">
+        <div>
+          <label className={labelClass}>¿Qué pasó?</label>
+          <div className="grid grid-cols-2 gap-2">
+            {Object.entries(INCIDENT_KINDS).map(([id, k]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setKind(id)}
+                aria-pressed={kind === id}
+                className={`rounded-lg border px-3 py-2 text-xs font-semibold transition ${kind === id ? "border-blue-600 bg-blue-50 text-blue-700" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+              >
+                {id === "accident" ? "Accidente" : "Falla de la unidad"}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className={labelClass}>Unidad</label>
@@ -7163,17 +7201,28 @@ function IncidentFormModal({ vehicles, onSave, onClose }) {
   );
 }
 
-function IncidentsPage({ vehicles, incidents, insertIncident, updateIncident }) {
+function IncidentsPage({ vehicles, incidents, insertIncident, updateIncident, kindFilter = "all" }) {
   const { format } = useDateFormat();
   const { showToast } = useToast();
   const [severityFilter, setSeverityFilter] = useState("all");
   const [modalOpen, setModalOpen] = useState(false);
+  const kindOf = (i) => (i.kind === "accident" ? "accident" : "failure");
+  const kindMeta = INCIDENT_KINDS[kindFilter];
 
-  const filtered = severityFilter === "all" ? incidents : incidents.filter((i) => i.severity === severityFilter);
+  const filtered = incidents
+    .filter((i) => !kindMeta || kindOf(i) === kindFilter)
+    .filter((i) => severityFilter === "all" || i.severity === severityFilter);
 
   async function addIncident(incident) {
     try {
-      await insertIncident(incident);
+      try {
+        await insertIncident(incident);
+      } catch (err) {
+        // Sin la migración v24 todavía no existe el tipo: se guarda sin él.
+        if (!/kind/.test(err.message)) throw err;
+        const { kind, ...rest } = incident;
+        await insertIncident(rest);
+      }
       setModalOpen(false);
     } catch (err) {
       showToast(`Error al reportar incidencia: ${err.message}`);
@@ -7198,8 +7247,10 @@ function IncidentsPage({ vehicles, incidents, insertIncident, updateIncident }) 
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Incidencias</h1>
-          <p className="mt-1 text-sm text-slate-500">Reporte de fallos y emergencias en ruta.</p>
+          <h1 className="text-xl font-bold text-slate-900">{kindMeta ? kindMeta.plural : "Incidencias"}</h1>
+          <p className="mt-1 text-sm text-slate-500">
+            {kindFilter === "accident" ? "Choques, golpes y emergencias en ruta." : kindFilter === "failure" ? "Fallas mecánicas o eléctricas de las unidades." : "Accidentes y fallas reportados en ruta."}
+          </p>
         </div>
         <button
           onClick={() => setModalOpen(true)}
@@ -7232,6 +7283,7 @@ function IncidentsPage({ vehicles, incidents, insertIncident, updateIncident }) 
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
                   <p className="text-xs font-bold text-slate-800">{i.unit}</p>
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${INCIDENT_KINDS[kindOf(i)].className}`}>{INCIDENT_KINDS[kindOf(i)].label}</span>
                   <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${sev.className}`}>{sev.label}</span>
                   <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${st.className}`}>{st.label}</span>
                 </div>
@@ -7258,10 +7310,12 @@ function IncidentsPage({ vehicles, incidents, insertIncident, updateIncident }) 
             </div>
           );
         })}
-        {filtered.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Sin incidencias registradas.</p>}
+        {filtered.length === 0 && (
+          <p className="py-8 text-center text-xs text-slate-400">{kindMeta ? `Sin ${kindMeta.plural.toLowerCase()} registrados.` : "Sin incidencias registradas."}</p>
+        )}
       </div>
 
-      {modalOpen && <IncidentFormModal vehicles={vehicles} onSave={addIncident} onClose={() => setModalOpen(false)} />}
+      {modalOpen && <IncidentFormModal vehicles={vehicles} presetKind={kindFilter} onSave={addIncident} onClose={() => setModalOpen(false)} />}
     </div>
   );
 }
@@ -7723,7 +7777,7 @@ function BotFeedPanel() {
 
 // Minisecciones de Facturas y Gastos, en árbol: General → Proyectos → cada
 // proyecto activo.
-function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggle, onNav }) {
+function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggle, onNav, flush = false }) {
   const item = (isActive) =>
     `block w-full min-w-0 flex-1 truncate rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition ${
       isActive ? "bg-blue-50 text-blue-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
@@ -7741,7 +7795,7 @@ function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggle, onNav }
   );
   const inReport = nav.report;
   return (
-    <div className="ml-[22px] mt-1 space-y-0.5 border-l border-slate-100 pl-3">
+    <div className={flush ? "space-y-0.5" : "ml-[22px] mt-1 space-y-0.5 border-l border-slate-100 pl-3"}>
       <div className="flex items-center gap-0.5">
         <button onClick={() => onNav(INVOICE_NAV_START)} className={item(active && !inReport && !nav.inProjects)}>
           General
@@ -7772,161 +7826,13 @@ function InvoiceSidebarMenu({ active, nav, projects, expanded, onToggle, onNav }
   );
 }
 
-function Sidebar({ open, activeTab, activeSubId, onNavigate, onNavigateSub, onLogoClick, isSuperAdmin, invoiceMenu }) {
-  const [expanded, setExpanded] = useState({ maintenance: true, compliance: true, fuel: true, invoiceGeneral: true, invoiceProjects: true });
-
-  function toggleExpanded(id) {
-    setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
-  }
-
-  return (
-    <aside
-      className={`sticky top-0 flex h-screen shrink-0 flex-col border-r border-slate-200 bg-white transition-all duration-200 print:hidden ${
-        open ? "w-64" : "w-[72px]"
-      }`}
-    >
-      <button
-        onClick={onLogoClick}
-        title="Ir al Home"
-        className={`flex h-16 items-center border-b border-slate-100 hover:bg-slate-50 ${open ? "px-5" : "justify-center"}`}
-      >
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600 text-sm font-extrabold text-white">N</div>
-        {open && <span className="ml-2.5 text-lg font-extrabold tracking-tight text-blue-700">NAVIO</span>}
-      </button>
-
-      <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const active = activeTab === item.id;
-          const isInvoices = item.id === "fuel" && !!invoiceMenu;
-          const hasChildren = !!item.children || isInvoices;
-          return (
-            <div key={item.id}>
-              <button
-                onClick={() => {
-                  onNavigate(item.id);
-                  // Al llegar desde otra sección se abre; estando ahí, se pliega o despliega.
-                  if (hasChildren) setExpanded((prev) => ({ ...prev, [item.id]: active ? !prev[item.id] : true }));
-                }}
-                title={item.label}
-                className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
-                  active ? "bg-blue-600 text-white shadow-sm" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
-                } ${open ? "" : "justify-center"}`}
-              >
-                <Icon size={18} className="shrink-0" />
-                {open && <span className="flex-1 truncate text-left">{item.label}</span>}
-                {open && <NavBadge id={item.id} />}
-                {open && hasChildren && (
-                  expanded[item.id] ? <ChevronUp size={14} className="shrink-0" /> : <ChevronDown size={14} className="shrink-0" />
-                )}
-              </button>
-              {open && isInvoices && expanded.fuel && (
-                <InvoiceSidebarMenu
-                  active={active}
-                  nav={invoiceMenu.nav}
-                  projects={invoiceMenu.projects}
-                  expanded={expanded}
-                  onToggle={toggleExpanded}
-                  onNav={invoiceMenu.onNav}
-                />
-              )}
-              {open && item.children && expanded[item.id] && (
-                <div className="ml-[22px] mt-1 space-y-0.5 border-l border-slate-100 pl-3">
-                  {item.children.map((child) => {
-                    const childActive = active && activeSubId === child.id;
-                    return (
-                      <button
-                        key={child.id}
-                        onClick={() => onNavigateSub(item.id, child.id)}
-                        className={`block w-full truncate rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition ${
-                          childActive ? "bg-blue-50 text-blue-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
-                        }`}
-                      >
-                        {child.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </nav>
-
-      <div className="space-y-1 border-t border-slate-100 px-3 py-3">
-        {BOTTOM_NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const active = activeTab === item.id;
-          return (
-            <button
-              key={item.id}
-              onClick={() => onNavigate(item.id)}
-              title={item.label}
-              className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-xs font-medium transition ${
-                active ? "bg-blue-50 text-blue-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
-              } ${open ? "" : "justify-center"}`}
-            >
-              <Icon size={16} className="shrink-0" />
-              {open && <span className="truncate">{item.label}</span>}
-            </button>
-          );
-        })}
-        {isSuperAdmin && (
-          <button
-            onClick={() => onNavigate("admin")}
-            title="Administración"
-            className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-xs font-medium transition ${
-              activeTab === "admin" ? "bg-blue-50 text-blue-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
-            } ${open ? "" : "justify-center"}`}
-          >
-            <Shield size={16} className="shrink-0" />
-            {open && <span className="truncate">Administración</span>}
-          </button>
-        )}
-        <AndroidAppDownload variant="nav" label="App para Android" collapsed={!open} />
-      </div>
-
-      {open ? (
-        <div className="border-t border-slate-100 p-3">
-          <div className="mb-2 flex items-center gap-1.5 px-1 text-[11px] font-bold uppercase tracking-wide text-slate-400">
-            <Bot size={13} /> Bot de Ingesta
-          </div>
-          <BotFeedPanel />
-        </div>
-      ) : (
-        <div className="flex justify-center border-t border-slate-100 p-3">
-          <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-50 text-slate-400">
-            <Bot size={16} />
-          </span>
-        </div>
-      )}
-    </aside>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
-/*  Header                                                                 */
-/* ---------------------------------------------------------------------- */
-
-const BENTO_APPS = [
-  { label: "Gestión de Flota", icon: Truck, tab: "fleet" },
-  { label: "Mantenimiento", icon: Wrench, tab: "maintenance" },
-  { label: "Cumplimiento", icon: ShieldCheck, tab: "compliance" },
-  { label: "Combustible", icon: Fuel, tab: "fuel" },
-  { label: "Reportes", icon: FileText, tab: null },
-  { label: "Alertas", icon: AlertTriangle, tab: "incidents" },
-  { label: "Facturación", icon: DollarSign, tab: "fuel" },
-  { label: "Soporte", icon: MessageSquare, tab: "support" },
-  { label: "Ajustes", icon: Sliders, tab: "settings" },
-];
-
+// Barra superior: menú, título de la página, búsqueda de unidades, avisos y
+// el círculo de la persona (lleva a cada parte de Configuración).
 function Header({
-  toggleSidebar,
+  onMenu,
+  menuLabel,
   title,
   subtitle,
-  onLogoClick,
-  bentoOpen,
-  setBentoOpen,
   notifOpen,
   setNotifOpen,
   searchOpen,
@@ -7938,61 +7844,42 @@ function Header({
   onNavigate,
   userName,
   userAvatar,
+  userEmail,
   companyName,
+  isSuperAdmin,
+  isCompanyAdmin,
+  onSignOut,
 }) {
-  const { showToast } = useToast();
-
   const searchResults =
     searchQuery.trim().length > 0
       ? vehicles
           .filter((v) => {
             const q = searchQuery.trim().toLowerCase();
-            return (
-              v.unit.toLowerCase().includes(q) ||
-              v.plate.toLowerCase().includes(q) ||
-              vehicleDriverName(v).toLowerCase().includes(q)
-            );
+            return v.unit.toLowerCase().includes(q) || v.plate.toLowerCase().includes(q) || vehicleDriverName(v).toLowerCase().includes(q);
           })
           .slice(0, 6)
       : [];
 
-  function goToBentoApp(app) {
-    if (app.tab) {
-      onNavigate(app.tab);
-    } else {
-      showToast(`${app.label}: próximamente disponible.`);
-    }
-    setBentoOpen(false);
-  }
-
   return (
-    <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/90 px-6 py-3 backdrop-blur">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-4">
-          <button
-            onClick={toggleSidebar}
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
-            aria-label="Alternar menú lateral"
-          >
+    <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/90 px-3 py-2.5 backdrop-blur sm:px-6 sm:py-3">
+      <div className="flex items-center justify-between gap-2 sm:gap-3">
+        <div className="flex min-w-0 items-center gap-2 sm:gap-4">
+          <button onClick={onMenu} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100" aria-label={menuLabel}>
             <Menu size={20} />
           </button>
-          <div>
-            <h1 className="text-base font-bold text-slate-800">{title}</h1>
-            <p className="text-xs text-slate-400">{subtitle}</p>
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-bold text-slate-800">{title}</h1>
+            <p className="hidden truncate text-xs text-slate-400 sm:block">{subtitle}</p>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex shrink-0 items-center gap-1 sm:gap-2.5">
           <div className="relative" data-keep-open>
-            <button
-              onClick={() => setSearchOpen((v) => !v)}
-              className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
-              aria-label="Buscar unidad"
-            >
+            <button onClick={() => setSearchOpen((v) => !v)} className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100" aria-label="Buscar unidad">
               <Search size={18} />
             </button>
             {searchOpen && (
-              <div className="absolute right-0 z-20 mt-2 w-72 rounded-2xl border border-slate-200 bg-white p-2 shadow-xl">
+              <div className="absolute right-0 z-20 mt-2 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-slate-200 bg-white p-2 shadow-xl">
                 <input
                   autoFocus
                   value={searchQuery}
@@ -8001,9 +7888,7 @@ function Header({
                   className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none"
                 />
                 <div className="mt-1.5 max-h-64 overflow-y-auto">
-                  {searchQuery.trim().length === 0 && (
-                    <p className="px-2 py-3 text-center text-[11px] text-slate-400">Escribe para buscar en toda la flota.</p>
-                  )}
+                  {searchQuery.trim().length === 0 && <p className="px-2 py-3 text-center text-[11px] text-slate-400">Escribe para buscar en toda la flota.</p>}
                   {searchQuery.trim().length > 0 && searchResults.length === 0 && (
                     <p className="px-2 py-3 text-center text-[11px] text-slate-400">Sin resultados para "{searchQuery}".</p>
                   )}
@@ -8030,52 +7915,17 @@ function Header({
               </div>
             )}
           </div>
-          <button
-            onClick={onLogoClick}
-            title="Ir al Home"
-            className="hidden text-lg font-extrabold tracking-tight text-blue-700 hover:text-blue-800 lg:block"
-          >
-            NAVIO
-          </button>
           <BellButton onClick={() => setNotifOpen((v) => !v)} />
-          <div className="hidden items-center gap-2.5 sm:flex">
-            <img src={userAvatar} alt={userName} className="h-9 w-9 rounded-full bg-blue-50 ring-2 ring-blue-100" />
-            <div className="leading-tight">
-              <p className="text-sm font-semibold text-slate-800">{userName}</p>
-              <p className="text-xs text-slate-400">{companyName || "Administrador"}</p>
-            </div>
-          </div>
-          <div className="relative">
-            <button
-              onClick={() => setBentoOpen((v) => !v)}
-              className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
-              aria-label="Menú rápido"
-            >
-              <LayoutGrid size={19} />
-            </button>
-            {bentoOpen && (
-              <div className="absolute right-0 z-20 mt-2 w-64 rounded-2xl border border-slate-200 bg-white p-3 shadow-xl">
-                <p className="mb-2 px-1 text-xs font-semibold text-slate-400">Herramientas Navio</p>
-                <div className="grid grid-cols-3 gap-2">
-                  {BENTO_APPS.map((app) => {
-                    const Icon = app.icon;
-                    return (
-                      <button
-                        key={app.label}
-                        onClick={() => goToBentoApp(app)}
-                        className="flex flex-col items-center gap-1.5 rounded-xl p-2.5 text-center hover:bg-blue-50"
-                      >
-                        <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-50 text-blue-600">
-                          <Icon size={16} />
-                        </span>
-                        <span className="text-[10.5px] font-medium leading-tight text-slate-600">{app.label}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
+          <UserMenu
+            userName={userName}
+            userAvatar={userAvatar}
+            userEmail={userEmail}
+            companyName={companyName}
+            isSuperAdmin={isSuperAdmin}
+            isCompanyAdmin={isCompanyAdmin}
+            onGo={onNavigate}
+            onSignOut={onSignOut}
+          />
         </div>
       </div>
     </header>
@@ -8110,15 +7960,22 @@ function NavioApp() {
   const currentUserAvatar = avatarUrl(currentUserName);
   const isMobileViewport = useIsMobileViewport();
 
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  // La pantalla abierta sobrevive a una recarga de la pestaña.
+  // Barra lateral: en pantallas anchas se abre o se queda en íconos; en
+  // angostas (la ventana a la mitad) queda en íconos y se abre encima.
+  const [sidebarOpen, setSidebarOpen] = usePersistentState("navio.nav.sidebarOpen", true);
+  const narrowScreen = useMediaQuery("(max-width: 1100px)");
+  const [overlayOpen, setOverlayOpen] = useState(false);
+  // La pantalla abierta (y la sección de cada una) sobrevive a una recarga.
   const [storedTab, setActiveTab] = useSessionState("navio.nav.tab", "home");
-  // Una pestaña que no existe (un dato viejo guardado o un enlace mal
-  // formado) lleva a Inicio en vez de dejar la página en blanco.
-  const activeTab = PAGE_META[storedTab] ? storedTab : "home";
+  const [storedSubs, setStoredSubs] = useSessionState("navio.nav.subs", {});
+  // Pestañas viejas ("Cuenta", "Administración") se traducen a las nuevas; una
+  // que no existe lleva a Inicio en vez de dejar la página en blanco.
+  const [routeTab, routeSub] = resolveRoute(storedTab, storedSubs?.[storedTab]);
+  const activeTab = PAGE_META[routeTab] ? routeTab : "home";
+  const activeSub = (routeTab === activeTab ? routeSub : undefined) ?? storedSubs?.[activeTab] ?? DEFAULT_SUB[activeTab];
   const [selectedVehicleId, setSelectedVehicleId] = useSessionState("navio.nav.vehicle", null);
-  const [bentoOpen, setBentoOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
+  const [serviceDetail, setServiceDetail] = useState(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [dateFormat, setDateFormat] = usePersistentState("navio.dateFormat", "DD/MM/AAAA");
@@ -8224,6 +8081,12 @@ function NavioApp() {
     insertRow: insertIncident,
     updateRow: updateIncident,
   } = useSupabaseTable("incidents", { companyId, enabled: activeTab === "incidents" });
+  // Campañas de servicio (migración v24). Sin ella, la lista viene vacía.
+  const {
+    rows: campaigns,
+    error: campaignsError,
+    refresh: refreshCampaigns,
+  } = useSupabaseTable("service_campaigns", { companyId, enabled: ["maintenance", "services", "schedule", "warranties"].includes(activeTab) });
   const {
     rows: communityPosts,
     loading: communityLoading,
@@ -8243,8 +8106,6 @@ function NavioApp() {
     incidentsLoading ||
     communityLoading;
 
-  const [maintenanceView, setMaintenanceView] = useSessionState("navio.nav.maintenance", "servicios");
-  const [complianceDocFilter, setComplianceDocFilter] = useSessionState("navio.nav.compliance", "all");
 
   const [formModal, setFormModal] = useState(null);
   const [addVehicleModalOpen, setAddVehicleModalOpen] = useState(false);
@@ -8284,15 +8145,29 @@ function NavioApp() {
 
   async function handleSaveRecord(module, record, extra = {}) {
     const { insertRow, updateRow } = recordTables[module];
-    try {
-      if (record.id) {
-        const { id, ...patch } = record;
+    // Sin la migración v24 aún no existen los datos del servicio: se guarda
+    // lo de siempre y se avisa.
+    if (module === "maintenance" && campaignsError) record = stripServiceFields(record);
+    const write = async (row) => {
+      if (row.id) {
+        const { id, ...patch } = row;
         await updateRow(id, { ...patch, status: "verified" });
       } else {
         const author = INVOICE_MODULES.includes(module) ? { uploadedByName: currentUserName } : {};
         // Lo que registra alguien sin permiso de revisar queda pendiente
         // (la base de datos lo exige igual).
-        await insertRow({ ...record, ...author, origin: "manual", status: canReviewInvoices ? "verified" : "pending" });
+        await insertRow({ ...row, ...author, origin: "manual", status: canReviewInvoices ? "verified" : "pending" });
+      }
+    };
+    try {
+      try {
+        await write(record);
+      } catch (err) {
+        // La base todavía no tiene una columna del servicio (falta la v24).
+        const missingColumn = module === "maintenance" && SERVICE_COLUMNS.some((c) => String(err.message).includes(c));
+        if (!missingColumn) throw err;
+        record = stripServiceFields(record);
+        await write(record);
       }
       if (INVOICE_MODULES.includes(module) && record.workOrder) {
         await ensureWorkOrder(record.project, record.workOrder, extra.orderDueDate);
@@ -8465,13 +8340,21 @@ function NavioApp() {
     setSelectedVehicleId(id);
   }
   function goToTab(id, subId) {
-    setActiveTab(id);
+    const [tab, sub] = resolveRoute(id, subId);
+    setActiveTab(tab);
     setSelectedVehicleId(null);
-    if (id === "maintenance") setMaintenanceView(subId ?? "servicios");
-    if (id === "compliance") setComplianceDocFilter(subId ?? "all");
+    setOverlayOpen(false);
+    const nextSub = sub ?? DEFAULT_SUB[tab];
+    if (nextSub !== undefined) setStoredSubs((prev) => ({ ...(prev ?? {}), [tab]: nextSub }));
   }
 
-  const activeSubId = activeTab === "maintenance" ? maintenanceView : activeTab === "compliance" ? complianceDocFilter : undefined;
+  // Abre el buscador de Mantenimiento ya filtrado (por ejemplo, una campaña).
+  function searchServices(applied) {
+    presetMaintenanceSearch(applied);
+    goToTab("maintenance");
+  }
+  const openServiceForm = (initial = null, presetService = null) =>
+    setFormModal({ mode: initial ? "edit" : "add", module: "maintenance", initial, presetService });
 
   // Lo que consultan el expediente de una unidad y las garantías.
   const fleetData = useMemo(
@@ -8484,143 +8367,9 @@ function NavioApp() {
     0
   );
 
-  if (isMobileViewport) {
-    return (
-      <DateFormatContext.Provider value={{ format: dateFormat, setFormat: setDateFormat }}>
-        <ToastContext.Provider value={{ showToast }}>
-          <AppProviders fleet={fleetData}>
-          {dataLoading && !vehiclesError && (
-            <div className="flex min-h-screen items-center justify-center">
-              <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">
-                <RefreshCw size={16} className="animate-spin" /> Cargando datos de Supabase...
-              </div>
-            </div>
-          )}
-          {vehiclesError && (
-            <div className="flex min-h-screen items-center justify-center px-4">
-              <div className="max-w-md rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center">
-                <AlertTriangle size={20} className="mx-auto mb-2 text-rose-600" />
-                <p className="text-sm font-bold text-rose-700">No se pudo conectar a la base de datos</p>
-                <p className="mt-1 text-xs text-rose-600">{vehiclesError}</p>
-              </div>
-            </div>
-          )}
-          {!dataLoading && !vehiclesError && (
-            <MobileAppShell
-              vehicles={vehicles}
-              trips={trips}
-              pendingCount={pendingReviewCount}
-              userName={currentUserName}
-              userEmail={currentUserEmail}
-              userAvatar={currentUserAvatar}
-              companyName={profile?.company?.name}
-              isSuperAdmin={!!profile?.isSuperAdmin}
-              isCompanyAdmin={isCompanyAdmin}
-              onSignOut={signOut}
-              onOpenRecordForm={(module) => setFormModal({ mode: "add", module, initial: null })}
-            />
-          )}
-          {formModal && (
-            <RecordFormModal
-              mode={formModal.mode}
-              module={formModal.module}
-              fixedCategory={formModal.category}
-              presetExpenseType={formModal.expenseType}
-              presetProject={formModal.project}
-              initial={formModal.initial}
-              vehicles={vehicles}
-              orders={invoiceOrders}
-              projectOptions={projectOptions}
-              onSave={handleSaveRecord}
-              onClose={() => setFormModal(null)}
-            />
-          )}
-          <WeakPasswordPrompt />
-          <ToastHost toast={toast} onDismiss={() => setToast(null)} />
-          </AppProviders>
-        </ToastContext.Provider>
-      </DateFormatContext.Provider>
-    );
-  }
-
-  return (
-    <DateFormatContext.Provider value={{ format: dateFormat, setFormat: setDateFormat }}>
-      <ToastContext.Provider value={{ showToast }}>
-        <AppProviders fleet={fleetData}>
-        <div
-          className="flex min-h-screen w-full bg-[#f8fafc]"
-          onClick={(e) => {
-            if (!e.target.closest?.("[data-keep-open]")) {
-              setBentoOpen(false);
-              setNotifOpen(false);
-              setSearchOpen(false);
-            }
-          }}
-        >
-          <Sidebar
-            open={sidebarOpen}
-            activeTab={activeTab}
-            activeSubId={activeSubId}
-            onNavigate={(id) => goToTab(id)}
-            onNavigateSub={(parentId, childId) => goToTab(parentId, childId)}
-            onLogoClick={goHome}
-            isSuperAdmin={!!profile?.isSuperAdmin}
-            invoiceMenu={{
-              nav: invoiceNav,
-              projects: sidebarProjects,
-              onNav: (nav) => {
-                goToTab("fuel");
-                setInvoiceNav(nav);
-              },
-            }}
-          />
-
-          <div className="flex min-h-screen min-w-0 flex-1 flex-col">
-            <div data-keep-open className="print:hidden">
-              <Header
-                toggleSidebar={() => setSidebarOpen((v) => !v)}
-                title={headerTitle}
-                subtitle={headerSubtitle}
-                onLogoClick={goHome}
-                bentoOpen={bentoOpen}
-                setBentoOpen={setBentoOpen}
-                notifOpen={notifOpen}
-                setNotifOpen={setNotifOpen}
-                searchOpen={searchOpen}
-                setSearchOpen={setSearchOpen}
-                searchQuery={searchQuery}
-                setSearchQuery={setSearchQuery}
-                vehicles={vehicles}
-                onSelectVehicle={jumpToVehicle}
-                onNavigate={goToTab}
-                userName={currentUserName}
-                userAvatar={currentUserAvatar}
-                companyName={profile?.company?.name}
-              />
-            </div>
-
-            <main className="flex-1 px-6 py-6">
-              {dataLoading && !vehiclesError && (
-                <div className="flex min-h-[60vh] items-center justify-center">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">
-                    <RefreshCw size={16} className="animate-spin" /> Cargando datos de Supabase...
-                  </div>
-                </div>
-              )}
-              {vehiclesError && (
-                <div className="flex min-h-[60vh] items-center justify-center px-4">
-                  <div className="max-w-md rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center">
-                    <AlertTriangle size={20} className="mx-auto mb-2 text-rose-600" />
-                    <p className="text-sm font-bold text-rose-700">No se pudo conectar a la base de datos</p>
-                    <p className="mt-1 text-xs text-rose-600">{vehiclesError}</p>
-                    <p className="mt-2 text-[11px] text-rose-500">
-                      Verifica que corriste supabase_migration.sql en tu proyecto de Supabase.
-                    </p>
-                  </div>
-                </div>
-              )}
-              {!dataLoading && !vehiclesError && (
-                <>
+  // Lo que se ve en cada sección: igual en la computadora y en el teléfono.
+  const pageContent = (
+    <>
                   {activeTab === "home" && (
                     <HomePage
                       vehicles={vehicles}
@@ -8659,27 +8408,56 @@ function NavioApp() {
                       isAdmin={isCompanyAdmin}
                       projectOptions={projectOptions}
                       onOpenDriverMode={() => setDriverModeOpen(true)}
+                      view={activeSub}
+                      onViewChange={(view) => setStoredSubs((prev) => ({ ...(prev ?? {}), transfers: view }))}
                     />
                   )}
                   {activeTab === "maintenance" && (
-                    <MaintenanceSection
-                      view={maintenanceView}
-                      vehicles={vehicles}
+                    <MaintenanceSearchPage records={maintenanceRecords} vehicles={vehicles} campaigns={campaigns} onOpenRecord={setServiceDetail} onAdd={() => openServiceForm()} />
+                  )}
+                  {activeTab === "services" && (
+                    <MaintenanceOrdersTable
                       records={maintenanceRecords}
-                      onAddClick={() => setFormModal({ mode: "add", module: "maintenance", initial: null })}
+                      vehicles={vehicles}
+                      onAddClick={() => openServiceForm()}
                       onConfirm={canReviewInvoices ? (r) => handleConfirmRecord("maintenance", r) : undefined}
-                      onEditClick={canReviewInvoices ? (r) => setFormModal({ mode: "edit", module: "maintenance", initial: r }) : undefined}
+                      onEditClick={canReviewInvoices ? (r) => openServiceForm(r) : undefined}
                       onDeleteClick={(r) => setDeleteRecordTarget({ module: "maintenance", record: r })}
-                      onUpdateVehicle={handleUpdateVehicle}
+                      onOpenRecord={setServiceDetail}
                     />
                   )}
+                  {activeTab === "schedule" && (
+                    <div className="space-y-5">
+                      <ScheduledServices records={maintenanceRecords} onOpenRecord={setServiceDetail} onSchedule={() => openServiceForm(null, { serviceStatus: "scheduled" })} />
+                      <MaintenanceSection
+                        view="servicios"
+                        vehicles={vehicles}
+                        records={maintenanceRecords}
+                        onAddClick={() => openServiceForm(null, { serviceStatus: "scheduled" })}
+                        onUpdateVehicle={handleUpdateVehicle}
+                      />
+                    </div>
+                  )}
+                  {activeTab === "warranties" &&
+                    (activeSub === "campaigns" ? (
+                      <CampaignsPage
+                        campaigns={campaigns}
+                        records={maintenanceRecords}
+                        isAdmin={isCompanyAdmin}
+                        missing={!!campaignsError}
+                        onChanged={refreshCampaigns}
+                        onSearchServices={(code) => searchServices({ coverage: "campaign", campaignCode: code })}
+                      />
+                    ) : (
+                      <WarrantiesPage />
+                    ))}
                   {activeTab === "incidents" && (
-                    <IncidentsPage vehicles={vehicles} incidents={incidents} insertIncident={insertIncident} updateIncident={updateIncident} />
+                    <IncidentsPage vehicles={vehicles} incidents={incidents} insertIncident={insertIncident} updateIncident={updateIncident} kindFilter={activeSub} />
                   )}
                   {activeTab === "compliance" && (
                     <CompliancePage
                       records={complianceRecords}
-                      docFilter={complianceDocFilter}
+                      docFilter={activeSub}
                       onAddClick={() => setFormModal({ mode: "add", module: "compliance", initial: null })}
                       onConfirm={canReviewInvoices ? (r) => handleConfirmRecord("compliance", r) : undefined}
                       onEditClick={canReviewInvoices ? (r) => setFormModal({ mode: "edit", module: "compliance", initial: r }) : undefined}
@@ -8705,11 +8483,20 @@ function NavioApp() {
                       onSetProjectClosed={handleSetProjectClosed}
                     />
                   )}
-                  {activeTab === "messages" && <MessagesPage isAdmin={isCompanyAdmin} />}
-                  {activeTab === "tasks" && <TasksPage isAdmin={isCompanyAdmin} />}
-                  {activeTab === "settings" && <SettingsPage />}
-                  {activeTab === "account" && (
-                    <AccountPage
+                  {activeTab === "messages" && (
+                    <MessagesPage
+                      isAdmin={isCompanyAdmin}
+                      view={activeSub}
+                      onOpenChannel={(c) => {
+                        if (c.kind !== "direct") setStoredSubs((prev) => ({ ...(prev ?? {}), messages: `channel:${c.id}` }));
+                      }}
+                    />
+                  )}
+                  {activeTab === "tasks" && <TasksPage isAdmin={isCompanyAdmin} view={activeSub} />}
+                  {activeTab === "settings" && (
+                    <ConfigurationPage
+                      section={activeSub}
+                      onSection={(id) => goToTab("settings", id)}
                       userName={currentUserName}
                       userEmail={currentUserEmail}
                       userAvatar={currentUserAvatar}
@@ -8717,8 +8504,10 @@ function NavioApp() {
                       companyName={profile?.company?.name}
                       isSuperAdmin={!!profile?.isSuperAdmin}
                       isCompanyAdmin={isCompanyAdmin}
+                      renderAdmin={() => <AdminCompaniesPage />}
                     />
                   )}
+                  {activeTab === "apps" && <AppsPage onGo={goToTab} />}
                   {activeTab === "support" && (
                     <CommunityPage
                       posts={communityPosts}
@@ -8729,18 +8518,12 @@ function NavioApp() {
                       userEmail={currentUserEmail}
                     />
                   )}
-                  {activeTab === "admin" && profile?.isSuperAdmin && <AdminCompaniesPage />}
-                </>
-              )}
-            </main>
-          </div>
+    </>
+  );
 
-          {notifOpen && (
-            <div data-keep-open className="fixed right-6 top-16 z-40 w-96 max-w-[calc(100vw-3rem)] rounded-2xl border border-slate-200 bg-white p-3 shadow-xl">
-              <NotificationsPanel isAdmin={isCompanyAdmin} onNavigate={goToTab} onClose={() => setNotifOpen(false)} />
-            </div>
-          )}
-
+  // Ventanas que comparten la computadora y el teléfono.
+  const sharedModals = (
+    <>
           {formModal && (
             <RecordFormModal
               mode={formModal.mode}
@@ -8752,8 +8535,31 @@ function NavioApp() {
               vehicles={vehicles}
               orders={invoiceOrders}
               projectOptions={projectOptions}
+              presetService={formModal.presetService}
+              campaigns={campaigns}
               onSave={handleSaveRecord}
               onClose={() => setFormModal(null)}
+            />
+          )}
+          {serviceDetail && (
+            <ServiceDetailModal
+              record={maintenanceRecords.find((r) => r.id === serviceDetail.id) ?? serviceDetail}
+              onClose={() => setServiceDetail(null)}
+              onEdit={
+                canReviewInvoices
+                  ? (r) => {
+                      setServiceDetail(null);
+                      openServiceForm(r);
+                    }
+                  : undefined
+              }
+              onConfirm={
+                canReviewInvoices
+                  ? (r) => {
+                      handleConfirmRecord("maintenance", r);
+                    }
+                  : undefined
+              }
             />
           )}
 
@@ -8788,6 +8594,149 @@ function NavioApp() {
               onClose={() => setDeleteRecordTarget(null)}
             />
           )}
+
+    </>
+  );
+
+  if (isMobileViewport) {
+    return (
+      <DateFormatContext.Provider value={{ format: dateFormat, setFormat: setDateFormat }}>
+        <ToastContext.Provider value={{ showToast }}>
+          <AppProviders fleet={fleetData}>
+          {dataLoading && !vehiclesError && (
+            <div className="flex min-h-screen items-center justify-center">
+              <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">
+                <RefreshCw size={16} className="animate-spin" /> Cargando datos de Supabase...
+              </div>
+            </div>
+          )}
+          {vehiclesError && (
+            <div className="flex min-h-screen items-center justify-center px-4">
+              <div className="max-w-md rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center">
+                <AlertTriangle size={20} className="mx-auto mb-2 text-rose-600" />
+                <p className="text-sm font-bold text-rose-700">No se pudo conectar a la base de datos</p>
+                <p className="mt-1 text-xs text-rose-600">{vehiclesError}</p>
+              </div>
+            </div>
+          )}
+          {!dataLoading && !vehiclesError && (
+            <MobileAppShell
+              vehicles={vehicles}
+              trips={trips}
+              pendingCount={pendingReviewCount}
+              userName={currentUserName}
+              userEmail={currentUserEmail}
+              userAvatar={currentUserAvatar}
+              companyName={profile?.company?.name}
+              isSuperAdmin={!!profile?.isSuperAdmin}
+              isCompanyAdmin={isCompanyAdmin}
+              onSignOut={signOut}
+              onOpenRecordForm={(module) => setFormModal({ mode: "add", module, initial: null })}
+              page={pageContent}
+              pageTitle={headerTitle}
+              onGo={(tab, sub, vehicleId) => {
+                goToTab(tab, sub);
+                if (vehicleId) setSelectedVehicleId(vehicleId);
+              }}
+            />
+          )}
+          {sharedModals}
+          <WeakPasswordPrompt />
+          <ToastHost toast={toast} onDismiss={() => setToast(null)} />
+          </AppProviders>
+        </ToastContext.Provider>
+      </DateFormatContext.Provider>
+    );
+  }
+
+  return (
+    <DateFormatContext.Provider value={{ format: dateFormat, setFormat: setDateFormat }}>
+      <ToastContext.Provider value={{ showToast }}>
+        <AppProviders fleet={fleetData}>
+        <div
+          className="flex min-h-screen w-full bg-page"
+          onClick={(e) => {
+            if (!e.target.closest?.("[data-keep-open]")) {
+              setNotifOpen(false);
+              setSearchOpen(false);
+            }
+          }}
+        >
+          <NavSidebar
+            open={narrowScreen ? overlayOpen : sidebarOpen}
+            overlay={narrowScreen}
+            onClose={() => setOverlayOpen(false)}
+            tab={activeTab}
+            sub={activeSub}
+            onGo={goToTab}
+            onLogoClick={goHome}
+            invoiceMenu={{
+              nav: invoiceNav,
+              projects: sidebarProjects,
+              onNav: (nav) => {
+                goToTab("fuel");
+                setInvoiceNav(nav);
+              },
+            }}
+          />
+
+          <div className="flex min-h-screen min-w-0 flex-1 flex-col">
+            <div data-keep-open className="print:hidden">
+              <Header
+                onMenu={() => (narrowScreen ? setOverlayOpen((v) => !v) : setSidebarOpen((v) => !v))}
+                menuLabel="Mostrar u ocultar el menú lateral"
+                title={headerTitle}
+                subtitle={headerSubtitle}
+                userEmail={currentUserEmail}
+                isSuperAdmin={!!profile?.isSuperAdmin}
+                isCompanyAdmin={isCompanyAdmin}
+                onSignOut={signOut}
+                notifOpen={notifOpen}
+                setNotifOpen={setNotifOpen}
+                searchOpen={searchOpen}
+                setSearchOpen={setSearchOpen}
+                searchQuery={searchQuery}
+                setSearchQuery={setSearchQuery}
+                vehicles={vehicles}
+                onSelectVehicle={jumpToVehicle}
+                onNavigate={goToTab}
+                userName={currentUserName}
+                userAvatar={currentUserAvatar}
+                companyName={profile?.company?.name}
+              />
+            </div>
+
+            <main className="flex-1 px-6 py-6">
+              {dataLoading && !vehiclesError && (
+                <div className="flex min-h-[60vh] items-center justify-center">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">
+                    <RefreshCw size={16} className="animate-spin" /> Cargando datos de Supabase...
+                  </div>
+                </div>
+              )}
+              {vehiclesError && (
+                <div className="flex min-h-[60vh] items-center justify-center px-4">
+                  <div className="max-w-md rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center">
+                    <AlertTriangle size={20} className="mx-auto mb-2 text-rose-600" />
+                    <p className="text-sm font-bold text-rose-700">No se pudo conectar a la base de datos</p>
+                    <p className="mt-1 text-xs text-rose-600">{vehiclesError}</p>
+                    <p className="mt-2 text-[11px] text-rose-500">
+                      Verifica que corriste supabase_migration.sql en tu proyecto de Supabase.
+                    </p>
+                  </div>
+                </div>
+              )}
+              {!dataLoading && !vehiclesError && pageContent}
+            </main>
+          </div>
+
+          {notifOpen && (
+            <div data-keep-open className="fixed right-6 top-16 z-40 w-96 max-w-[calc(100vw-3rem)] rounded-2xl border border-slate-200 bg-white p-3 shadow-xl">
+              <NotificationsPanel isAdmin={isCompanyAdmin} onNavigate={goToTab} onClose={() => setNotifOpen(false)} />
+            </div>
+          )}
+
+          {sharedModals}
 
           <TrackingPill onOpen={() => setDriverModeOpen(true)} />
           {driverModeOpen && <DriverModeModal vehicles={vehicles} trips={trips} onClose={() => setDriverModeOpen(false)} />}
@@ -8857,6 +8806,8 @@ export {
   useSessionState,
   useSupabaseTable,
   useIsMobileViewport,
+  InvoiceSidebarMenu,
+  BotFeedPanel,
   formatDate,
   formatCurrency,
   formatMoney,

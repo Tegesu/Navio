@@ -289,13 +289,21 @@ function TripDetailModal({ trip, onClose }) {
   );
 }
 
-export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeTrip, isAdmin, projectOptions = [], onOpenDriverMode }) {
+export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeTrip, isAdmin, projectOptions = [], onOpenDriverMode, view = "open", onViewChange }) {
   const { format } = useDateFormat();
   const { showToast } = useToast();
   const { user, profile } = useAuth();
   const supervisor = profileCan(profile, "supervisor");
   const tracking = useTracking();
-  const [filter, setFilter] = useState("open");
+  // El apartado elegido en el menú lateral (Programar, En curso, Completados, Cancelados).
+  const [filter, setFilterState] = useState(view);
+  useEffect(() => {
+    setFilterState(view);
+  }, [view]);
+  const setFilter = (id) => {
+    setFilterState(id);
+    onViewChange?.(id);
+  };
   const [query, setQuery] = useState("");
   const [form, setForm] = useState(null); // null | {} | trip
   const [detailId, setDetailId] = useState(null);

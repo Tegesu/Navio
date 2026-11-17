@@ -15,6 +15,12 @@
   background: #f8fafc;
   transition: opacity 0.35s ease, visibility 0.35s;
 }
+html.dark #splash {
+  background: #1e1e1d;
+}
+html.dark .splash-logo {
+  color: #a597fd;
+}
 #splash.splash-done {
   opacity: 0;
   visibility: hidden;
@@ -157,4 +163,132 @@
     animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Base para ambos temas (los colores salen de las variables)         */
+/* ------------------------------------------------------------------ */
+html,
+body {
+  background-color: rgb(var(--bg-page));
+}
+body {
+  color: rgb(var(--tx-slate-800));
+}
+/* Campos sin fondo propio: que sigan al tema (en oscuro, el navegador los
+   pintaría blancos). ":where" no pesa: cualquier clase de la app gana. */
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]), select, textarea) {
+  background-color: rgb(var(--bg-white));
+  color: inherit;
+}
+html.dark :where(input, select, textarea)::placeholder {
+  color: rgb(var(--tx-slate-400));
+}
+html.dark ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+html.dark ::-webkit-scrollbar-thumb {
+  background: #4a4a47;
+  border-radius: 999px;
+  border: 2px solid #1e1e1d;
+}
+html.dark ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Mapa en modo oscuro: se invierten los mosaicos y los controles. */
+html.dark .leaflet-container {
+  background: #1e1e1d;
+}
+html.dark .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.85) saturate(0.35) sepia(0.12);
+}
+html.dark .leaflet-bar a,
+html.dark .leaflet-control-attribution,
+html.dark .leaflet-tooltip,
+html.dark .leaflet-popup-content-wrapper,
+html.dark .leaflet-popup-tip {
+  background: #2e2e2c;
+  color: #e8e7e1;
+  border-color: #484744;
+}
+html.dark .leaflet-control-attribution a {
+  color: #a597fd;
+}
+
+/* Al cambiar de tema, los colores se mueven juntos y sin parpadeo. */
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease !important;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Inicio de sesión en el teléfono: primero la imagen; luego se       */
+/*  difumina, se va al fondo y entra la tarjeta para entrar.           */
+/* ------------------------------------------------------------------ */
+@media (max-width: 767.98px) {
+  .login-art {
+    transform-origin: 50% 30%;
+    animation: login-recede 0.9s 2.1s cubic-bezier(0.4, 0, 0.2, 1) both;
+  }
+  .login-card {
+    animation: login-card-in 0.7s 2.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  .login-instant .login-art {
+    animation-delay: 0s;
+    animation-duration: 0.01ms;
+  }
+  .login-instant .login-card {
+    animation-delay: 0s;
+    animation-duration: 0.35s;
+  }
+}
+@keyframes login-recede {
+  from {
+    filter: none;
+    transform: none;
+    opacity: 1;
+  }
+  to {
+    filter: blur(7px) saturate(0.85);
+    transform: scale(0.93);
+    opacity: 0.5;
+  }
+}
+@keyframes login-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(48px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-art,
+  .login-card {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+  }
+}
+
+/* Entrada en modo oscuro: la "N" toma el color lavanda de Navio. */
+html.dark .splash-n {
+  animation-name: splash-n-dark;
+}
+@keyframes splash-n-dark {
+  to {
+    background: #6f5de8;
+    color: #fff;
+    transform: scale(1.2);
+    box-shadow: 0 12px 32px rgba(111, 93, 232, 0.35);
+  }
+}
+
+/* Teléfono: los avisos flotantes van arriba de la barra inferior. */
+.has-bottom-nav .cookie-notice {
+  bottom: calc(76px + env(safe-area-inset-bottom));
 }

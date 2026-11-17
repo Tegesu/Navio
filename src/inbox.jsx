@@ -6,6 +6,7 @@ import {
   CheckCheck,
   CheckCircle2,
   ClipboardList,
+  Lock,
   Megaphone,
   MessageSquare,
   Navigation,
@@ -15,6 +16,7 @@ import {
   Trash2,
   User,
   Users,
+  X,
 } from "lucide-react";
 import { supabase, useAuth, useToast, useDateFormat, formatDate, Modal, avatarUrl, timeAgoLabel, localISODate } from "./NavioDashboard.jsx";
 import { usePeople, personName } from "./people.jsx";
@@ -348,11 +350,11 @@ function ChannelAvatar({ channel, size = "h-9 w-9" }) {
   );
 }
 
-function NewConversationModal({ group = null, onOpen, onClose }) {
+function NewConversationModal({ group = null, initialMode = "direct", onOpen, onClose }) {
   const { user } = useAuth();
   const { people } = usePeople();
   const others = people.filter((p) => p.id !== user?.id);
-  const [mode, setMode] = useState(group ? "group" : "direct");
+  const [mode, setMode] = useState(group ? "group" : initialMode);
   const [name, setName] = useState(group?.name ?? "");
   const [members, setMembers] = useState(group?.memberIds ?? []);
   const [busy, setBusy] = useState(false);
@@ -639,17 +641,45 @@ function Conversation({ channel, isAdmin, onBack, onChanged }) {
   );
 }
 
-export function MessagesPage({ isAdmin, compact = false }) {
+// Vistas de Mensajes: "all", "group" (chats grupales), "direct" (privados) o
+// "channel:<id>" (un chat en particular).
+const MESSAGE_VIEWS = {
+  all: { title: "Mensajes", hint: "Conversaciones entre las personas de tu empresa. Nadie de fuera puede leerlas.", filter: () => true },
+  group: { title: "Chats grupales", hint: "El chat general de la empresa y los grupos en los que participas.", filter: (c) => c.kind === "general" || c.kind === "group" },
+  direct: { title: "Chats privados", hint: "Conversaciones uno a uno. Solo las ven las dos personas.", filter: (c) => c.kind === "direct" },
+};
+
+export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenChannel }) {
   const inbox = useInbox();
   const [openId, setOpenId] = useState(null);
   const [creating, setCreating] = useState(false);
-  const channels = inbox?.channels ?? [];
-  const open = channels.find((c) => c.id === openId) ?? null;
+  const pinnedId = typeof view === "string" && view.startsWith("channel:") ? Number(view.slice(8)) : null;
+  const viewKey = pinnedId ? "group" : MESSAGE_VIEWS[view] ? view : "all";
+  const meta = MESSAGE_VIEWS[viewKey];
+  const allChannels = inbox?.channels ?? [];
+  const channels = allChannels.filter(meta.filter);
+  const open = allChannels.find((c) => c.id === openId) ?? null;
+
+  // Un chat elegido desde el menú se abre directo.
+  useEffect(() => {
+    if (pinnedId) setOpenId(pinnedId);
+  }, [pinnedId]);
+
+  // Al cambiar de vista, la conversación abierta debe ser de esa vista.
+  useEffect(() => {
+    if (!pinnedId && open && !meta.filter(open)) setOpenId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewKey]);
 
   // En pantalla ancha siempre hay una conversación abierta.
   useEffect(() => {
     if (!compact && openId === null && channels.length > 0 && window.innerWidth >= 1024) setOpenId(channels[0].id);
   }, [compact, openId, channels]);
+
+  const choose = (channel) => {
+    setOpenId(channel.id);
+    onOpenChannel?.(channel);
+  };
 
   async function handleOpened(channelId) {
     setCreating(false);
@@ -665,14 +695,14 @@ export function MessagesPage({ isAdmin, compact = false }) {
     <div className={compact ? "flex h-[calc(100vh-7.5rem)] flex-col" : "space-y-4"}>
       {!compact && (
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Mensajes</h1>
-          <p className="mt-1 text-sm text-slate-500">Conversaciones entre las personas de tu empresa. Nadie de fuera puede leerlas.</p>
+          <h1 className="text-xl font-bold text-slate-900">{meta.title}</h1>
+          <p className="mt-1 text-sm text-slate-500">{meta.hint}</p>
         </div>
       )}
       <div className={`grid min-h-0 flex-1 overflow-hidden border-slate-200 bg-white lg:grid-cols-[300px_minmax(0,1fr)] ${compact ? "" : "h-[calc(100vh-14rem)] min-h-[420px] rounded-2xl border shadow-sm"}`}>
         <div className={`min-h-0 flex-col border-slate-100 lg:flex lg:border-r ${open ? "hidden" : "flex"}`}>
           <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2.5">
-            <p className="text-xs font-bold text-slate-700">Conversaciones</p>
+            <p className="text-xs font-bold text-slate-700">{viewKey === "all" ? "Conversaciones" : meta.title}</p>
             <button onClick={() => setCreating(true)} className="flex items-center gap-1 rounded-lg bg-blue-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700">
               <Plus size={12} /> Nueva
             </button>
@@ -681,7 +711,7 @@ export function MessagesPage({ isAdmin, compact = false }) {
             {channels.map((c) => (
               <button
                 key={c.id}
-                onClick={() => setOpenId(c.id)}
+                onClick={() => choose(c)}
                 className={`flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition ${openId === c.id ? "bg-blue-50" : "hover:bg-slate-50"}`}
               >
                 <ChannelAvatar channel={c} />
@@ -699,7 +729,11 @@ export function MessagesPage({ isAdmin, compact = false }) {
                 </span>
               </button>
             ))}
-            {channels.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Cargando conversaciones…</p>}
+            {channels.length === 0 && (
+              <p className="py-8 text-center text-xs text-slate-400">
+                {allChannels.length === 0 ? "Cargando conversaciones…" : viewKey === "direct" ? "Todavía no tienes chats privados. Presiona \"Nueva\"." : "Sin conversaciones en esta vista."}
+              </p>
+            )}
           </div>
         </div>
         <div className={`min-h-0 lg:block ${open ? "block" : "hidden"}`}>
@@ -719,7 +753,7 @@ export function MessagesPage({ isAdmin, compact = false }) {
           )}
         </div>
       </div>
-      {creating && <NewConversationModal onOpen={handleOpened} onClose={() => setCreating(false)} />}
+      {creating && <NewConversationModal initialMode={viewKey === "group" ? "group" : "direct"} onOpen={handleOpened} onClose={() => setCreating(false)} />}
     </div>
   );
 }
@@ -827,16 +861,236 @@ function TaskFormModal({ initial, isAdmin, onClose }) {
   );
 }
 
-export function TasksPage({ isAdmin, compact = false }) {
+// La conversación de una tarea: mensajes de las dos personas y los cambios
+// de estado, en orden. Al terminar la tarea queda como historial.
+function TaskChat({ task }) {
+  const { user } = useAuth();
+  const { showToast } = useToast();
+  const [items, setItems] = useState(null);
+  const [missing, setMissing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef(null);
+  const closed = task.status === "done" || task.status === "cancelled";
+  const taskId = task.id;
+
+  const load = useCallback(async () => {
+    const { data, error } = await supabase.from("task_comments").select("*").eq("taskId", taskId).order("id", { ascending: true }).limit(500);
+    if (error) {
+      setMissing(true);
+      setItems([]);
+    } else setItems(data ?? []);
+  }, [taskId]);
+
+  useEffect(() => {
+    setItems(null);
+    setDraft("");
+    load();
+    const channel = supabase
+      .channel(`task-chat-${taskId}-${++inboxChannelSeq}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "task_comments", filter: `taskId=eq.${taskId}` }, (payload) => {
+        const row = payload.new;
+        setItems((prev) => (prev && !prev.some((m) => m.id === row.id) ? [...prev, row] : prev));
+      })
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [taskId, load]);
+
+  // Los cambios de estado los escribe la base: se vuelve a leer al cambiar.
+  useEffect(() => {
+    load();
+  }, [task.status, load]);
+
+  useEffect(() => {
+    const box = scrollRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [items]);
+
+  async function send() {
+    const body = draft.trim();
+    if (!body || sending) return;
+    setSending(true);
+    const { data, error } = await supabase.from("task_comments").insert({ taskId, body }).select().single();
+    setSending(false);
+    if (error) {
+      showToast(`No se pudo enviar: ${error.message}`);
+      return;
+    }
+    setDraft("");
+    setItems((prev) => (prev && !prev.some((m) => m.id === data.id) ? [...prev, data] : prev));
+  }
+
+  if (missing) {
+    return <p className="rounded-xl bg-slate-50 px-3 py-6 text-center text-xs text-slate-400">La conversación de las tareas se activa al aplicar la actualización de la base de datos.</p>;
+  }
+
+  let lastDay = null;
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200">
+      <div ref={scrollRef} className="min-h-[220px] flex-1 space-y-1 overflow-y-auto bg-slate-50/60 px-3 py-3">
+        {items === null && <p className="py-6 text-center text-xs text-slate-400">Cargando conversación…</p>}
+        {items?.length === 0 && <p className="py-6 text-center text-xs text-slate-400">Aún no hay mensajes. Escribe para dar seguimiento.</p>}
+        {items?.map((m) => {
+          const day = dayLabel(m.createdAt);
+          const showDay = day !== lastDay;
+          lastDay = day;
+          if (m.kind === "event") {
+            return (
+              <div key={m.id}>
+                {showDay && <p className="py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-400">{day}</p>}
+                <p className="mx-auto w-fit max-w-[90%] rounded-full bg-white px-3 py-1 text-center text-[11px] text-slate-500 shadow-sm">
+                  {m.body} <span className="text-slate-400">· {hourLabel(m.createdAt)}</span>
+                </p>
+              </div>
+            );
+          }
+          const mine = m.authorId === user?.id;
+          return (
+            <div key={m.id}>
+              {showDay && <p className="py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-400">{day}</p>}
+              <div className={`flex ${mine ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[82%] rounded-2xl px-3 py-1.5 ${mine ? "rounded-br-md bg-blue-600 text-white" : "rounded-bl-md bg-white text-slate-700 shadow-sm"}`}>
+                  {!mine && <p className="text-[10px] font-bold text-blue-600">{m.authorName || "Alguien"}</p>}
+                  <p className="whitespace-pre-wrap break-words text-xs leading-relaxed">{m.body}</p>
+                  <p className={`mt-0.5 text-right text-[9px] ${mine ? "text-blue-100" : "text-slate-400"}`}>{hourLabel(m.createdAt)}</p>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {closed ? (
+        <p className="flex items-center justify-center gap-1.5 border-t border-slate-100 bg-white px-3 py-2.5 text-[11px] text-slate-400">
+          <Lock size={12} /> La conversación se cerró al {task.status === "done" ? "terminar" : "cancelar"} la tarea. Reábrela para escribir.
+        </p>
+      ) : (
+        <div className="flex items-end gap-2 border-t border-slate-100 bg-white p-2.5">
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+            rows={1}
+            maxLength={2000}
+            placeholder="Escribe un avance o una pregunta…"
+            aria-label="Mensaje de la tarea"
+            className="max-h-32 min-h-[38px] flex-1 resize-none rounded-xl border border-slate-200 px-3 py-2 text-xs focus:border-blue-400 focus:outline-none"
+          />
+          <button onClick={send} disabled={!draft.trim() || sending} aria-label="Enviar" className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40">
+            <Send size={15} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function useWide(query = "(min-width: 1024px)") {
+  const get = () => typeof window !== "undefined" && !!window.matchMedia?.(query).matches;
+  const [wide, setWide] = useState(get);
+  useEffect(() => {
+    const media = window.matchMedia?.(query);
+    if (!media) return undefined;
+    const update = () => setWide(media.matches);
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, [query]);
+  return wide;
+}
+
+// Detalle de una tarea con sus acciones y su conversación.
+function TaskDetail({ task, isAdmin, onEdit, onSetStatus, onClose }) {
+  const { user } = useAuth();
+  const { format } = useDateFormat();
+  const mine = task.assignedTo === user?.id;
+  const canEdit = isAdmin || task.createdBy === user?.id;
+  const status = TASK_STATUS[task.status] ?? TASK_STATUS.open;
+  const isOpen = task.status === "open" || task.status === "in_progress";
+  const canMove = mine || canEdit;
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="break-words text-sm font-bold text-slate-800">{task.title}</p>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] text-slate-400">
+            <span className={`rounded-full px-2 py-0.5 font-semibold ${status.className}`}>{status.label}</span>
+            <span className="flex items-center gap-1">
+              <User size={11} /> {mine ? "Yo" : task.assignedToName || "Sin asignar"}
+            </span>
+            {task.createdByName && task.createdBy !== task.assignedTo && <span>Asignó {task.createdByName}</span>}
+            {task.dueDate && <span>Para el {formatDate(task.dueDate, format)}</span>}
+            {task.completedAt && <span>Terminada el {formatDate(task.completedAt.slice(0, 10), format)}</span>}
+          </div>
+        </div>
+        {onClose && (
+          <button onClick={onClose} aria-label="Cerrar detalle" className="hidden h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 lg:flex">
+            <X size={15} />
+          </button>
+        )}
+      </div>
+      {task.description && <p className="whitespace-pre-wrap break-words rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600">{task.description}</p>}
+      {task.relatedLabel && <p className="text-[11px] text-slate-500">Relacionada con: <b>{task.relatedLabel}</b></p>}
+      {canMove && (
+        <div className="flex flex-wrap gap-1.5">
+          {task.status === "open" && mine && (
+            <button onClick={() => onSetStatus(task, "in_progress")} className="rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-[11px] font-semibold text-blue-700 hover:bg-blue-100">
+              Empezar
+            </button>
+          )}
+          {isOpen && (
+            <button onClick={() => onSetStatus(task, "done")} className="flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100">
+              <CheckCircle2 size={12} /> Marcar como resuelta
+            </button>
+          )}
+          {!isOpen && (
+            <button onClick={() => onSetStatus(task, "open")} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+              Reabrir
+            </button>
+          )}
+          {canEdit && isOpen && (
+            <button onClick={() => onEdit(task)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+              Editar
+            </button>
+          )}
+          {canEdit && isOpen && (
+            <button onClick={() => onSetStatus(task, "cancelled")} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50">
+              Cancelar tarea
+            </button>
+          )}
+        </div>
+      )}
+      <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
+        <MessageSquare size={12} /> {isOpen ? "Seguimiento" : "Historial hasta su resolución"}
+      </p>
+      <TaskChat task={task} />
+    </div>
+  );
+}
+
+// Vistas: "open" (tareas asignadas sin completar) y "done" (resueltas).
+export function TasksPage({ isAdmin, compact = false, view = "open", focusId = null }) {
   const { user } = useAuth();
   const { format } = useDateFormat();
   const { showToast } = useToast();
   const inbox = useInbox();
+  const wide = useWide();
   const [scope, setScope] = useState("mine");
-  const [showDone, setShowDone] = useState(false);
   const [form, setForm] = useState(null);
+  const [selectedId, setSelectedId] = useState(focusId);
   const tasks = inbox?.tasks ?? [];
   const today = localISODate();
+  const resolved = view === "done";
+
+  useEffect(() => {
+    if (focusId) setSelectedId(focusId);
+  }, [focusId]);
 
   const scopes = [
     { id: "mine", label: "Mis tareas", filter: (t) => t.assignedTo === user?.id },
@@ -845,127 +1099,165 @@ export function TasksPage({ isAdmin, compact = false }) {
   ];
   const current = scopes.find((s) => s.id === scope) ?? scopes[0];
   const isOpen = (t) => t.status === "open" || t.status === "in_progress";
+  const inView = (t) => (resolved ? !isOpen(t) : isOpen(t));
   const listed = tasks
     .filter(current.filter)
-    .filter((t) => showDone || isOpen(t))
-    .sort((a, b) => Number(isOpen(b)) - Number(isOpen(a)) || String(a.dueDate ?? "9999").localeCompare(String(b.dueDate ?? "9999")) || b.id - a.id);
+    .filter(inView)
+    .sort((a, b) =>
+      resolved
+        ? String(b.completedAt ?? b.updatedAt ?? "").localeCompare(String(a.completedAt ?? a.updatedAt ?? "")) || b.id - a.id
+        : String(a.dueDate ?? "9999").localeCompare(String(b.dueDate ?? "9999")) || b.id - a.id
+    );
+  const selected = tasks.find((t) => t.id === selectedId) ?? null;
+
+  // En pantalla ancha, la primera tarea de la lista se abre sola.
+  useEffect(() => {
+    if (wide && !compact && (!selected || !inView(selected)) && listed.length > 0 && !focusId) setSelectedId(listed[0].id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wide, compact, view, scope, listed.length]);
 
   async function setStatus(task, status) {
     const { error } = await supabase.from("tasks").update({ status }).eq("id", task.id);
     if (error) showToast(`No se pudo actualizar: ${error.message}`);
-    else inbox.reloadTasks();
+    else {
+      inbox.reloadTasks();
+      if (status === "done") showToast("Tarea resuelta. Su conversación queda en \"Tareas resueltas\".");
+    }
   }
 
   async function remove(task) {
     const { error } = await supabase.from("tasks").delete().eq("id", task.id);
     if (error) showToast(`No se pudo eliminar: ${error.message}`);
-    else inbox.reloadTasks();
+    else {
+      if (selectedId === task.id) setSelectedId(null);
+      inbox.reloadTasks();
+    }
   }
 
   if (inbox && !inbox.available) {
     return <p className="rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-10 text-center text-xs text-slate-400">Las tareas se activan al aplicar la actualización de la base de datos.</p>;
   }
 
+  const list = (
+    <div className="space-y-2">
+      {listed.map((t) => {
+        const overdue = isOpen(t) && t.dueDate && t.dueDate < today;
+        const mine = t.assignedTo === user?.id;
+        const canEdit = isAdmin || t.createdBy === user?.id;
+        const status = TASK_STATUS[t.status] ?? TASK_STATUS.open;
+        const active = selected?.id === t.id && (wide && !compact);
+        return (
+          <div
+            key={t.id}
+            className={`flex items-start gap-3 rounded-2xl border bg-white p-3.5 shadow-sm transition ${active ? "border-blue-300 ring-2 ring-blue-100" : overdue ? "border-rose-200" : "border-slate-200"}`}
+          >
+            <button
+              onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
+              disabled={!mine && !canEdit}
+              aria-label={t.status === "done" ? "Reabrir tarea" : "Marcar como resuelta"}
+              className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition disabled:opacity-40 ${
+                t.status === "done" ? "border-emerald-500 bg-emerald-500 text-white" : "border-slate-300 text-transparent hover:border-emerald-400"
+              }`}
+            >
+              <CheckCircle2 size={12} />
+            </button>
+            <button onClick={() => setSelectedId(t.id)} className="min-w-0 flex-1 text-left">
+              <p className={`break-words text-sm font-semibold ${t.status === "cancelled" ? "text-slate-400 line-through" : resolved ? "text-slate-600" : "text-slate-800"}`}>{t.title}</p>
+              {t.description && <p className="mt-0.5 line-clamp-2 whitespace-pre-wrap break-words text-xs text-slate-500">{t.description}</p>}
+              <span className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
+                <span className={`rounded-full px-2 py-0.5 font-semibold ${status.className}`}>{status.label}</span>
+                <span className="flex items-center gap-1">
+                  <User size={11} /> {mine ? "Yo" : t.assignedToName || "Sin asignar"}
+                </span>
+                {t.dueDate && !resolved && (
+                  <span className={`flex items-center gap-1 ${overdue ? "font-semibold text-rose-600" : ""}`}>
+                    {overdue && <AlertTriangle size={11} />}
+                    {overdue ? "Venció el" : "Para el"} {formatDate(t.dueDate, format)}
+                  </span>
+                )}
+                {resolved && t.completedAt && <span>Resuelta el {formatDate(t.completedAt.slice(0, 10), format)}</span>}
+                {t.priority === "high" && !resolved && <span className={`font-semibold ${TASK_PRIORITY.high.className}`}>Prioridad alta</span>}
+                {t.relatedLabel && <span>· {t.relatedLabel}</span>}
+                <span className="flex items-center gap-1 font-semibold text-blue-600">
+                  <MessageSquare size={11} /> {resolved ? "Ver historial" : "Conversación"}
+                </span>
+              </span>
+            </button>
+            {canEdit && (
+              <button onClick={() => remove(t)} aria-label="Eliminar tarea" className="shrink-0 rounded-lg border border-slate-200 p-1.5 text-slate-400 hover:bg-slate-50 hover:text-rose-500">
+                <Trash2 size={12} />
+              </button>
+            )}
+          </div>
+        );
+      })}
+      {listed.length === 0 && (
+        <p className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-slate-200 bg-white py-10 text-center text-xs text-slate-400">
+          <CheckCheck size={20} className="text-emerald-400" />
+          {resolved ? "Todavía no hay tareas resueltas en esta vista." : current.id === "mine" ? "No tienes tareas pendientes." : "Sin tareas pendientes en esta vista."}
+        </p>
+      )}
+    </div>
+  );
+
+  const sidePanel = wide && !compact;
   return (
     <div className={compact ? "space-y-4 p-4 pb-24" : "space-y-5"}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Tareas</h1>
-          {!compact && <p className="mt-1 text-sm text-slate-500">Lo que cada persona tiene pendiente. Quien recibe una tarea es avisado al momento.</p>}
+          <h1 className="text-xl font-bold text-slate-900">{resolved ? "Tareas resueltas" : "Tareas asignadas"}</h1>
+          {!compact && (
+            <p className="mt-1 text-sm text-slate-500">
+              {resolved ? "Lo que ya se terminó, con su conversación completa hasta que se resolvió." : "Lo que falta por hacer. Cada tarea tiene su propia conversación para dar seguimiento."}
+            </p>
+          )}
         </div>
-        <button onClick={() => setForm({})} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700">
-          <Plus size={15} /> Nueva tarea
-        </button>
-      </div>
-
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap gap-2">
-          {scopes.map((s) => {
-            const count = tasks.filter(s.filter).filter(isOpen).length;
-            return (
-              <button
-                key={s.id}
-                onClick={() => setScope(s.id)}
-                className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
-                  current.id === s.id ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-                }`}
-              >
-                {s.label} <b className={current.id === s.id ? "text-blue-100" : "text-slate-400"}>{count}</b>
-              </button>
-            );
-          })}
-        </div>
-        <label className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-slate-500">
-          <input type="checkbox" checked={showDone} onChange={(e) => setShowDone(e.target.checked)} className="h-3.5 w-3.5 accent-blue-600" />
-          Mostrar terminadas
-        </label>
-      </div>
-
-      <div className="space-y-2">
-        {listed.map((t) => {
-          const overdue = isOpen(t) && t.dueDate && t.dueDate < today;
-          const mine = t.assignedTo === user?.id;
-          const canEdit = isAdmin || t.createdBy === user?.id;
-          const status = TASK_STATUS[t.status] ?? TASK_STATUS.open;
-          return (
-            <div key={t.id} className={`flex items-start gap-3 rounded-2xl border bg-white p-3.5 shadow-sm ${overdue ? "border-rose-200" : "border-slate-200"}`}>
-              <button
-                onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
-                disabled={!mine && !canEdit}
-                aria-label={t.status === "done" ? "Reabrir tarea" : "Marcar como terminada"}
-                className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition disabled:opacity-40 ${
-                  t.status === "done" ? "border-emerald-500 bg-emerald-500 text-white" : "border-slate-300 text-transparent hover:border-emerald-400"
-                }`}
-              >
-                <CheckCircle2 size={12} />
-              </button>
-              <div className="min-w-0 flex-1">
-                <p className={`break-words text-sm font-semibold ${t.status === "done" || t.status === "cancelled" ? "text-slate-400 line-through" : "text-slate-800"}`}>{t.title}</p>
-                {t.description && <p className="mt-0.5 whitespace-pre-wrap break-words text-xs text-slate-500">{t.description}</p>}
-                <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
-                  <span className={`rounded-full px-2 py-0.5 font-semibold ${status.className}`}>{status.label}</span>
-                  <span className="flex items-center gap-1">
-                    <User size={11} /> {mine ? "Yo" : t.assignedToName || "Sin asignar"}
-                  </span>
-                  {t.dueDate && (
-                    <span className={`flex items-center gap-1 ${overdue ? "font-semibold text-rose-600" : ""}`}>
-                      {overdue && <AlertTriangle size={11} />}
-                      {overdue ? "Venció el" : "Para el"} {formatDate(t.dueDate, format)}
-                    </span>
-                  )}
-                  {t.priority === "high" && <span className={`font-semibold ${TASK_PRIORITY.high.className}`}>Prioridad alta</span>}
-                  {t.relatedLabel && <span>· {t.relatedLabel}</span>}
-                  {t.createdBy !== t.assignedTo && t.createdByName && <span>· Asignó {t.createdByName}</span>}
-                </div>
-              </div>
-              <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-                {t.status === "open" && mine && (
-                  <button onClick={() => setStatus(t, "in_progress")} className="rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-[11px] font-semibold text-blue-700 hover:bg-blue-100">
-                    Empezar
-                  </button>
-                )}
-                {canEdit && isOpen(t) && (
-                  <button onClick={() => setForm(t)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
-                    Editar
-                  </button>
-                )}
-                {canEdit && (
-                  <button onClick={() => remove(t)} aria-label="Eliminar tarea" className="rounded-lg border border-slate-200 p-1.5 text-slate-400 hover:bg-slate-50 hover:text-rose-500">
-                    <Trash2 size={12} />
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-        {listed.length === 0 && (
-          <p className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-slate-200 bg-white py-10 text-center text-xs text-slate-400">
-            <CheckCheck size={20} className="text-emerald-400" />
-            {current.id === "mine" ? "No tienes tareas pendientes." : "Sin tareas en esta vista."}
-          </p>
+        {!resolved && (
+          <button onClick={() => setForm({})} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700">
+            <Plus size={15} /> Nueva tarea
+          </button>
         )}
       </div>
 
+      <div className="flex flex-wrap gap-2">
+        {scopes.map((s) => {
+          const count = tasks.filter(s.filter).filter(inView).length;
+          return (
+            <button
+              key={s.id}
+              onClick={() => setScope(s.id)}
+              className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
+                current.id === s.id ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+              }`}
+            >
+              {s.label} <b className={current.id === s.id ? "text-blue-100" : "text-slate-400"}>{count}</b>
+            </button>
+          );
+        })}
+      </div>
+
+      {sidePanel ? (
+        <div className="grid grid-cols-[minmax(0,1fr)_minmax(360px,420px)] items-start gap-4">
+          {list}
+          <div className="sticky top-20 flex h-[calc(100vh-7rem)] min-h-[420px] flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            {selected ? (
+              <TaskDetail task={selected} isAdmin={isAdmin} onEdit={setForm} onSetStatus={setStatus} onClose={() => setSelectedId(null)} />
+            ) : (
+              <p className="m-auto text-center text-xs text-slate-400">Elige una tarea para ver su conversación.</p>
+            )}
+          </div>
+        </div>
+      ) : (
+        list
+      )}
+
+      {!sidePanel && selected && (
+        <Modal title="Tarea" width="max-w-lg" onClose={() => setSelectedId(null)}>
+          <div className="flex h-[70vh] min-h-0 flex-col">
+            <TaskDetail task={selected} isAdmin={isAdmin} onEdit={setForm} onSetStatus={setStatus} />
+          </div>
+        </Modal>
+      )}
       {form && <TaskFormModal initial={form} isAdmin={isAdmin} onClose={() => setForm(null)} />}
     </div>
   );

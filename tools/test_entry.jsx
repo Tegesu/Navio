@@ -52,7 +52,17 @@ const db = {
   misc_expenses: [invoice({ category: "tolls", expenseType: "casetas", concept: "Caseta", amount: 350, date: thisMonth(1), vendor: "CAPUFE", unit: "Unidad 12", project: "Tren Maya", details: { plaza: "Cosoleacaque", paymentMethod: "TAG" } })],
   work_orders: [{ id: 1, companyId: COMPANY, project: "Tren Maya", code: "OT-100", dueDate: null, createdAt: ago(30) }],
   project_settings: [], concept_deadlines: [], user_reminders: [],
-  maintenance_records: [{ id: 1, companyId: COMPANY, unit: "Unidad 12", plate: "YZA-142-B", category: "engine", concept: "Cambio de aceite", amount: 3200, date: thisMonth(1), vendor: "Taller Central", origin: "manual", status: "verified", createdAt: ago(40) }],
+  maintenance_records: [
+    { id: 1, companyId: COMPANY, unit: "Unidad 12", plate: "YZA-142-B", category: "engine", concept: "Cambio de aceite", amount: 3200, date: thisMonth(1), vendor: "Taller Central", origin: "manual", status: "verified", createdAt: ago(40), project: "Tren Maya", workOrder: "OT-100", claimNumber: "RC-1029", technician: "Luis Ramírez", engineNumber: "MTR-77812", componentNumber: "FLT-22", serviceStart: thisMonth(1), serviceEnd: thisMonth(1), coverage: "warranty", campaignCode: null, odometerKm: 152300, serviceStatus: "done" },
+    { id: 2, companyId: COMPANY, unit: "Unidad 07", plate: "XKT-880-A", category: "brakes", concept: "Revisión de frenos (campaña)", amount: 0, date: thisMonth(2), vendor: "Kenworth del Golfo", origin: "manual", status: "verified", createdAt: ago(10), project: "Puerto", workOrder: "OT-221", claimNumber: "RC-2001", technician: "Ana Torres", engineNumber: "MTR-11200", componentNumber: "BRK-9", serviceStart: iso(new Date(Date.now() + 3 * 864e5)), serviceEnd: null, coverage: "campaign", campaignCode: "CAMP-2026-04", odometerKm: 88000, serviceStatus: "scheduled" },
+  ],
+  service_campaigns: [
+    { id: 1, companyId: COMPANY, code: "CAMP-2026-04", title: "Revisión del sistema de frenos", manufacturer: "Kenworth", affectedUnits: "T680 2021–2023", description: "Cambiar la válvula del freno de servicio.", startDate: thisMonth(1), endDate: null, status: "active", documentUrl: null, createdBy: "u1", createdAt: ago(20) },
+  ],
+  task_comments: [
+    { id: 1, taskId: 1, companyId: COMPANY, authorId: "u1", authorName: "Johana Viras", kind: "event", body: "Johana Viras creó la tarea y se la asignó a Vania Usuario.", createdAt: ago(4) },
+    { id: 2, taskId: 1, companyId: COMPANY, authorId: "u2", authorName: "Vania Usuario", kind: "comment", body: "Ya pedí los comprobantes al proveedor.", createdAt: ago(3) },
+  ],
   compliance_records: [{ id: 1, companyId: COMPANY, unit: "Unidad 07", plate: "XKT-880-A", docType: "Póliza de Seguro", concept: "Renovación póliza", amount: 18000, date: thisMonth(1), dueDate: iso(new Date(Date.now() + 12 * 864e5)), paymentStatus: "Pendiente de Pago", origin: "manual", status: "pending", createdAt: ago(20) }],
   trips: [
     { id: 1, companyId: COMPANY, unit: "Unidad 12", vehicleId: 1, driver: "Ricardo Pérez", tripType: "cargo", origin: "Coatzacoalcos", destination: "Mérida", date: iso(now), cargo: "Materiales, 8 t", status: "scheduled", assignedTo: ME, assignedToName: isMember ? "Vania Usuario" : "Johana Viras", project: "Tren Maya", createdByName: "Johana Viras", createdAt: ago(3) },
@@ -392,6 +402,14 @@ supabase.from = (table) => {
     chain.insert = (row) => insert(Array.isArray(row) ? row.map(stamp) : stamp(row));
   }
   if (table === "warranties") {
+    const insert = chain.insert;
+    chain.insert = (row) => insert({ status: "active", createdBy: ME, ...row });
+  }
+  if (table === "task_comments") {
+    const insert = chain.insert;
+    chain.insert = (row) => insert({ kind: "comment", ...row, authorId: ME, authorName: myName() });
+  }
+  if (table === "service_campaigns") {
     const insert = chain.insert;
     chain.insert = (row) => insert({ status: "active", createdBy: ME, ...row });
   }

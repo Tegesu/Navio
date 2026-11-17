@@ -266,3 +266,72 @@ export function BackgroundTrackingPanel() {
     </div>
   );
 }
+
+/* ---------------------------------------------------------------------- */
+/*  Página "App para Android y iOS"                                       */
+/* ---------------------------------------------------------------------- */
+
+export function AppsPage({ onGo }) {
+  const { native } = useTracking();
+  return (
+    <div className="space-y-5">
+      <div className="overflow-hidden rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-700 p-5 text-white shadow-sm">
+        <h1 className="flex items-center gap-2 text-xl font-bold">
+          <Smartphone size={20} /> Navio en tu teléfono
+        </h1>
+        <p className="mt-1 max-w-2xl text-sm text-blue-100">
+          Lleva Navio contigo: revisa traslados, registra facturas y servicios, contesta mensajes y deja que el viaje se registre aunque apagues la pantalla.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <AndroidAppCard />
+
+        <div className={`${card} space-y-3`}>
+          <div>
+            <h2 className="flex items-center gap-2 text-sm font-bold text-slate-800">
+              <Smartphone size={16} className="text-blue-600" /> iPhone (iOS)
+            </h2>
+            <p className="mt-1 text-xs text-slate-500">En iPhone, Navio se usa desde Safari y se agrega a la pantalla de inicio como si fuera una app.</p>
+          </div>
+          <ol className="space-y-2">
+            <Step number={1}>
+              Abre <b>{typeof window !== "undefined" ? window.location.host : "Navio"}</b> en Safari y entra con tu cuenta.
+            </Step>
+            <Step number={2}>
+              Toca el botón <b>Compartir</b> (el cuadro con la flecha hacia arriba) y elige <b>Agregar a pantalla de inicio</b>.
+            </Step>
+            <Step number={3}>Abre Navio desde el ícono nuevo: se ve a pantalla completa, igual que una app.</Step>
+            <Step number={4}>
+              Para que el viaje siga registrándose con la pantalla apagada, vincula la app gratuita <b>Traccar Client</b> (son 2 minutos).
+            </Step>
+          </ol>
+          {onGo && (
+            <button onClick={() => onGo("settings", "tracking")} className={primaryButton}>
+              Vincular la app de rastreo
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className={card}>
+        <h2 className="text-sm font-bold text-slate-800">¿Cuál me conviene?</h2>
+        <div className="mt-3 grid grid-cols-1 gap-3 text-xs text-slate-600 sm:grid-cols-3">
+          <div className="rounded-xl bg-slate-50 p-3">
+            <p className="font-semibold text-slate-800">Manejo con Android</p>
+            <p className="mt-1">Instala la app Navio. Todo queda en una sola app, incluido el rastreo del viaje.</p>
+          </div>
+          <div className="rounded-xl bg-slate-50 p-3">
+            <p className="font-semibold text-slate-800">Manejo con iPhone</p>
+            <p className="mt-1">Agrega Navio a la pantalla de inicio y vincula Traccar Client para el rastreo.</p>
+          </div>
+          <div className="rounded-xl bg-slate-50 p-3">
+            <p className="font-semibold text-slate-800">Solo reviso y administro</p>
+            <p className="mt-1">No necesitas instalar nada: Navio funciona igual desde el navegador del teléfono o la computadora.</p>
+          </div>
+        </div>
+        {native && <p className="mt-3 text-[11px] text-slate-400">Estás usando la app Navio para Android.</p>}
+      </div>
+    </div>
+  );
+}

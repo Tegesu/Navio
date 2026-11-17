@@ -15,12 +15,23 @@ export { MIN_PASSWORD };
 // La animación de entrada ("NAVIO" → "N") vive en index.html para verse desde
 // el primer instante. Aquí solo se retira cuando la app ya tiene qué mostrar,
 // dejando que la animación termine.
+// En teléfonos lentos la animación empieza tarde (cuando llega el estilo), así
+// que se espera a que termine de verdad, no solo a que pase el tiempo.
 const SPLASH_MS = 1050;
 export function hideSplash() {
   const splash = document.getElementById("splash");
-  if (!splash || splash.classList.contains("splash-done")) return;
-  const wait = Math.max(0, SPLASH_MS - performance.now());
-  window.setTimeout(() => splash.classList.add("splash-done"), wait);
+  if (!splash || splash.classList.contains("splash-done") || splash.dataset.hiding) return;
+  splash.dataset.hiding = "1";
+  const done = () => splash.classList.add("splash-done");
+  const minimum = new Promise((resolve) => window.setTimeout(resolve, Math.max(0, SPLASH_MS - performance.now())));
+  let running = [];
+  try {
+    running = (splash.getAnimations?.({ subtree: true }) ?? []).map((a) => a.finished.catch(() => {}));
+  } catch {
+    running = [];
+  }
+  const safety = new Promise((resolve) => window.setTimeout(resolve, 2600));
+  Promise.race([Promise.all([minimum, ...running]), safety]).then(done);
 }
 
 export function translateAuthError(error) {
@@ -51,7 +62,7 @@ export function AuthErrorMessage({ message }) {
 
 export function FullScreenLoader() {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[#f8fafc]">
+    <div className="flex min-h-screen items-center justify-center bg-page">
       <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">
         <RefreshCw size={16} className="animate-spin" /> Cargando…
       </div>
@@ -208,24 +219,24 @@ const HIGHLIGHTS = [
 
 function LoginShowcase() {
   return (
-    <div className="flex h-full min-h-screen flex-col px-10 py-9 xl:px-14">
+    <div className="flex h-full min-h-[100dvh] flex-col px-6 pb-6 pt-10 md:min-h-screen md:px-8 md:py-9 xl:px-14">
       <div className="navio-rise flex items-center gap-2.5">
         <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white text-base font-extrabold text-blue-700">N</div>
         <span className="text-xl font-extrabold tracking-tight text-white">NAVIO</span>
       </div>
-      <div className="navio-rise mt-8 max-w-2xl" style={{ animationDelay: "0.15s" }}>
-        <h2 className="text-3xl font-extrabold leading-tight text-white xl:text-4xl">Tu flotilla, tus viajes y tus facturas en un solo lugar.</h2>
+      <div className="navio-rise mt-6 max-w-2xl md:mt-8" style={{ animationDelay: "0.15s" }}>
+        <h2 className="text-2xl font-extrabold leading-tight text-white md:text-3xl xl:text-4xl">Tu flotilla, tus viajes y tus facturas en un solo lugar.</h2>
         <p className="mt-3 max-w-xl text-sm leading-relaxed text-blue-100">
           Sigue cada unidad en el mapa, lleva el registro de los traslados y deja que Navio lea las facturas para que tu equipo solo las revise.
         </p>
       </div>
-      <div className="relative my-4 min-h-[260px] flex-1">
+      <div className="relative my-4 min-h-[240px] flex-1">
         <Scene />
       </div>
-      <ul className="grid grid-cols-3 gap-5">
+      <ul className="hidden gap-5 lg:grid lg:grid-cols-3">
         {HIGHLIGHTS.map(({ icon: Icon, title, text }, index) => (
           <li key={title} className="navio-rise flex gap-2.5" style={{ animationDelay: `${0.9 + index * 0.12}s` }}>
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white/10 text-white">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[rgb(255_255_255/0.1)] text-white">
               <Icon size={16} />
             </span>
             <span>
@@ -239,27 +250,40 @@ function LoginShowcase() {
   );
 }
 
-// Tres cuartas partes para la imagen y la cuarta de la derecha para los
-// formularios. En pantallas angostas solo quedan los formularios.
+// Computadora (también con la ventana a la mitad): la imagen a la izquierda y
+// los formularios a la derecha. Teléfono: primero se ve la imagen; después
+// se difumina, se va al fondo y aparece la tarjeta para entrar.
 export function AuthLayout({ children }) {
   useEffect(hideSplash, []);
+  // La presentación del teléfono se ve una vez por visita; después, directo.
+  const [instant] = useState(() => {
+    try {
+      const seen = window.sessionStorage.getItem("navio.loginIntro") === "1";
+      window.sessionStorage.setItem("navio.loginIntro", "1");
+      return seen;
+    } catch {
+      return false;
+    }
+  });
   return (
-    <div className="flex min-h-screen bg-white">
-      <aside className="relative hidden min-w-0 flex-1 overflow-hidden bg-gradient-to-br from-blue-600 via-blue-800 to-slate-900 lg:block">
+    <div className={`relative flex min-h-[100dvh] bg-slate-900 md:min-h-screen md:bg-white ${instant ? "login-instant" : ""}`}>
+      <aside className="login-art fixed inset-0 overflow-hidden bg-gradient-to-br from-blue-600 via-blue-800 to-slate-900 md:relative md:inset-auto md:block md:min-w-0 md:flex-1">
         <LoginShowcase />
       </aside>
-      <main className="flex min-h-screen w-full flex-col lg:w-1/4 lg:min-w-[380px] lg:shrink-0 lg:border-l lg:border-slate-200">
-        <div className="mx-auto flex w-full max-w-[420px] flex-1 flex-col justify-center px-6 py-8 lg:px-7">
-          <div className="mb-7 flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-sm font-extrabold text-white shadow-lg shadow-blue-600/30">N</div>
-            <span className="text-lg font-extrabold tracking-tight text-slate-900 lg:hidden">NAVIO</span>
+      <main className="relative z-10 flex min-h-[100dvh] w-full flex-col justify-end md:min-h-screen md:w-[40%] md:min-w-[340px] md:max-w-[460px] md:shrink-0 md:justify-start md:border-l md:border-slate-200 md:bg-white lg:w-1/4 lg:min-w-[380px]">
+        <div className="login-card mx-3 mb-3 mt-28 flex flex-col rounded-3xl bg-white shadow-2xl md:m-0 md:flex-1 md:rounded-none md:shadow-none">
+          <div className="mx-auto flex w-full max-w-[420px] flex-1 flex-col justify-center px-6 pb-4 pt-7 md:py-8 lg:px-7">
+            <div className="mb-6 flex items-center gap-2.5 md:mb-7">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-sm font-extrabold text-white shadow-lg shadow-blue-600/30">N</div>
+              <span className="text-lg font-extrabold tracking-tight text-slate-900 md:hidden">NAVIO</span>
+            </div>
+            {children}
           </div>
-          {children}
+          <footer className="mx-auto w-full max-w-[420px] px-6 pb-5 lg:px-7">
+            <CookieNotice inline />
+            <LegalLinks />
+          </footer>
         </div>
-        <footer className="mx-auto w-full max-w-[420px] px-6 pb-5 lg:px-7">
-          <CookieNotice inline />
-          <LegalLinks />
-        </footer>
       </main>
     </div>
   );
