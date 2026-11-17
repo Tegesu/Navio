@@ -21,6 +21,50 @@ const FILTERS = [
 ];
 const actionButton = "rounded-lg border px-3 py-1.5 text-[11px] font-semibold disabled:opacity-60";
 
+// Cuántas unidades puede tener una empresa (10 por omisión). Solo el
+// super-administrador lo cambia, cuando la empresa pide más.
+function VehicleLimitEditor({ company, onSaved }) {
+  const { showToast } = useToast();
+  const current = Number(company.vehicleLimit) || 10;
+  const [value, setValue] = useState(String(current));
+  const [saving, setSaving] = useState(false);
+  const next = Number(value);
+  const changed = Number.isInteger(next) && next >= 1 && next !== current;
+
+  async function save() {
+    setSaving(true);
+    const { error } = await supabase.rpc("set_vehicle_limit", { target_company_id: company.id, new_limit: next });
+    setSaving(false);
+    if (error) showToast(`No se pudo cambiar el límite: ${error.message}`);
+    else {
+      showToast(`${company.name}: ahora puede tener hasta ${next} unidades.`);
+      onSaved();
+    }
+  }
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+      <span>
+        Unidades: <span className="font-semibold text-slate-700">{Number(company.vehicles) || 0}</span> de
+      </span>
+      <input
+        type="number"
+        min={1}
+        max={100000}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        aria-label={`Límite de unidades de ${company.name}`}
+        className="w-20 rounded-lg border border-slate-200 px-2 py-1 text-[11px] focus:border-blue-400 focus:outline-none"
+      />
+      {changed && (
+        <button onClick={save} disabled={saving} className="rounded-lg bg-blue-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
+          {saving ? "Guardando…" : "Guardar límite"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function CompaniesPanel() {
   const { showToast } = useToast();
   const [companies, setCompanies] = useState(null);
@@ -117,6 +161,7 @@ function CompaniesPanel() {
                         <ShieldCheck size={12} /> Código de invitación: <span className="select-all font-mono">{c.inviteCode}</span>
                       </p>
                     )}
+                    {c.vehicleLimit !== undefined && <VehicleLimitEditor key={`${c.id}-${c.vehicleLimit}`} company={c} onSaved={load} />}
                   </div>
                   <div className="flex shrink-0 flex-wrap gap-2">
                     {(c.status === "pending" || c.status === "rejected") && (

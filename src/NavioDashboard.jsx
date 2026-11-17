@@ -354,7 +354,9 @@ function AuthProvider({ children }) {
     }
     if (loadedProfileUserRef.current !== userId) setProfileLoading(true);
     const query = (companyColumns) => supabase.from("profiles").select(`*, company:companies(${companyColumns})`).eq("id", userId).single();
-    let { data, error } = await query("name, currency, botChannel, legalName, rfc, address, contactName, contactEmail, contactPhone, settings");
+    let { data, error } = await query("name, currency, botChannel, legalName, rfc, address, contactName, contactEmail, contactPhone, settings, vehicleLimit");
+    // Antes de la migración v23 no existe el límite de unidades.
+    if (error) ({ data, error } = await query("name, currency, botChannel, legalName, rfc, address, contactName, contactEmail, contactPhone, settings"));
     // Antes de la migración v17 esas columnas no existen: se piden las de siempre.
     if (error) ({ data, error } = await query("name, currency, botChannel"));
     if (!error) {
@@ -801,7 +803,7 @@ function RecordsTable({ records, columns, onConfirm, onEdit, onDelete, emptyLabe
               ))}
               <td className="px-4 py-3 text-right">
                 <div className="flex justify-end gap-1.5">
-                  {r.status === "pending" && (
+                  {onConfirm && r.status === "pending" && (
                     <button
                       onClick={() => onConfirm(r)}
                       className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
@@ -809,12 +811,14 @@ function RecordsTable({ records, columns, onConfirm, onEdit, onDelete, emptyLabe
                       <CheckCircle2 size={12} /> Confirmar
                     </button>
                   )}
-                  <button
-                    onClick={() => onEdit(r)}
-                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
-                  >
-                    <Edit2 size={12} /> Editar
-                  </button>
+                  {onEdit && (
+                    <button
+                      onClick={() => onEdit(r)}
+                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                    >
+                      <Edit2 size={12} /> Editar
+                    </button>
+                  )}
                   {isCompanyAdmin && onDelete && (
                     <button
                       onClick={() => onDelete(r)}
@@ -989,8 +993,17 @@ function rotateMark({ x, y, w, h }, rotation) {
   return { x, y, w, h };
 }
 
-function canMarkInvoice(invoice, isAdmin) {
-  return !isInvoiceClosed(invoice) && (isAdmin || (invoice.status || "pending") === "pending");
+// Permisos extra que da el administrador (migración v23): "supervisor"
+// (traslados de otras personas) e "invoices" (revisa facturas). Los
+// administradores los tienen todos. La base de datos es la que manda; esto
+// solo decide qué botones mostrar.
+function profileCan(profile, permission) {
+  return !!(profile?.isSuperAdmin || profile?.companyRole === "admin" || (profile?.permissions ?? []).includes(permission));
+}
+
+// Marcar el documento es parte de revisar la factura.
+function canMarkInvoice(invoice, canReview) {
+  return !isInvoiceClosed(invoice) && canReview;
 }
 
 function useInvoiceMarks(invoice, documentUrl) {
@@ -1064,7 +1077,7 @@ function DocumentPreview({ path, file, invoice }) {
   const { user, profile } = useAuth();
   const isAdmin = !!(profile?.isSuperAdmin || profile?.companyRole === "admin");
   const { marks, addMark, removeMark } = useInvoiceMarks(file ? null : invoice, file ? null : path);
-  const canMark = !file && !!invoice && canMarkInvoice(invoice, isAdmin);
+  const canMark = !file && !!invoice && canMarkInvoice(invoice, profileCan(profile, "invoices"));
   const [state, setState] = useState({ status: "loading" });
   const [attempt, setAttempt] = useState(0);
   const [page, setPage] = useState(1);
@@ -2926,8 +2939,28 @@ function AddVehicleModal({ vehicles, onSave, onClose }) {
     setSaving(false);
   }
 
+  // Máximo de unidades de la empresa (10 por omisión; solo Navio lo sube).
+  const vehicleLimit = Number(profile?.company?.vehicleLimit) || 10;
+  if (vehicles.length >= vehicleLimit) {
+    return (
+      <Modal title="Agregar Unidad" width="max-w-sm" onClose={onClose}>
+        <p className="text-xs leading-relaxed text-slate-600">
+          Tu empresa llegó al límite de <span className="font-semibold">{vehicleLimit} unidades</span>. Para agregar más, contacta a Navio.
+        </p>
+        <div className="mt-4 flex justify-end">
+          <button onClick={onClose} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
+            Entendido
+          </button>
+        </div>
+      </Modal>
+    );
+  }
+
   return (
     <Modal title="Agregar Unidad" width="max-w-lg" onClose={onClose}>
+      <p className="-mt-2 mb-3 text-[11px] text-slate-400">
+        Unidad {vehicles.length + 1} de {vehicleLimit} que permite tu plan.
+      </p>
       <form onSubmit={handleSubmit} className="max-h-[70vh] space-y-3 overflow-y-auto pr-1">
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -3825,7 +3858,7 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
                   >
                     <Eye size={12} /> Detalle
                   </button>
-                  {inv.status === "pending" && !inv.approved && (
+                  {onConfirm && inv.status === "pending" && !inv.approved && (
                     <button
                       onClick={() => onConfirm(inv)}
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
@@ -3857,7 +3890,7 @@ function InvoiceDesgloseTable({ rows, columnIds, currency, isAdmin, onEdit, onCo
                       <X size={12} /> Rechazar
                     </button>
                   )}
-                  {!isInvoiceLocked(inv) && (
+                  {onEdit && !isInvoiceLocked(inv) && (
                     <button
                       onClick={() => onEdit(inv)}
                       className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
@@ -4346,7 +4379,7 @@ function InvoiceDetailModal({ invoice, currency, onEdit, onClose }) {
         <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
           Cerrar
         </button>
-        {!isInvoiceLocked(invoice) && (
+        {onEdit && !isInvoiceLocked(invoice) && (
           <button onClick={() => onEdit(invoice)} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
             Editar / Corregir
           </button>
@@ -6853,10 +6886,14 @@ function FuelPage({
         <InvoiceDetailModal
           invoice={detailInvoice}
           currency={currency}
-          onEdit={(inv) => {
-            setDetailKey(null);
-            onEditInvoice(inv);
-          }}
+          onEdit={
+            onEditInvoice
+              ? (inv) => {
+                  setDetailKey(null);
+                  onEditInvoice(inv);
+                }
+              : undefined
+          }
           onClose={() => setDetailKey(null)}
         />
       )}
@@ -8214,6 +8251,8 @@ function NavioApp() {
   const [editVehicleTarget, setEditVehicleTarget] = useState(null);
   const [deleteVehicleTarget, setDeleteVehicleTarget] = useState(null);
   const isCompanyAdmin = !!(profile?.isSuperAdmin || profile?.companyRole === "admin");
+  // Corregir y verificar facturas: administrador o quien él designe.
+  const canReviewInvoices = profileCan(profile, "invoices");
 
   const [toast, setToast] = useState(null);
   function showToast(message) {
@@ -8251,13 +8290,15 @@ function NavioApp() {
         await updateRow(id, { ...patch, status: "verified" });
       } else {
         const author = INVOICE_MODULES.includes(module) ? { uploadedByName: currentUserName } : {};
-        await insertRow({ ...record, ...author, origin: "manual", status: "verified" });
+        // Lo que registra alguien sin permiso de revisar queda pendiente
+        // (la base de datos lo exige igual).
+        await insertRow({ ...record, ...author, origin: "manual", status: canReviewInvoices ? "verified" : "pending" });
       }
       if (INVOICE_MODULES.includes(module) && record.workOrder) {
         await ensureWorkOrder(record.project, record.workOrder, extra.orderDueDate);
       }
       setFormModal(null);
-      showToast("Registro guardado en Supabase.");
+      showToast(record.id || canReviewInvoices ? "Registro guardado en Supabase." : "Registro guardado. Queda pendiente hasta que lo revise la persona encargada de las facturas.");
     } catch (err) {
       showToast(`Error al guardar: ${err.message}`);
     }
@@ -8626,8 +8667,8 @@ function NavioApp() {
                       vehicles={vehicles}
                       records={maintenanceRecords}
                       onAddClick={() => setFormModal({ mode: "add", module: "maintenance", initial: null })}
-                      onConfirm={(r) => handleConfirmRecord("maintenance", r)}
-                      onEditClick={(r) => setFormModal({ mode: "edit", module: "maintenance", initial: r })}
+                      onConfirm={canReviewInvoices ? (r) => handleConfirmRecord("maintenance", r) : undefined}
+                      onEditClick={canReviewInvoices ? (r) => setFormModal({ mode: "edit", module: "maintenance", initial: r }) : undefined}
                       onDeleteClick={(r) => setDeleteRecordTarget({ module: "maintenance", record: r })}
                       onUpdateVehicle={handleUpdateVehicle}
                     />
@@ -8640,8 +8681,8 @@ function NavioApp() {
                       records={complianceRecords}
                       docFilter={complianceDocFilter}
                       onAddClick={() => setFormModal({ mode: "add", module: "compliance", initial: null })}
-                      onConfirm={(r) => handleConfirmRecord("compliance", r)}
-                      onEditClick={(r) => setFormModal({ mode: "edit", module: "compliance", initial: r })}
+                      onConfirm={canReviewInvoices ? (r) => handleConfirmRecord("compliance", r) : undefined}
+                      onEditClick={canReviewInvoices ? (r) => setFormModal({ mode: "edit", module: "compliance", initial: r }) : undefined}
                       onDeleteClick={(r) => setDeleteRecordTarget({ module: "compliance", record: r })}
                     />
                   )}
@@ -8657,8 +8698,8 @@ function NavioApp() {
                       isAdmin={isCompanyAdmin}
                       userName={currentUserName}
                       onAddInvoice={handleAddInvoice}
-                      onEditInvoice={handleEditInvoice}
-                      onConfirmInvoice={handleConfirmInvoice}
+                      onEditInvoice={canReviewInvoices ? handleEditInvoice : undefined}
+                      onConfirmInvoice={canReviewInvoices ? handleConfirmInvoice : undefined}
                       onDecideInvoice={handleInvoiceDecision}
                       onSaveDeadlines={handleSaveDeadlines}
                       onSetProjectClosed={handleSetProjectClosed}
@@ -8798,6 +8839,7 @@ export {
   AuthContext,
   AuthProvider,
   useAuth,
+  profileCan,
   ToastContext,
   useToast,
   DateFormatContext,

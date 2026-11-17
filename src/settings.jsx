@@ -169,86 +169,128 @@ function useCompanyCodes(enabled) {
 }
 
 // Cuánto puede durar un código de invitación nuevo.
-const INVITE_VALIDITY = [
-  { days: 1, label: "1 día" },
-  { days: 7, label: "7 días" },
-  { days: 30, label: "30 días" },
-];
-
 function expiryInfo(iso) {
   if (!iso) return null;
   const date = new Date(iso);
   const ms = date.getTime() - Date.now();
   const when = date.toLocaleString("es-MX", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  if (ms <= 0) return { expired: true, text: `Venció el ${when}. Genera uno nuevo para invitar a más personas.` };
-  const days = Math.round(ms / 864e5);
-  const left = days >= 1 ? `en ${days} ${days === 1 ? "día" : "días"}` : `en ${Math.max(1, Math.round(ms / 36e5))} h`;
+  if (ms <= 0) return { expired: true, text: `El último código venció el ${when}.` };
+  const hours = Math.round(ms / 36e5);
+  const left = hours < 48 ? `en ${Math.max(1, hours)} h` : `en ${Math.round(ms / 864e5)} días`;
   return { expired: false, text: `Vence el ${when} (${left}).` };
 }
 
-function CodeBox({ label, hint, value, prefix = "", which, onRotated, expiresAt, withValidity = false }) {
+// Código del bot (el de invitación tiene su propia tarjeta).
+function CodeBox({ label, hint, value, prefix = "", which, onRotated }) {
   const { showToast } = useToast();
   const [confirming, setConfirming] = useState(false);
-  const [days, setDays] = useState(7);
-  const [rotating, setRotating] = useState(false);
-  const expiry = withValidity ? expiryInfo(expiresAt) : null;
-  const usable = value && !expiry?.expired;
 
   async function rotate() {
-    setRotating(true);
-    const { error } = await supabase.rpc("rotate_company_code", withValidity ? { which, valid_days: days } : { which });
-    setRotating(false);
+    const { error } = await supabase.rpc("rotate_company_code", { which });
     if (error) showToast(`No se pudo regenerar: ${error.message}`);
     else {
-      showToast(withValidity ? `Código nuevo listo. Sirve ${days === 1 ? "1 día" : `${days} días`}; el anterior dejó de funcionar.` : "Código regenerado. El anterior dejó de funcionar.");
+      showToast("Código regenerado. El anterior dejó de funcionar.");
       onRotated();
     }
     setConfirming(false);
   }
 
-  const warning = "El código actual dejará de funcionar de inmediato. Quien ya está dentro de la empresa no se ve afectado.";
   return (
     <div>
       <p className={labelClass}>{label}</p>
       <div className="flex flex-wrap items-center gap-2">
-        <code className={`min-w-0 flex-1 truncate rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold ${expiry?.expired ? "text-slate-400 line-through" : "text-slate-700"}`}>
+        <code className="min-w-0 flex-1 truncate rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">
           {value === undefined ? "Cargando…" : `${prefix}${value || "—"}`}
         </code>
-        <CopyButton text={usable ? `${prefix}${value}` : ""} />
-        <button onClick={() => setConfirming(true)} className={`${expiry?.expired ? primaryButton : plainButton} flex items-center gap-1`}>
-          <RefreshCw size={12} /> {expiry?.expired ? "Generar código nuevo" : "Regenerar"}
+        <CopyButton text={value ? `${prefix}${value}` : ""} />
+        <button onClick={() => setConfirming(true)} className={`${plainButton} flex items-center gap-1`}>
+          <RefreshCw size={12} /> Regenerar
         </button>
       </div>
-      {expiry && <p className={`mt-1 text-[11px] font-medium ${expiry.expired ? "text-rose-600" : "text-slate-500"}`}>{expiry.text}</p>}
       <p className="mt-1 text-[11px] text-slate-400">{hint}</p>
-      {confirming && !withValidity && <ConfirmModal title="Regenerar código" message={warning} confirmLabel="Regenerar" onConfirm={rotate} onClose={() => setConfirming(false)} />}
-      {confirming && withValidity && (
-        <Modal title="Generar código nuevo" width="max-w-sm" onClose={() => setConfirming(false)}>
-          <p className="text-xs text-slate-600">{warning}</p>
-          <label htmlFor="invite-validity" className={`${labelClass} mt-3`}>
-            ¿Cuánto tiempo servirá?
-          </label>
-          <select id="invite-validity" value={days} onChange={(e) => setDays(Number(e.target.value))} className={inputClass}>
-            {INVITE_VALIDITY.map((o) => (
-              <option key={o.days} value={o.days}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-          <p className="mt-1 text-[11px] text-slate-400">Mientras más corto, menos riesgo si alguien lo reenvía.</p>
-          <div className="mt-4 flex justify-end gap-2">
-            <button onClick={() => setConfirming(false)} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
-              Cancelar
-            </button>
-            <button onClick={rotate} disabled={rotating} className={primaryButton}>
-              {rotating ? "Generando…" : "Generar código"}
-            </button>
-          </div>
-        </Modal>
+      {confirming && (
+        <ConfirmModal
+          title="Regenerar código"
+          message="El código actual dejará de funcionar de inmediato. Quien ya está dentro de la empresa no se ve afectado."
+          confirmLabel="Regenerar"
+          onConfirm={rotate}
+          onClose={() => setConfirming(false)}
+        />
       )}
     </div>
   );
 }
+
+// Código de invitación: no existe hasta que el administrador lo pide, vence a
+// las 24 horas y sirve para una sola persona (al usarlo, se gasta).
+function InviteCodeCard({ codes, onChanged }) {
+  const { showToast } = useToast();
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const code = codes?.inviteCode ?? null;
+  const expiry = code ? expiryInfo(codes?.inviteExpiresAt) : null;
+  const active = !!code && !expiry?.expired;
+
+  async function generate() {
+    setBusy(true);
+    const { error } = await supabase.rpc("generate_invite_code");
+    setBusy(false);
+    setConfirming(false);
+    if (error) showToast(`No se pudo generar el código: ${error.message}`);
+    else {
+      showToast("Código listo: sirve para una sola persona durante 24 horas.");
+      onChanged();
+    }
+  }
+
+  return (
+    <div className={`${card} space-y-3`}>
+      <div>
+        <h2 className="text-sm font-bold text-slate-800">Invitar personas</h2>
+        <p className="text-xs text-slate-500">
+          Genera un código para cada persona que invites: sirve una sola vez y vence 24 horas después. Quien lo use te enviará una solicitud, y entra a la empresa (como Usuario) hasta que un administrador la apruebe.
+        </p>
+      </div>
+      {codes === null ? (
+        <p className="text-xs text-slate-400">Cargando…</p>
+      ) : active ? (
+        <div>
+          <p className={labelClass}>Código de invitación</p>
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="min-w-0 flex-1 truncate rounded-lg bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">{code}</code>
+            <CopyButton text={code} />
+            <button onClick={() => setConfirming(true)} className={`${plainButton} flex items-center gap-1`}>
+              <RefreshCw size={12} /> Generar otro
+            </button>
+          </div>
+          <p className="mt-1 text-[11px] font-medium text-slate-500">{expiry.text} Sirve para una sola persona.</p>
+        </div>
+      ) : (
+        <div className="flex flex-wrap items-center gap-3">
+          <button onClick={generate} disabled={busy} className={`${primaryButton} flex items-center gap-1.5`}>
+            <KeyRound size={13} /> {busy ? "Generando…" : "Código de invitación"}
+          </button>
+          <p className="text-[11px] text-slate-400">{expiry?.expired ? expiry.text : "No hay un código activo."}</p>
+        </div>
+      )}
+      {confirming && (
+        <ConfirmModal
+          title="Generar otro código"
+          message="El código actual dejará de servir de inmediato. Úsalo si se lo diste a alguien que ya no debe entrar."
+          confirmLabel="Generar otro"
+          onConfirm={generate}
+          onClose={() => setConfirming(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Permisos que el administrador le puede dar a un usuario (él los tiene todos).
+const MEMBER_PERMISSIONS = [
+  { id: "supervisor", label: "Supervisor", hint: "Inicia y termina traslados de otras personas" },
+  { id: "invoices", label: "Revisa facturas", hint: "Corrige y verifica facturas" },
+];
 
 // Personas que escribieron el código y esperan que un administrador las apruebe.
 function JoinRequestsCard({ onApproved }) {
@@ -340,6 +382,17 @@ function TeamPanel() {
     setBusyId(null);
   }
 
+  async function togglePermission(member, permission, on) {
+    const current = member.permissions ?? [];
+    const next = on ? [...current, permission] : current.filter((p) => p !== permission);
+    setBusyId(member.id);
+    const { error } = await supabase.rpc("set_member_permissions", { target_user: member.id, new_permissions: next });
+    showToast(error ? `No se pudo cambiar el permiso: ${error.message}` : "Permisos actualizados.");
+    await loadMembers();
+    refreshPeople();
+    setBusyId(null);
+  }
+
   async function removeMember() {
     const { error } = await supabase.rpc("remove_company_member", { target_user: toRemove.id });
     showToast(error ? `No se pudo dar de baja: ${error.message}` : `${toRemove.fullName || "La persona"} ya no tiene acceso a la empresa.`);
@@ -366,25 +419,16 @@ function TeamPanel() {
         }}
       />
 
-      <div className={`${card} space-y-3`}>
-        <div>
-          <h2 className="text-sm font-bold text-slate-800">Invitar personas</h2>
-          <p className="text-xs text-slate-500">Quien cree su cuenta y escriba este código te enviará una solicitud. Entra a la empresa (como Usuario) hasta que un administrador la apruebe aquí.</p>
-        </div>
-        <CodeBox
-          label="Código de invitación"
-          hint="Si se filtra o alguien deja la empresa, regenéralo: el anterior deja de servir."
-          value={codes === null ? undefined : codes.inviteCode}
-          expiresAt={codes?.inviteExpiresAt}
-          withValidity
-          which="invite"
-          onRotated={reloadCodes}
-        />
-      </div>
+      <InviteCodeCard codes={codes} onChanged={reloadCodes} />
 
       <div className={card}>
         <h2 className="mb-1 text-sm font-bold text-slate-800">Personas ({members?.length ?? "…"})</h2>
-        <p className="mb-3 text-xs text-slate-500">Administrador: aprueba, rechaza y anula facturas, edita unidades, asigna tareas y gestiona al equipo. Usuario: registra y verifica, pero no aprueba.</p>
+        <p className="mb-3 text-xs leading-relaxed text-slate-500">
+          <span className="font-semibold text-slate-600">Administrador:</span> todo, incluido aprobar, rechazar y anular facturas, editar unidades y gestionar al equipo.{" "}
+          <span className="font-semibold text-slate-600">Usuario:</span> registra facturas (quedan pendientes) y lleva los traslados que tiene asignados. A un usuario le puedes dar además:{" "}
+          <span className="font-semibold text-slate-600">Supervisor</span> (inicia y termina traslados de otras personas) y{" "}
+          <span className="font-semibold text-slate-600">Revisa facturas</span> (corrige y verifica facturas; aprobar sigue siendo del administrador).
+        </p>
         {members === null && <p className="text-xs text-slate-400">Cargando…</p>}
         <div className="space-y-2">
           {members?.map((member) => {
@@ -399,6 +443,24 @@ function TeamPanel() {
                       {self && <span className="ml-1.5 font-normal text-slate-400">(tú)</span>}
                     </p>
                     <p className="truncate text-[11px] text-slate-400">{[member.email, member.jobTitle, member.phone].filter(Boolean).join(" · ")}</p>
+                    {member.companyRole === "admin" ? (
+                      <p className="mt-0.5 text-[11px] text-slate-400">Tiene todos los permisos.</p>
+                    ) : self ? null : (
+                      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+                        {MEMBER_PERMISSIONS.map((p) => (
+                          <label key={p.id} title={p.hint} className="flex cursor-pointer items-center gap-1.5 text-[11px] text-slate-600">
+                            <input
+                              type="checkbox"
+                              checked={(member.permissions ?? []).includes(p.id)}
+                              disabled={busyId === member.id}
+                              onChange={(e) => togglePermission(member, p.id, e.target.checked)}
+                              className="h-3.5 w-3.5 accent-blue-600"
+                            />
+                            {p.label}
+                          </label>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
                 {self ? (

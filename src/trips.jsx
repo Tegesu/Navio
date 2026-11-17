@@ -13,6 +13,7 @@ import {
   isVariableDriver,
   vehicleDriverName,
   vehicleDriverLabel,
+  profileCan,
 } from "./NavioDashboard.jsx";
 import { usePeople, personName } from "./people.jsx";
 import { DriverPanel, RouteMap, formatDuration, formatKm, routeSummary, useTracking } from "./tracking.jsx";
@@ -45,7 +46,11 @@ function TripStatusBadge({ status }) {
 }
 
 function TripFormModal({ initial, vehicles, projectOptions = [], onSave, onClose }) {
-  const { people } = usePeople();
+  const { people: everyone } = usePeople();
+  const { user, profile } = useAuth();
+  // Asignar a otra persona es de supervisores y administradores; los demás
+  // solo pueden asignárselo a sí mismos (o dejarlo sin cuenta).
+  const people = profileCan(profile, "supervisor") ? everyone : everyone.filter((p) => p.id === user?.id || p.id === initial?.assignedTo);
   const firstVehicle = vehicles.find((v) => v.id === initial?.vehicleId) ?? vehicles.find((v) => v.unit === initial?.unit) ?? vehicles[0];
   const [tripType, setTripType] = useState(initial?.tripType ?? "cargo");
   const [vehicleId, setVehicleId] = useState(firstVehicle?.id ?? "");
@@ -287,7 +292,8 @@ function TripDetailModal({ trip, onClose }) {
 export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeTrip, isAdmin, projectOptions = [], onOpenDriverMode }) {
   const { format } = useDateFormat();
   const { showToast } = useToast();
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
+  const supervisor = profileCan(profile, "supervisor");
   const tracking = useTracking();
   const [filter, setFilter] = useState("open");
   const [query, setQuery] = useState("");
@@ -392,6 +398,8 @@ export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeT
         {listed.map((t) => {
           const open = t.status === "scheduled" || t.status === "ongoing";
           const mine = !t.assignedTo || t.assignedTo === user?.id;
+          // Un traslado de otra persona solo lo mueve un supervisor o un administrador.
+          const canManage = mine || supervisor;
           const trackedHere = tracking?.active?.tripId === t.id;
           return (
             <div key={t.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -424,7 +432,7 @@ export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeT
                 <button onClick={() => setDetailId(t.id)} className={`${actionClass} border-slate-200 text-slate-600 hover:bg-slate-50`}>
                   <Eye size={12} /> {t.routeId ? "Ver recorrido" : "Detalle"}
                 </button>
-                {open && mine && !tracking?.active && (
+                {open && canManage && !tracking?.active && (
                   <button onClick={() => onOpenDriverMode()} className={`${actionClass} border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100`}>
                     <Navigation size={12} /> Iniciar con rastreo
                   </button>
@@ -434,7 +442,7 @@ export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeT
                     <Navigation size={12} /> Mi viaje en curso
                   </button>
                 )}
-                {t.status === "scheduled" && (
+                {canManage && t.status === "scheduled" && (
                   <button
                     onClick={() => changeStatus(t, { status: "ongoing", startedAt: new Date().toISOString() }, "No se pudo marcar en curso")}
                     className={`${actionClass} border-slate-200 text-slate-600 hover:bg-slate-50`}
@@ -443,7 +451,7 @@ export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeT
                     Marcar en curso
                   </button>
                 )}
-                {t.status === "ongoing" && !trackedHere && (
+                {canManage && t.status === "ongoing" && !trackedHere && (
                   <button
                     onClick={() => changeStatus(t, { status: "completed", endedAt: new Date().toISOString() }, "No se pudo completar")}
                     className={`${actionClass} border-emerald-200 text-emerald-700 hover:bg-emerald-50`}
@@ -451,12 +459,12 @@ export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeT
                     <CheckCircle2 size={12} /> Completar
                   </button>
                 )}
-                {open && (
+                {open && canManage && (
                   <button onClick={() => setForm(t)} className={`${actionClass} border-slate-200 text-slate-600 hover:bg-slate-50`}>
                     <Edit2 size={12} /> Editar
                   </button>
                 )}
-                {open && !trackedHere && (
+                {open && canManage && !trackedHere && (
                   <button onClick={() => changeStatus(t, { status: "cancelled" }, "No se pudo cancelar")} className={`${actionClass} border-rose-200 text-rose-600 hover:bg-rose-50`}>
                     <X size={12} /> Cancelar
                   </button>

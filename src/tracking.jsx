@@ -13,6 +13,7 @@ import {
   LIVE_MAP_STATUS_STYLES,
   FLEET_STATUS_FILTERS,
   computeVehicleStatus,
+  profileCan,
 } from "./NavioDashboard.jsx";
 
 /* ---------------------------------------------------------------------- */
@@ -694,10 +695,13 @@ function OrphanRouteNotice({ vehicles }) {
 // Iniciar o terminar un viaje. "trips" son los traslados que la persona puede
 // tomar; también se puede salir sin traslado asignado ("viaje libre").
 export function DriverPanel({ vehicles, trips = [], big = false }) {
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
   const { showToast } = useToast();
   const tracking = useTracking();
-  const openTrips = trips.filter((t) => ["scheduled", "ongoing"].includes(t.status) && (!t.assignedTo || t.assignedTo === user?.id));
+  // Los propios y los libres; un supervisor (o administrador) puede iniciar
+  // también los asignados a otra persona.
+  const supervisor = profileCan(profile, "supervisor");
+  const openTrips = trips.filter((t) => ["scheduled", "ongoing"].includes(t.status) && (supervisor || !t.assignedTo || t.assignedTo === user?.id));
   const [choice, setChoice] = useState(() => (openTrips[0] ? `trip:${openTrips[0].id}` : "free"));
   const [vehicleId, setVehicleId] = useState(vehicles[0]?.id ?? null);
   const [confirming, setConfirming] = useState(false);

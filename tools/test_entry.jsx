@@ -2,6 +2,7 @@
 // ?member → usuario normal · ?login → pantalla de acceso real · ?super → super-administrador · ?legal → sin términos aceptados
 // ?native → como dentro de la app de Android (ver test_native.js) · ?tracker → con la app de rastreo ya vinculada
 // ?requests → con solicitudes para unirse · ?expired → código de invitación vencido · ?onboarding → cuenta sin empresa
+// ?member&reviewer → usuario que revisa facturas · ?member&supervisor → usuario supervisor · ?full → empresa con 10 unidades · ?nocode → sin código de invitación activo
 import "./test_native.js";
 import "leaflet/dist/leaflet.css";
 import "./.tailwind.css";
@@ -39,7 +40,7 @@ const invoice = (o) => ({ id: nextId++, origin: "manual", status: "verified", ap
 const db = {
   profiles: [
     { id: "u1", fullName: "Johana Viras", companyId: COMPANY, companyRole: "admin", jobTitle: "Administración", phone: "921 000 0001" },
-    { id: "u2", fullName: "Vania Usuario", companyId: COMPANY, companyRole: "member", jobTitle: "Chofer", phone: "921 000 0002" },
+    { id: "u2", fullName: "Vania Usuario", companyId: COMPANY, companyRole: "member", jobTitle: "Chofer", phone: "921 000 0002", permissions: [params.has("reviewer") && "invoices", params.has("supervisor") && "supervisor"].filter(Boolean) },
     { id: "u3", fullName: "Carlos Ruiz", companyId: COMPANY, companyRole: "member", jobTitle: "Chofer", phone: "" },
   ],
   vehicles: [vehicle(1, "Unidad 12", "YZA-142-B", "Ricardo Pérez"), vehicle(2, "Unidad 07", "XKT-880-A", "Lucía Gómez", { healthScore: 62 }), vehicle(3, "Unidad 09", "WPL-215-C", "", { driver: { mode: "variable", name: "" } })],
@@ -100,14 +101,14 @@ const db = {
   tracker_devices: params.has("tracker") ? [{ id: 1, companyId: COMPANY, userId: isMember ? "u2" : "u1", createdAt: ago(48), lastSeenAt: ago(0.05) }] : [],
   legal_acceptances: params.has("legal") ? [] : [{ id: 1, userId: isMember ? "u2" : "u1", document: "terms", version: "2026-11-11", acceptedAt: ago(1) }, { id: 2, userId: isMember ? "u2" : "u1", document: "privacy", version: "2026-11-11", acceptedAt: ago(1) }],
   privacy_requests: [],
-  company_secrets: [{ companyId: COMPANY, inviteCode: "ABCDEF123456", botLinkCode: "BOT123456789", inviteExpiresAt: params.has("expired") ? ago(30) : ago(-24 * 5) }],
+  company_secrets: [{ companyId: COMPANY, inviteCode: params.has("nocode") ? null : "ABCDEF123456", botLinkCode: "BOT123456789", inviteExpiresAt: params.has("nocode") ? null : params.has("expired") ? ago(30) : ago(-20) }],
   join_requests: params.has("requests")
     ? [
         { id: 501, companyId: COMPANY, userId: "u8", fullName: "Pedro Nuevo", email: "pedro@x.test", status: "pending", createdAt: ago(0.2) },
         { id: 502, companyId: COMPANY, userId: "u9", fullName: "Desconocido", email: "alguien@otro.test", status: "pending", createdAt: ago(26) },
       ]
     : [],
-  companies: [{ id: COMPANY, name: "Empresa de prueba", currency: "MXN", status: "approved", botChannel: null, botChatId: null, contactName: "Johana", contactEmail: "j@x.test", contactPhone: "", legalName: "", rfc: "", address: "", settings: {} }],
+  companies: [{ id: COMPANY, name: "Empresa de prueba", currency: "MXN", status: "approved", botChannel: null, botChatId: null, contactName: "Johana", contactEmail: "j@x.test", contactPhone: "", legalName: "", rfc: "", address: "", settings: {}, vehicleLimit: params.has("full") ? 3 : 10 }],
 };
 window.__db = db;
 window.__supabase = supabase;
@@ -308,7 +309,22 @@ const rpcs = {
     for (const p of targets) db.notifications.unshift({ id: nextId++, companyId: COMPANY, userId: p.id, kind: "alert", title: alert_title, body: alert_body, createdByName: myName(), readAt: null, createdAt: new Date().toISOString() });
     return targets.length;
   },
-  list_company_members: () => db.profiles.map((p) => ({ ...p, email: `${p.id}@x.test` })),
+  list_company_members: () => db.profiles.map((p) => ({ ...p, email: `${p.id}@x.test`, permissions: p.permissions ?? [] })),
+  set_member_permissions({ target_user, new_permissions }) {
+    if (!new_permissions.every((x) => ["invoices", "supervisor"].includes(x))) throw new Error("Permiso no reconocido.");
+    db.profiles.find((p) => p.id === target_user).permissions = [...new Set(new_permissions)].sort();
+    return null;
+  },
+  generate_invite_code() {
+    const code = Math.random().toString(16).slice(2, 14).toUpperCase();
+    Object.assign(db.company_secrets[0], { inviteCode: code, inviteExpiresAt: new Date(Date.now() + 864e5).toISOString() });
+    return [{ code, expiresAt: db.company_secrets[0].inviteExpiresAt }];
+  },
+  set_vehicle_limit({ target_company_id, new_limit }) {
+    if (!(new_limit >= 1)) throw new Error("El límite debe ser de 1 a 100,000 unidades.");
+    db.companies.find((c) => c.id === target_company_id).vehicleLimit = new_limit;
+    return null;
+  },
   get_company_codes: () => db.company_secrets,
   rotate_company_code({ which, valid_days = 7 }) {
     if (which === "invite" && (valid_days < 1 || valid_days > 30)) throw new Error("El código de invitación puede durar de 1 a 30 días.");
@@ -322,6 +338,7 @@ const rpcs = {
     if (invite_code.trim().toUpperCase() !== s.inviteCode || new Date(s.inviteExpiresAt) < new Date()) return null;
     db.join_requests.forEach((r) => r.userId === ME && r.status === "pending" && (r.status = "cancelled"));
     db.join_requests.push({ id: nextId++, companyId: COMPANY, userId: ME, fullName: myName(), email: "demo@example.test", status: "pending", createdAt: new Date().toISOString() });
+    Object.assign(s, { inviteCode: null, inviteExpiresAt: null }); // un solo uso
     return COMPANY;
   },
   my_join_request() {
@@ -337,7 +354,7 @@ const rpcs = {
     if (approve) db.profiles.push({ id: r.userId, fullName: r.fullName, companyId: COMPANY, companyRole: "member", jobTitle: "", phone: "" });
     return null;
   },
-  admin_list_companies: () => db.companies.map((c) => ({ ...c, inviteCode: db.company_secrets.find((x) => x.companyId === c.id)?.inviteCode ?? null, members: db.profiles.filter((p) => p.companyId === c.id).length })),
+  admin_list_companies: () => db.companies.map((c) => ({ ...c, inviteCode: db.company_secrets.find((x) => x.companyId === c.id)?.inviteCode ?? null, members: db.profiles.filter((p) => p.companyId === c.id).length, vehicleLimit: c.vehicleLimit ?? 10, vehicles: db.vehicles.filter((v) => v.companyId === c.id).length })),
   approve_company({ target_company_id }) { db.companies.find((c) => c.id === target_company_id).status = "approved"; return "NEWCODE12345"; },
   set_company_status({ target_company_id, new_status }) { db.companies.find((c) => c.id === target_company_id).status = new_status; return null; },
   pair_tracker_device() {
