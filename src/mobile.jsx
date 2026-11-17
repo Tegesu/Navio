@@ -16,17 +16,20 @@ import {
   Receipt,
   Settings,
   ShieldCheck,
+  SlidersHorizontal,
   Smartphone,
   Truck,
   Wrench,
 } from "lucide-react";
-import { useAuth, useDateFormat, useSessionState, formatDate, vehicleDriverLabel } from "./NavioDashboard.jsx";
+import { useAuth, useDateFormat, formatDate, vehicleDriverLabel } from "./NavioDashboard.jsx";
+import { goBack } from "./history.js";
 import { useInbox, MessagesPage, NotificationsPanel } from "./inbox.jsx";
 import { useTracking, TrackingLiveCard } from "./tracking.jsx";
 import { MobileTripTab } from "./trips.jsx";
 import { LegalLinks } from "./legal.jsx";
 import { AndroidAppDownload, isAndroidDevice } from "./background.jsx";
 import { ThemeSwitch } from "./navigation.jsx";
+import { useHomeLayout, HomeWidgetGrid, HomeShortcuts, CustomizeHomeModal } from "./homewidgets.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Navio en el teléfono: la misma estructura que en la computadora,      */
@@ -98,11 +101,12 @@ function QuickTile({ icon: Icon, label, hint, tone, count, onClick }) {
   );
 }
 
-function HomeTab({ vehicles, trips, userName, companyName, pendingCount, isAdmin, go, openPage }) {
+function HomeTab({ vehicles, trips, userName, companyName, homeData, go, openPage, onAddInvoice }) {
   const { user } = useAuth();
   const { format } = useDateFormat();
   const tracking = useTracking();
-  const inbox = useInbox();
+  const { layout, save } = useHomeLayout({ trips, orders: homeData?.orders ?? [] });
+  const [customizing, setCustomizing] = useState(false);
   const nextTrip = trips
     .filter((t) => t.assignedTo === user?.id && (t.status === "scheduled" || t.status === "ongoing"))
     .sort((a, b) => String(a.date).localeCompare(String(b.date)))[0];
@@ -111,14 +115,22 @@ function HomeTab({ vehicles, trips, userName, companyName, pendingCount, isAdmin
 
   return (
     <div className="space-y-4 p-4 pb-28">
-      <div className="overflow-hidden rounded-3xl bg-gradient-to-br from-blue-600 to-blue-800 p-4 text-white shadow-sm">
-        <p className="text-xs text-blue-100">{greeting},</p>
-        <h1 className="truncate text-xl font-bold">{userName}</h1>
-        {companyName && <p className="truncate text-xs text-blue-100">{companyName}</p>}
-        {!tracking?.active && (
+      {/* Bienvenida: en modo oscuro, carbón con un toque lavanda. */}
+      <div className="welcome-card overflow-hidden rounded-3xl p-4 text-white shadow-sm">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <p className="text-xs opacity-80">{greeting},</p>
+            <h1 className="truncate text-xl font-bold">{userName}</h1>
+            {companyName && <p className="truncate text-xs opacity-80">{companyName}</p>}
+          </div>
+          <button onClick={() => setCustomizing(true)} aria-label="Personalizar inicio" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[rgb(255_255_255/0.14)]">
+            <SlidersHorizontal size={16} />
+          </button>
+        </div>
+        {layout.drive && !tracking?.active && (
           <button onClick={() => go("trip")} className="mt-3 flex w-full items-center justify-between gap-2 rounded-2xl bg-[rgb(255_255_255/0.14)] p-3 text-left">
             <span className="min-w-0">
-              <span className="block text-[11px] font-medium text-blue-100">{nextTrip ? `Tu próximo traslado · ${formatDate(nextTrip.date, format)}` : "¿Vas a manejar?"}</span>
+              <span className="block text-[11px] font-medium opacity-80">{nextTrip ? `Tu próximo traslado · ${formatDate(nextTrip.date, format)}` : "¿Vas a manejar?"}</span>
               <span className="block truncate text-sm font-bold">{nextTrip ? `${nextTrip.origin} → ${nextTrip.destination}` : "Iniciar un viaje"}</span>
             </span>
             <Navigation size={20} className="shrink-0" />
@@ -132,7 +144,7 @@ function HomeTab({ vehicles, trips, userName, companyName, pendingCount, isAdmin
         </button>
       )}
 
-      {isAndroidDevice() && !tracking?.native && (
+      {layout.drive && isAndroidDevice() && !tracking?.native && (
         <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4">
           <p className="text-sm font-bold text-slate-800">Instala la app Navio</p>
           <p className="mt-1 text-xs text-slate-600">Con la app, el viaje se sigue registrando aunque apagues la pantalla o uses otras apps.</p>
@@ -140,49 +152,50 @@ function HomeTab({ vehicles, trips, userName, companyName, pendingCount, isAdmin
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-2.5">
-        <QuickTile icon={Truck} label="Traslados" hint="Programar y seguir" tone="bg-blue-50 text-blue-600" onClick={() => openPage("transfers", "open")} />
-        <QuickTile icon={Receipt} label="Facturas" hint="Gastos y proyectos" tone="bg-emerald-50 text-emerald-600" count={pendingCount} onClick={() => openPage("fuel")} />
-        <QuickTile icon={Wrench} label="Mantenimiento" hint="Buscar un servicio" tone="bg-amber-50 text-amber-600" onClick={() => openPage("maintenance")} />
-        <QuickTile icon={ClipboardList} label="Tareas" hint="Lo que tienes pendiente" tone="bg-violet-50 text-violet-600" count={inbox.myOpenTasks} onClick={() => openPage("tasks", "open")} />
-      </div>
+      <HomeWidgetGrid
+        compact
+        ids={layout.widgets}
+        data={{ vehicles, trips, invoices: [], maintenanceRecords: [], complianceRecords: [], orders: [], currency: "MXN", ...homeData, userId: user?.id }}
+        onNavigate={openPage}
+      />
 
-      {pendingCount > 0 && (
-        <button onClick={() => openPage("fuel")} className="flex w-full items-center justify-between gap-2 rounded-2xl bg-amber-50 px-3.5 py-3 text-left text-xs font-semibold text-amber-800 ring-1 ring-amber-200">
-          <span>
-            {pendingCount} registro{pendingCount === 1 ? "" : "s"} por revisar{isAdmin ? "" : " por tu equipo"}
-          </span>
-          <ChevronRight size={15} className="shrink-0" />
-        </button>
+      {layout.shortcuts.length > 0 && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+          <HomeShortcuts compact ids={layout.shortcuts} onNavigate={openPage} onAddInvoice={onAddInvoice} />
+        </div>
       )}
 
-      <div>
-        <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-xs font-bold uppercase tracking-wide text-slate-400">Unidades ({vehicles.length})</h2>
-          <button onClick={() => openPage("map")} className="flex items-center gap-1 text-[11px] font-semibold text-blue-600">
-            <MapPin size={12} /> Ver mapa
-          </button>
-        </div>
-        <div className="space-y-2">
-          {vehicles.map((v) => (
-            <button key={v.id} onClick={() => openPage("fleet", undefined, v.id)} className="flex w-full items-center justify-between gap-2 rounded-2xl border border-slate-200 bg-white p-3 text-left">
-              <span className="flex min-w-0 items-center gap-2.5">
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
-                  <Truck size={16} />
-                </span>
-                <span className="min-w-0">
-                  <span className="block truncate text-xs font-bold text-slate-800">
-                    {v.unit} <span className="font-medium text-slate-400">· {v.plate}</span>
-                  </span>
-                  <span className="block truncate text-[11px] text-slate-500">{vehicleDriverLabel(v)}</span>
-                </span>
-              </span>
-              <span className="shrink-0 text-[11px] font-semibold text-slate-500">{(Number(v.kmActual) || 0).toLocaleString("es-MX")} km</span>
+      {layout.fleet && (
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-xs font-bold uppercase tracking-wide text-slate-400">Unidades ({vehicles.length})</h2>
+            <button onClick={() => openPage("map")} className="flex items-center gap-1 text-[11px] font-semibold text-blue-600">
+              <MapPin size={12} /> Ver mapa
             </button>
-          ))}
-          {vehicles.length === 0 && <p className="py-6 text-center text-xs text-slate-400">Todavía no hay unidades registradas.</p>}
+          </div>
+          <div className="space-y-2">
+            {vehicles.map((v) => (
+              <button key={v.id} onClick={() => openPage("fleet", undefined, v.id)} className="flex w-full items-center justify-between gap-2 rounded-2xl border border-slate-200 bg-white p-3 text-left">
+                <span className="flex min-w-0 items-center gap-2.5">
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
+                    <Truck size={16} />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block truncate text-xs font-bold text-slate-800">
+                      {v.unit} <span className="font-medium text-slate-400">· {v.plate}</span>
+                    </span>
+                    <span className="block truncate text-[11px] text-slate-500">{vehicleDriverLabel(v)}</span>
+                  </span>
+                </span>
+                <span className="shrink-0 text-[11px] font-semibold text-slate-500">{(Number(v.kmActual) || 0).toLocaleString("es-MX")} km</span>
+              </button>
+            ))}
+            {vehicles.length === 0 && <p className="py-6 text-center text-xs text-slate-400">Todavía no hay unidades registradas.</p>}
+          </div>
         </div>
-      </div>
+      )}
+
+      {customizing && <CustomizeHomeModal phone layout={layout} onSave={save} onClose={() => setCustomizing(false)} />}
     </div>
   );
 }
@@ -261,7 +274,7 @@ const MENU = [
       { label: "Buscar servicios", route: ["maintenance"] },
       { label: "Servicios", route: ["services"] },
       { label: "Incidencias", route: ["incidents", "all"], children: [{ label: "Accidentes", route: ["incidents", "accident"] }, { label: "Fallas", route: ["incidents", "failure"] }] },
-      { label: "Garantías", route: ["warranties", "warranties"], children: [{ label: "Campañas", route: ["warranties", "campaigns"] }, { label: "Garantías", route: ["warranties", "warranties"] }] },
+      { label: "Garantías", route: ["warranties", "warranties"], children: [{ label: "Campañas", route: ["warranties", "campaigns"] }, { label: "Garantías", route: ["warranties", "warranties"] }, { label: "Órdenes de trabajo", route: ["warranties", "orders"] }] },
       { label: "Programación de mantenimiento", route: ["schedule"] },
     ],
   },
@@ -371,9 +384,9 @@ function MenuTab({ openPage }) {
 }
 
 // page: la misma pantalla que se ve en la computadora para la ruta actual.
-export function MobileAppShell({ vehicles, trips, pendingCount, userName, userAvatar, companyName, isCompanyAdmin, onOpenRecordForm, page, pageTitle, onGo }) {
-  const [tab, setTab] = useSessionState("navio.nav.mobileTab", "home");
-  const [screen, setScreen] = useSessionState("navio.nav.mobileScreen", null); // null | "page" | "alerts"
+// tab / screen viven en NavioApp para que el botón de regreso del teléfono
+// vuelva a la pantalla anterior. screen: null | "page" | "alerts".
+export function MobileAppShell({ vehicles, trips, userName, userAvatar, companyName, isCompanyAdmin, onOpenRecordForm, page, pageTitle, onGo, tab, setTab, screen, setScreen, homeData, onAddInvoice }) {
   const inbox = useInbox();
   const current = TABS.some((t) => t.id === tab) ? tab : "home";
 
@@ -409,7 +422,7 @@ export function MobileAppShell({ vehicles, trips, pendingCount, userName, userAv
         style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}
       >
         {title ? (
-          <button onClick={() => setScreen(null)} className="flex min-h-[40px] min-w-0 items-center gap-1.5 text-sm font-bold text-slate-800">
+          <button onClick={() => goBack(() => setScreen(null))} className="flex min-h-[40px] min-w-0 items-center gap-1.5 text-sm font-bold text-slate-800">
             <ArrowLeft size={18} className="shrink-0 text-blue-600" /> <span className="truncate">{title}</span>
           </button>
         ) : (
@@ -436,7 +449,7 @@ export function MobileAppShell({ vehicles, trips, pendingCount, userName, userAv
             <NotificationsPanel isAdmin={isCompanyAdmin} onNavigate={(target) => openPage(target)} onClose={() => setScreen(null)} />
           </div>
         )}
-        {!screen && current === "home" && <HomeTab vehicles={vehicles} trips={trips} userName={userName} companyName={companyName} pendingCount={pendingCount} isAdmin={isCompanyAdmin} go={go} openPage={openPage} />}
+        {!screen && current === "home" && <HomeTab vehicles={vehicles} trips={trips} userName={userName} companyName={companyName} homeData={homeData} go={go} openPage={openPage} onAddInvoice={onAddInvoice} />}
         {!screen && current === "trip" && <MobileTripTab vehicles={vehicles} trips={trips} />}
         {!screen && current === "register" && <RegisterTab onOpenForm={onOpenRecordForm} openPage={openPage} />}
         {!screen && current === "messages" && <MessagesPage isAdmin={isCompanyAdmin} compact />}

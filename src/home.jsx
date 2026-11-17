@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardList, DollarSign, E
 import { supabase, useAuth, useToast, usePersistentState, formatCurrency, localISODate, Modal, KpiCard, VehiclePhoto, HomeChartSlot, isVariableDriver, vehicleDriverLabel } from "./NavioDashboard.jsx";
 import { useInbox } from "./inbox.jsx";
 import { daysUntil } from "./vehicle.jsx";
+import { useHomeLayout, HomeWidgetGrid, HomeShortcuts, CustomizeHomeButton, CustomizeHomeModal } from "./homewidgets.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Inicio: lo que pasa hoy y lo que necesita atención                    */
@@ -99,7 +100,10 @@ function AnnouncementModal({ current, onClose }) {
   );
 }
 
-export function HomePage({ vehicles, maintenanceRecords, complianceRecords, invoices, trips, currency, isAdmin, userName, onSelectVehicle, onNavigate, onAddInvoice }) {
+export function HomePage({ vehicles, maintenanceRecords, complianceRecords, invoices, trips, orders = [], currency, isAdmin, userName, onSelectVehicle, onNavigate, onAddInvoice }) {
+  // Cada persona elige qué indicadores, accesos y secciones ve.
+  const { layout, save: saveLayout } = useHomeLayout({ trips, orders });
+  const [customizing, setCustomizing] = useState(false);
   const { user, profile } = useAuth();
   const inbox = useInbox();
   const [prefs, setPrefs] = usePersistentState("navio.home.v2", { range: 90, charts: ["spend", "liters", "trips"] });
@@ -198,34 +202,19 @@ export function HomePage({ vehicles, maintenanceRecords, complianceRecords, invo
   }, [invoices, maintenanceRecords, complianceRecords, vehicles, trips, prefs.range]);
   const chartKeys = [0, 1, 2].map((slot) => (metrics[prefs.charts?.[slot]] ? prefs.charts[slot] : ["spend", "liters", "trips"][slot]));
 
-  const kpis = [
-    { id: "trips", go: () => onNavigate("transfers"), widget: { label: "Viajes en curso", value: stats.ongoing, detail: `${counts(stats.scheduledToday, "programado", "programados")} para hoy`, icon: Truck, tone: "emerald" } },
-    {
-      id: "spend",
-      go: () => onNavigate("fuel"),
-      widget: { label: "Gasto del mes", value: money(stats.thisMonth), detail: stats.change === null ? "Facturas, servicios y trámites" : `${stats.change >= 0 ? "▲" : "▼"} ${Math.abs(stats.change)}% contra el mes pasado`, icon: DollarSign, tone: "blue" },
-    },
-    { id: "review", go: () => onNavigate("fuel"), widget: { label: "Por revisar", value: stats.pending, detail: isAdmin ? `${stats.toApprove} por aprobar` : "Registros sin verificar", icon: Receipt, tone: stats.pending > 0 ? "amber" : "slate" } },
-    { id: "tasks", go: () => onNavigate("tasks"), widget: { label: "Mis tareas", value: inbox.myOpenTasks ?? 0, detail: `${counts(inbox.unreadMessages ?? 0, "mensaje nuevo", "mensajes nuevos")}`, icon: ClipboardList, tone: "sky" } },
-  ];
-  const shortcuts = [
-    { label: "Registrar factura", icon: Plus, go: () => onAddInvoice() },
-    { label: "Nuevo traslado", icon: Navigation, go: () => onNavigate("transfers") },
-    { label: "Mapa en vivo", icon: MapPin, go: () => onNavigate("map") },
-    { label: "Mensajes", icon: MessageSquare, go: () => onNavigate("messages") },
-    { label: "Garantías", icon: ShieldCheck, go: () => onNavigate("maintenance", "garantias") },
-    { label: "Trámites", icon: FileText, go: () => onNavigate("compliance") },
-  ];
   const shown = attention.slice(0, 7);
 
   return (
     <div className="space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
       <div>
         <h1 className="text-xl font-bold text-slate-900">Hola, {String(userName).split(" ")[0]}</h1>
         <p className="mt-1 text-sm text-slate-500">
           <span className="capitalize">{new Date().toLocaleDateString("es-MX", { weekday: "long" })}</span> {new Date().toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })} ·{" "}
           {attention.length === 0 ? "todo en orden." : `${counts(attention.length, "asunto necesita", "asuntos necesitan")} tu atención.`}
         </p>
+      </div>
+      <CustomizeHomeButton onClick={() => setCustomizing(true)} />
       </div>
 
       {(announcement || isAdmin) && (
@@ -250,16 +239,15 @@ export function HomePage({ vehicles, maintenanceRecords, complianceRecords, invo
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-        {kpis.map((kpi) => (
-          <button key={kpi.id} onClick={kpi.go} className="rounded-2xl text-left transition hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">
-            <KpiCard widget={kpi.widget} />
-          </button>
-        ))}
-      </div>
+      <HomeWidgetGrid
+        ids={layout.widgets}
+        data={{ vehicles, trips, invoices, maintenanceRecords, complianceRecords, orders, currency, userId: user?.id }}
+        onNavigate={onNavigate}
+      />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        <div className={`${card} lg:col-span-2`}>
+        {layout.attention && (
+        <div className={`${card} ${layout.shortcuts.length ? "lg:col-span-2" : "lg:col-span-3"}`}>
           <h2 className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-800">
             <AlertTriangle size={15} className={attention.length ? "text-amber-500" : "text-slate-300"} /> Requiere atención
           </h2>
@@ -290,25 +278,17 @@ export function HomePage({ vehicles, maintenanceRecords, complianceRecords, invo
             </ul>
           )}
         </div>
+        )}
 
-        <div className={card}>
-          <h2 className="mb-3 text-sm font-bold text-slate-800">Accesos rápidos</h2>
-          <div className="grid grid-cols-2 gap-2">
-            {shortcuts.map((s) => {
-              const Icon = s.icon;
-              return (
-                <button key={s.label} onClick={s.go} className="flex items-center gap-2 rounded-xl border border-slate-100 px-2.5 py-2.5 text-left hover:border-blue-200 hover:bg-blue-50/50">
-                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-600">
-                    <Icon size={14} />
-                  </span>
-                  <span className="text-[11px] font-semibold leading-tight text-slate-600">{s.label}</span>
-                </button>
-              );
-            })}
+        {layout.shortcuts.length > 0 && (
+          <div className={`${card} ${layout.attention ? "" : "lg:col-span-3"}`}>
+            <h2 className="mb-3 text-sm font-bold text-slate-800">Accesos rápidos</h2>
+            <HomeShortcuts ids={layout.shortcuts} onNavigate={onNavigate} onAddInvoice={onAddInvoice} />
           </div>
-        </div>
+        )}
       </div>
 
+      {layout.fleet && (
       <div className={card}>
         <div className="mb-3 flex items-center justify-between gap-2">
           <h2 className="text-sm font-bold text-slate-800">Tu flotilla ({vehicles.length})</h2>
@@ -330,7 +310,9 @@ export function HomePage({ vehicles, maintenanceRecords, complianceRecords, invo
           </div>
         )}
       </div>
+      )}
 
+      {layout.trends && (
       <div>
         <div className="mb-3 flex items-center justify-between gap-2">
           <h2 className="text-sm font-bold text-slate-800">Tendencias</h2>
@@ -348,8 +330,10 @@ export function HomePage({ vehicles, maintenanceRecords, complianceRecords, invo
           ))}
         </div>
       </div>
+      )}
 
       {editingNotice && <AnnouncementModal current={announcement} onClose={() => setEditingNotice(false)} />}
+      {customizing && <CustomizeHomeModal layout={layout} onSave={saveLayout} onClose={() => setCustomizing(false)} />}
     </div>
   );
 }

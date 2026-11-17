@@ -1,5 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
+import { addBaseLayer, trafficLayer, durationText, hasTomTom } from "./maps.js";
+import { RoutePlanner, savePlan, readPlan, thinPoints } from "./routeplanner.jsx";
 import { Capacitor, CapacitorHttp, registerPlugin } from "@capacitor/core";
 import { AlertTriangle, Clock, Gauge, LocateFixed, MapPin, Navigation, Route, Truck, User, WifiOff, X } from "lucide-react";
 import {
@@ -705,6 +707,9 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
   const [choice, setChoice] = useState(() => (openTrips[0] ? `trip:${openTrips[0].id}` : "free"));
   const [vehicleId, setVehicleId] = useState(vehicles[0]?.id ?? null);
   const [confirming, setConfirming] = useState(false);
+  // Ruta planeada (opcional): salida, destino y la ruta elegida.
+  const [planOpen, setPlanOpen] = useState(false);
+  const [plan, setPlan] = useState(null);
   // Fuera de la app, quien vinculó su app de rastreo puede elegir con qué registra.
   const canUseTracker = !tracking.native && !!tracking.tracker;
   const [source, setSource] = useState("tracker");
@@ -716,13 +721,29 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
   const fieldClass = `w-full rounded-lg border border-slate-200 bg-white focus:border-blue-400 focus:outline-none ${big ? "px-3 py-2.5 text-sm" : "px-2.5 py-1.5 text-xs"}`;
   const buttonClass = `w-full rounded-2xl font-bold text-white shadow-sm disabled:opacity-60 ${big ? "py-4 text-base" : "py-2.5 text-xs"}`;
 
-  async function handleStart() {
+  async function handleStart(withRoute = false) {
     if (!vehicle) return;
+    const route = withRoute ? plan?.route : null;
+    savePlan(
+      route
+        ? {
+            from: plan.from?.label ?? "",
+            to: plan.to?.label ?? "",
+            km: route.km,
+            minutes: route.minutes,
+            delayMinutes: route.delayMinutes,
+            arrival: new Date(Date.now() + route.minutes * 60000).toISOString(),
+            points: thinPoints(route.points),
+            destination: plan.to ? { lat: plan.to.lat, lng: plan.to.lng } : null,
+          }
+        : null
+    );
     await tracking.start({ vehicleId: vehicle.id, tripId: chosenTrip?.id ?? null, unit: vehicle.unit, source: chosenSource });
   }
 
   async function handleStop() {
     setConfirming(false);
+    savePlan(null);
     const route = await tracking.stop();
     if (route) showToast(`Viaje guardado: ${formatKm(route.distanceKm)} recorridos.`);
   }
@@ -731,6 +752,7 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
     return (
       <div className="space-y-3">
         <TrackingLiveCard big={big} />
+        <PlannedRouteCard />
         <TrackingError />
         <TrackingModeNote />
         {confirming ? (
@@ -820,11 +842,71 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
           )}
         </div>
       )}
+      <div className="rounded-2xl border border-slate-200 bg-white">
+        <button type="button" onClick={() => setPlanOpen((v) => !v)} aria-expanded={planOpen} className="flex w-full items-center gap-2 px-3 py-2.5 text-left">
+          <Route size={16} className="shrink-0 text-blue-600" />
+          <span className="min-w-0 flex-1">
+            <span className="block text-xs font-bold text-slate-800">¿A dónde vas? Planear la ruta</span>
+            <span className="block text-[11px] text-slate-500">Opcional: tiempo estimado, tráfico en vivo y rutas alternativas.</span>
+          </span>
+          <span className="text-[11px] font-semibold text-blue-600">{planOpen ? "Ocultar" : "Abrir"}</span>
+        </button>
+        {planOpen && (
+          <div className="border-t border-slate-100 p-3">
+            <RoutePlanner onChange={setPlan} />
+          </div>
+        )}
+      </div>
       <TrackingError />
-      <button onClick={handleStart} disabled={busy || !vehicle} className={`${buttonClass} bg-blue-600 hover:bg-blue-700`}>
-        {tracking.status === "starting" ? "Iniciando…" : "Iniciar viaje"}
-      </button>
+      {planOpen && plan?.route ? (
+        <>
+          <button onClick={() => handleStart(true)} disabled={busy || !vehicle} className={`${buttonClass} bg-blue-600 hover:bg-blue-700`}>
+            {tracking.status === "starting" ? "Iniciando…" : `Iniciar viaje con esta ruta · ${durationText(plan.route.minutes)}`}
+          </button>
+          <button onClick={() => handleStart(false)} disabled={busy || !vehicle} className="w-full rounded-2xl border border-slate-200 bg-white py-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60">
+            Solo iniciar el viaje (sin ruta)
+          </button>
+        </>
+      ) : (
+        <button onClick={() => handleStart(false)} disabled={busy || !vehicle} className={`${buttonClass} bg-blue-600 hover:bg-blue-700`}>
+          {tracking.status === "starting" ? "Iniciando…" : planOpen ? "Solo iniciar el viaje" : "Iniciar viaje"}
+        </button>
+      )}
       {vehicles.length === 0 && <p className="text-center text-[11px] text-slate-400">Primero registra una unidad en Gestión de flota.</p>}
+    </div>
+  );
+}
+
+// La ruta que se planeó al iniciar: destino, llegada estimada y el mapa con
+// la posición actual.
+function PlannedRouteCard() {
+  const tracking = useTracking();
+  const [plan] = useState(() => readPlan());
+  if (!plan?.points?.length) return null;
+  const here = tracking.lastFix;
+  return (
+    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+      <div className="flex items-center gap-2 px-3 py-2.5">
+        <Route size={16} className="shrink-0 text-blue-600" />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-xs font-bold text-slate-800">Hacia {plan.to || "tu destino"}</p>
+          <p className="text-[11px] text-slate-500">
+            {Math.round(plan.km)} km · {durationText(plan.minutes)} · llegada estimada {new Date(plan.arrival).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" })}
+          </p>
+        </div>
+      </div>
+      <div className="relative h-56">
+        <MapView
+          lines={[{ id: "plan", points: plan.points, color: "#2563eb" }]}
+          pins={[
+            { id: "a", lat: plan.points[0].lat, lng: plan.points[0].lng, text: "A", color: "#10b981" },
+            { id: "b", lat: plan.points[plan.points.length - 1].lat, lng: plan.points[plan.points.length - 1].lng, text: "B", color: "#e11d48" },
+          ]}
+          markers={here ? [{ id: "me", lat: here.lat, lng: here.lng, color: "#10b981", label: "Tú", selected: true }] : []}
+          fitKey="plan"
+          traffic
+        />
+      </div>
     </div>
   );
 }
@@ -859,7 +941,6 @@ export function DriverModeModal({ vehicles, trips, onClose }) {
 
 const MAP_COLORS = { moving: "#10b981", stopped: "#f59e0b", offline: "#94a3b8" };
 const DEFAULT_MAP_CENTER = [23.6345, -102.5528]; // México
-const TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
 
 // Los nombres de unidad los escribe la gente: se insertan como texto, nunca
 // como HTML, para que no puedan colar código en el mapa.
@@ -887,7 +968,7 @@ function pinIcon(text, color) {
 // pins:    [{ id, lat, lng, text, color }]
 // fitKey:  al cambiar, el mapa se ajusta para mostrar todo lo dibujado.
 // follow:  { lat, lng } — el mapa se mantiene centrado ahí.
-export function MapView({ markers = [], lines = [], pins = [], fitKey, follow = null, onSelectMarker }) {
+export function MapView({ markers = [], lines = [], pins = [], fitKey, follow = null, onSelectMarker, traffic = false }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const layersRef = useRef({ markers: new Map(), lines: null, pins: null });
@@ -897,7 +978,7 @@ export function MapView({ markers = [], lines = [], pins = [], fitKey, follow = 
 
   useEffect(() => {
     const map = L.map(containerRef.current, { zoomControl: true, attributionControl: true }).setView(DEFAULT_MAP_CENTER, 5);
-    L.tileLayer(TILE_URL, { attribution: "© OpenStreetMap", maxZoom: 19 }).addTo(map);
+    addBaseLayer(map, containerRef.current);
     layersRef.current.lines = L.layerGroup().addTo(map);
     layersRef.current.pins = L.layerGroup().addTo(map);
     mapRef.current = map;
@@ -968,6 +1049,15 @@ export function MapView({ markers = [], lines = [], pins = [], fitKey, follow = 
     fittedRef.current = fitKey;
     mapRef.current.fitBounds(L.latLngBounds(points), { padding: [48, 48], maxZoom: 15 });
   }, [fitKey, markers, pins, lines]);
+
+  // Tráfico en vivo (TomTom), si se pide.
+  useEffect(() => {
+    if (!traffic) return undefined;
+    const layer = trafficLayer();
+    if (!layer) return undefined;
+    layer.addTo(mapRef.current);
+    return () => layer.remove();
+  }, [traffic]);
 
   useEffect(() => {
     if (follow) mapRef.current.panTo([follow.lat, follow.lng], { animate: true });
@@ -1175,6 +1265,7 @@ export function LiveMapPage({ vehicles, trips = [], isAdmin, onSelectVehicle }) 
   const [pastPoints, setPastPoints] = useState([]);
   const [driverOpen, setDriverOpen] = useState(false);
   const [fitKey, setFitKey] = useState(0);
+  const [showTraffic, setShowTraffic] = useState(false);
 
   const fleet = useMemo(
     () =>
@@ -1309,7 +1400,17 @@ export function LiveMapPage({ vehicles, trips = [], isAdmin, onSelectVehicle }) 
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
         <div className="relative h-[60vh] min-h-[420px] overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
-          <MapView markers={markers} lines={lines} pins={pins} fitKey={withSignal > 0 ? fitKey : undefined} follow={follow} onSelectMarker={selectVehicle} />
+          <MapView markers={markers} lines={lines} pins={pins} fitKey={withSignal > 0 ? fitKey : undefined} follow={follow} onSelectMarker={selectVehicle} traffic={showTraffic} />
+          {hasTomTom() && (
+            <button
+              type="button"
+              onClick={() => setShowTraffic((v) => !v)}
+              aria-pressed={showTraffic}
+              className={`absolute right-3 top-3 z-10 rounded-xl px-3 py-1.5 text-[11px] font-semibold shadow-md ${showTraffic ? "bg-blue-600 text-white" : "bg-white/95 text-slate-600"}`}
+            >
+              Tráfico en vivo
+            </button>
+          )}
           {withSignal === 0 && (
             <div className="pointer-events-none absolute inset-x-0 top-3 z-10 flex justify-center px-3">
               <span className="rounded-full bg-white/95 px-3 py-1.5 text-center text-[11px] font-semibold text-slate-500 shadow-md">

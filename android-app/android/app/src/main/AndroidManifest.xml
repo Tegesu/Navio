@@ -35,6 +35,14 @@
                 android:resource="@xml/file_paths"></meta-data>
         </provider>
 
+        <!-- Stickers para WhatsApp: solo WhatsApp puede leerlos (con su permiso). -->
+        <provider
+            android:name=".StickerContentProvider"
+            android:authorities="${applicationId}.stickercontentprovider"
+            android:enabled="true"
+            android:exported="true"
+            android:readPermission="com.whatsapp.sticker.READ" />
+
         <!-- El plugin de ubicación declara su servicio como "exportado", lo
              que dejaría a otras apps del teléfono iniciarlo o conectarse a él.
              Solo lo usa Navio, así que aquí se cierra. -->
@@ -47,4 +55,15 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Notas de voz y fotos en Mensajes (se piden al usarlas por primera vez). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <!-- Para abrir WhatsApp al agregar un paquete de stickers. -->
+    <queries>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+    </queries>
 </manifest>

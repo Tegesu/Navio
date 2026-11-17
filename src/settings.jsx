@@ -18,6 +18,7 @@ import { translateAuthError } from "./auth.jsx";
 import { PasswordChecklist, passwordProblem, setWeakPasswordFlag } from "./password.jsx";
 import { BackgroundTrackingPanel } from "./background.jsx";
 import { SETTINGS_SECTIONS, ThemeSwitch } from "./navigation.jsx";
+import { GpsDevicesPanel } from "./gpsdevices.jsx";
 
 const card = "rounded-2xl border border-slate-200 bg-white p-4 shadow-sm";
 const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none disabled:bg-slate-50 disabled:text-slate-500";
@@ -1447,6 +1448,7 @@ export function ConfigurationPage({ section = "profile", onSection, userName, us
           {current.id === "company" && <CompanyPanel />}
           {current.id === "team" && <TeamPanel />}
           {current.id === "bot" && <BotPanel />}
+          {current.id === "gps" && <GpsDevicesPanel />}
           {current.id === "audit" && <AuditPanel />}
           {current.id === "preferences" && <PreferencesPanel />}
           {current.id === "privacy" && <PrivacyPanel />}

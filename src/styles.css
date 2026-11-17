@@ -289,6 +289,22 @@ html.dark .splash-n {
 }
 
 /* Teléfono: los avisos flotantes van arriba de la barra inferior. */
-.has-bottom-nav .cookie-notice {
+.has-bottom-nav .cookie-notice,
+.has-bottom-nav .toast-host {
   bottom: calc(76px + env(safe-area-inset-bottom));
+}
+
+/* Cartel de bienvenida del teléfono: azul en claro; carbón con lavanda en oscuro. */
+.welcome-card {
+  background: linear-gradient(135deg, #2563eb 0%, #1e40af 100%);
+}
+html.dark .welcome-card {
+  background: radial-gradient(120% 140% at 0% 0%, rgba(143, 127, 246, 0.32) 0%, rgba(143, 127, 246, 0) 55%),
+    linear-gradient(135deg, #2c2a3a 0%, #252524 100%);
+  box-shadow: inset 0 0 0 1px rgba(165, 151, 253, 0.18);
+}
+
+/* Mapas de TomTom en modo oscuro: ya vienen oscuros, no se invierten. */
+html.dark .tiles-native-dark .leaflet-tile-pane {
+  filter: none;
 }

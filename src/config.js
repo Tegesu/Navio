@@ -11,3 +11,14 @@
 //      Captcha protection", elige Turnstile y pega la Secret Key.
 // Las dos cosas van juntas: con solo una, nadie podrá entrar.
 export const CAPTCHA_SITE_KEY = "0x4AAAAAAGBuPt13hXJQVLnz";
+
+// Mapas, rutas y tráfico en vivo (TomTom). Vacío = mapa de OpenStreetMap sin
+// rutas ni tráfico.
+//
+// Para activarlo:
+//   1. Crea una cuenta en developer.tomtom.com y, en "Keys", una llave nueva.
+//   2. En la llave, limita su uso al dominio de Navio (navio-fyj2.vercel.app)
+//      si el portal lo permite, y activa un aviso de consumo.
+//   3. Pega la llave aquí abajo. Es pública por naturaleza (la ve el
+//      navegador), no es una contraseña.
+export const TOMTOM_KEY = "";

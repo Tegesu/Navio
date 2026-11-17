@@ -140,11 +140,64 @@ const reply = (status: number, text = "") =>
     headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" },
   });
 
+// ---------------------------------------------------------------------------
+// GPS fijos en las unidades (migración v25)
+// ---------------------------------------------------------------------------
+// El receptor (Traccar Server) reenvía cada posición en JSON con la cabecera
+// "X-Navio-Secret". Esa clave se guarda en Supabase → Edge Functions →
+// Secrets como TRACCAR_FORWARD_SECRET (64 caracteres al azar). Sin ella,
+// esta entrada no acepta nada.
+//   Formato de Traccar: { "position": { latitude, longitude, speed (nudos),
+//   course, accuracy, fixTime, attributes: { ignition } }, "device": { uniqueId } }
+const FORWARD_SECRET = Deno.env.get("TRACCAR_FORWARD_SECRET") ?? "";
+
+function sameSecret(given: string, expected: string): boolean {
+  if (!given || !expected || given.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= given.charCodeAt(i) ^ expected.charCodeAt(i);
+  return diff === 0;
+}
+
+async function handleForward(req: Request, address: string): Promise<Response> {
+  if (FORWARD_SECRET.length < 32 || !sameSecret(req.headers.get("x-navio-secret") ?? "", FORWARD_SECRET)) {
+    countBadToken(address);
+    return reply(401, "Firma no válida");
+  }
+  let body: any;
+  try {
+    const raw = await req.text();
+    if (raw.length > MAX_BODY_BYTES) return reply(413, "Demasiados datos en un solo envío");
+    body = JSON.parse(raw);
+  } catch {
+    return reply(400, "No se pudo leer el envío");
+  }
+  const imei = String(body?.device?.uniqueId ?? "").replace(/\s/g, "");
+  if (!/^[0-9]{10,20}$/.test(imei)) return reply(400, "GPS sin número de serie");
+  const position = body?.position ?? {};
+  const knots = num(position.speed);
+  const point = makePoint(position.latitude, position.longitude, knots === null ? null : knots * KNOTS_TO_KMH, position.course, position.accuracy, position.fixTime ?? position.deviceTime);
+  const rawIgnition = position.attributes?.ignition;
+  const ignition = typeof rawIgnition === "boolean" ? rawIgnition : null;
+
+  const { data, error } = await supabase.rpc("gps_device_report", { device_imei: imei, points: point ? [point] : [], ignition });
+  if (error) {
+    if (error.code === "P0429") return reply(429, "Demasiados envíos");
+    console.error("gps_device_report:", error.message);
+    return reply(500, "No se pudo guardar");
+  }
+  // Un GPS que no está dado de alta en Navio: 404 (se ve en el receptor).
+  if (data?.status === "unknown") return reply(404, "GPS no registrado");
+  return reply(200);
+}
+
 Deno.serve(async (req) => {
   if (req.method !== "GET" && req.method !== "POST") return reply(405, "Método no permitido");
 
   const address = clientAddress(req);
   if (blocked(address)) return reply(429, "Demasiados intentos");
+
+  // El receptor de los GPS fijos se identifica con su cabecera.
+  if (req.method === "POST" && req.headers.has("x-navio-secret")) return handleForward(req, address);
 
   const url = new URL(req.url);
   let token = url.searchParams.get("id") ?? url.searchParams.get("deviceid") ?? "";

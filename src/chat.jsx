@@ -1,0 +1,1306 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowLeft,
+  Camera,
+  Check,
+  CheckCheck,
+  Clock,
+  Copy,
+  CornerUpLeft,
+  Download,
+  Edit2,
+  FileText,
+  Forward,
+  Image as ImageIcon,
+  Info,
+  Languages,
+  Mic,
+  Pin,
+  PinOff,
+  Plus,
+  Send,
+  Smile,
+  Star,
+  StarOff,
+  Sticker,
+  Trash2,
+  Upload,
+  X,
+} from "lucide-react";
+import { supabase, useAuth, useToast, Modal } from "./NavioDashboard.jsx";
+import { useInbox } from "./inbox.jsx";
+import { isNativeApp } from "./tracking.jsx";
+
+/* ---------------------------------------------------------------------- */
+/*  Conversación: mensajes, archivos, voz, stickers y acciones            */
+/* ---------------------------------------------------------------------- */
+
+const PAGE_SIZE = 50;
+const EDIT_WINDOW_MS = 15 * 60 * 1000;
+const MAX_FILE_MB = 25;
+const REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+const EXT_BY_MIME = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "video/mp4": "mp4",
+  "video/webm": "webm",
+  "video/quicktime": "mov",
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "audio/mp4": "m4a",
+  "audio/x-m4a": "m4a",
+  "audio/mpeg": "mp3",
+  "audio/aac": "aac",
+  "audio/wav": "wav",
+  "application/pdf": "pdf",
+  "application/msword": "doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/vnd.ms-excel": "xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.ms-powerpoint": "ppt",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+  "text/plain": "txt",
+  "text/csv": "csv",
+  "application/zip": "zip",
+};
+const MIME_BY_EXT = Object.fromEntries(Object.entries(EXT_BY_MIME).map(([mime, ext]) => [ext, mime]));
+MIME_BY_EXT.jpeg = "image/jpeg";
+MIME_BY_EXT.m4a = "audio/mp4";
+
+const KIND_LABEL = { image: "📷 Foto", video: "🎬 Video", file: "📄 Documento", voice: "🎤 Nota de voz", sticker: "Sticker" };
+export const previewText = (kind, body) => (kind && kind !== "text" ? `${KIND_LABEL[kind] ?? "Archivo"}${body ? `: ${body}` : ""}` : body);
+
+const dayLabel = (iso) => {
+  const date = new Date(iso);
+  const today = new Date();
+  const yesterday = new Date(Date.now() - 864e5);
+  if (date.toDateString() === today.toDateString()) return "Hoy";
+  if (date.toDateString() === yesterday.toDateString()) return "Ayer";
+  return date.toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" });
+};
+const hourLabel = (iso) => new Date(iso).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" });
+const sizeLabel = (bytes) => (bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round((bytes || 0) / 1024))} KB`);
+const durationLabel = (s) => `${Math.floor((s || 0) / 60)}:${String(Math.round(s || 0) % 60).padStart(2, "0")}`;
+const time = (iso) => (iso ? Date.parse(iso) : 0);
+
+/* ---------- Archivos ---------- */
+
+// Los archivos del chat son privados: se bajan con la sesión y se muestran
+// desde la memoria del navegador (blob:), nunca con un enlace público.
+const mediaCache = new Map();
+function mediaUrl(path) {
+  if (!mediaCache.has(path)) {
+    mediaCache.set(
+      path,
+      supabase.storage
+        .from("chat")
+        .download(path)
+        .then(({ data, error }) => {
+          if (error) throw error;
+          return URL.createObjectURL(data);
+        })
+    );
+  }
+  return mediaCache.get(path);
+}
+function useMediaUrl(path) {
+  const [url, setUrl] = useState(null);
+  useEffect(() => {
+    if (!path) return undefined;
+    let alive = true;
+    mediaUrl(path)
+      .then((u) => alive && setUrl(u))
+      .catch(() => {
+        mediaCache.delete(path);
+        if (alive) setUrl(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [path]);
+  return url;
+}
+
+function fileInfo(file) {
+  const fromName = (file.name || "").split(".").pop()?.toLowerCase();
+  const mime = (file.type || MIME_BY_EXT[fromName] || "").split(";")[0];
+  const ext = EXT_BY_MIME[mime] || (MIME_BY_EXT[fromName] ? fromName : null);
+  return { mime: mime || MIME_BY_EXT[ext], ext };
+}
+
+async function uploadChatFile(file, companyId, folder) {
+  const { mime, ext } = fileInfo(file);
+  if (!ext) throw new Error("Ese tipo de archivo no se puede enviar.");
+  if (file.size > MAX_FILE_MB * 1024 * 1024) throw new Error(`El archivo pesa más de ${MAX_FILE_MB} MB.`);
+  const path = `${companyId}/${folder}/${crypto.randomUUID()}.${ext}`;
+  const { error } = await supabase.storage.from("chat").upload(path, file, { contentType: mime });
+  if (error) throw error;
+  return { path, mime };
+}
+
+async function imageSize(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const size = { width: bitmap.width, height: bitmap.height };
+    bitmap.close?.();
+    return size;
+  } catch {
+    return {};
+  }
+}
+
+/* ---------- Mantener presionado ---------- */
+
+function useLongPress(onLongPress, ms = 450) {
+  const timer = useRef(null);
+  const start = useRef(null);
+  const cancel = () => {
+    window.clearTimeout(timer.current);
+    timer.current = null;
+  };
+  return {
+    onPointerDown: (e) => {
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      start.current = { x: e.clientX, y: e.clientY };
+      cancel();
+      timer.current = window.setTimeout(() => {
+        timer.current = null;
+        navigator.vibrate?.(15);
+        onLongPress();
+      }, ms);
+    },
+    onPointerMove: (e) => {
+      if (!timer.current || !start.current) return;
+      if (Math.abs(e.clientX - start.current.x) > 10 || Math.abs(e.clientY - start.current.y) > 10) cancel();
+    },
+    onPointerUp: cancel,
+    onPointerLeave: cancel,
+    onPointerCancel: cancel,
+    onContextMenu: (e) => {
+      e.preventDefault();
+      cancel();
+      onLongPress();
+    },
+  };
+}
+
+/* ---------- Piezas de un mensaje ---------- */
+
+function Ticks({ message, receipts }) {
+  if (message.pending) return <Clock size={11} className="opacity-70" aria-label="Enviando" />;
+  const created = time(message.createdAt);
+  if (receipts?.readUntil && created <= time(receipts.readUntil)) return <CheckCheck size={13} className="text-sky-200" aria-label="Visto" />;
+  if (receipts?.deliveredUntil && created <= time(receipts.deliveredUntil)) return <CheckCheck size={13} className="opacity-70" aria-label="Recibido" />;
+  return <Check size={13} className="opacity-70" aria-label="Enviado" />;
+}
+
+function ImageAttachment({ attachment, sticker = false, onOpen }) {
+  const url = useMediaUrl(attachment.path);
+  const ratio = attachment.width && attachment.height ? attachment.height / attachment.width : 0.75;
+  if (url === false) return <p className="text-[11px] italic opacity-70">No se pudo cargar la imagen.</p>;
+  if (sticker) {
+    return url ? <img src={url} alt="Sticker" className="h-32 w-32 object-contain" draggable={false} /> : <div className="h-32 w-32 animate-pulse rounded-xl bg-slate-100" />;
+  }
+  return (
+    <button type="button" onClick={() => url && onOpen(url)} className="block overflow-hidden rounded-xl" style={{ width: 220, height: Math.min(300, Math.round(220 * ratio)) }}>
+      {url ? <img src={url} alt={attachment.name || "Foto"} className="h-full w-full object-cover" draggable={false} /> : <span className="block h-full w-full animate-pulse bg-slate-200" />}
+    </button>
+  );
+}
+
+function VideoAttachment({ attachment }) {
+  const url = useMediaUrl(attachment.path);
+  if (url === false) return <p className="text-[11px] italic opacity-70">No se pudo cargar el video.</p>;
+  return url ? <video src={url} controls playsInline preload="metadata" className="max-h-72 w-60 rounded-xl bg-black" /> : <div className="h-40 w-60 animate-pulse rounded-xl bg-slate-200" />;
+}
+
+function VoiceAttachment({ attachment, mine }) {
+  const url = useMediaUrl(attachment.path);
+  return (
+    <div className="flex min-w-[220px] items-center gap-2">
+      <Mic size={16} className={mine ? "text-blue-100" : "text-blue-600"} />
+      {url ? <audio src={url} controls preload="metadata" className="h-9 w-52" /> : <span className="text-[11px] opacity-70">{url === false ? "No se pudo cargar" : "Cargando…"}</span>}
+      {attachment.duration ? <span className="text-[10px] opacity-70">{durationLabel(attachment.duration)}</span> : null}
+    </div>
+  );
+}
+
+function FileAttachment({ attachment, mine }) {
+  const [busy, setBusy] = useState(false);
+  async function download() {
+    setBusy(true);
+    try {
+      const url = await mediaUrl(attachment.path);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = attachment.name || "archivo";
+      a.click();
+    } catch {
+      // Se avisa en pantalla con el estado del botón.
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <button type="button" onClick={download} className={`flex min-w-[200px] items-center gap-2.5 rounded-xl px-2.5 py-2 text-left ${mine ? "bg-[rgb(255_255_255/0.14)]" : "bg-slate-100"}`}>
+      <FileText size={22} className="shrink-0" />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-xs font-semibold">{attachment.name || "Documento"}</span>
+        <span className="block text-[10px] opacity-70">{sizeLabel(attachment.size)}</span>
+      </span>
+      <Download size={15} className={`shrink-0 ${busy ? "animate-pulse" : ""}`} />
+    </button>
+  );
+}
+
+function ReplyQuote({ reply, mine, onJump }) {
+  if (!reply) return null;
+  return (
+    <button type="button" onClick={onJump} className={`mb-1 block w-full rounded-lg border-l-4 px-2 py-1 text-left ${mine ? "border-blue-200 bg-[rgb(255_255_255/0.14)]" : "border-blue-500 bg-slate-100"}`}>
+      <span className={`block text-[10px] font-bold ${mine ? "text-blue-100" : "text-blue-600"}`}>{reply.senderName || "Mensaje"}</span>
+      <span className="block truncate text-[11px] opacity-80">{reply.deletedAt ? "Mensaje borrado" : previewText(reply.kind, reply.body) || "Mensaje"}</span>
+    </button>
+  );
+}
+
+function Bubble({ message, mine, showSender, reply, reactions, starred, receipts, translation, highlighted, onMenu, onJump, onOpenImage, onToggleReaction, userId }) {
+  const press = useLongPress(() => onMenu(message));
+  const attachment = message.attachment;
+  const isSticker = message.kind === "sticker";
+  const grouped = useMemo(() => {
+    const map = new Map();
+    for (const r of reactions) {
+      const entry = map.get(r.emoji) ?? { emoji: r.emoji, count: 0, mine: false, names: [] };
+      entry.count += 1;
+      entry.mine = entry.mine || r.userId === userId;
+      entry.names.push(r.userName || "Alguien");
+      map.set(r.emoji, entry);
+    }
+    return [...map.values()];
+  }, [reactions, userId]);
+
+  if (message.deletedAt) {
+    return (
+      <div className={`flex ${mine ? "justify-end" : "justify-start"}`}>
+        <p className={`rounded-2xl px-3 py-1.5 text-xs italic ${mine ? "bg-blue-600/60 text-blue-100" : "bg-white text-slate-400 shadow-sm"}`}>Mensaje borrado</p>
+      </div>
+    );
+  }
+
+  const meta = (
+    <span className={`mt-0.5 flex items-center justify-end gap-1 text-[9px] ${isSticker ? "text-slate-400" : mine ? "text-blue-100" : "text-slate-400"}`}>
+      {starred && <Star size={9} className="fill-current" />}
+      {message.pinnedAt && <Pin size={9} />}
+      {message.editedAt && <span>editado</span>}
+      {hourLabel(message.createdAt)}
+      {mine && <Ticks message={message} receipts={receipts} />}
+    </span>
+  );
+
+  return (
+    <div id={`msg-${message.id}`} className={`group flex items-end gap-1 ${mine ? "justify-end" : "justify-start"}`}>
+      {mine && (
+        <button type="button" onClick={() => onMenu(message)} aria-label="Opciones del mensaje" className="mb-2 hidden rounded-full p-1 text-slate-300 hover:bg-slate-100 hover:text-slate-500 group-hover:block focus:block">
+          <Smile size={14} />
+        </button>
+      )}
+      <div className="max-w-[80%]">
+        <div
+          {...press}
+          className={`select-none [-webkit-touch-callout:none] ${
+            isSticker ? "" : `rounded-2xl px-2.5 py-1.5 ${mine ? "rounded-br-md bg-blue-600 text-white" : "rounded-bl-md bg-white text-slate-700 shadow-sm"}`
+          } ${highlighted ? "ring-2 ring-amber-400" : ""}`}
+        >
+          {!mine && showSender && !isSticker && <p className="text-[10px] font-bold text-blue-600">{message.senderName || "Alguien"}</p>}
+          {message.forwarded && (
+            <p className={`flex items-center gap-1 text-[10px] italic ${mine ? "text-blue-100" : "text-slate-400"}`}>
+              <Forward size={10} /> Reenviado
+            </p>
+          )}
+          <ReplyQuote reply={reply} mine={mine} onJump={() => onJump(message.replyToId)} />
+          {attachment && message.kind === "image" && <ImageAttachment attachment={attachment} onOpen={onOpenImage} />}
+          {attachment && isSticker && <ImageAttachment attachment={attachment} sticker />}
+          {attachment && message.kind === "video" && <VideoAttachment attachment={attachment} />}
+          {attachment && message.kind === "voice" && <VoiceAttachment attachment={attachment} mine={mine} />}
+          {attachment && message.kind === "file" && <FileAttachment attachment={attachment} mine={mine} />}
+          {message.body && <p className="whitespace-pre-wrap break-words px-0.5 pt-0.5 text-xs leading-relaxed">{message.body}</p>}
+          {translation && (
+            <p className={`mt-1 border-t pt-1 text-[11px] italic ${mine ? "border-blue-400 text-blue-50" : "border-slate-100 text-slate-500"}`}>
+              <Languages size={10} className="mr-1 inline" />
+              {translation}
+            </p>
+          )}
+          {meta}
+        </div>
+        {grouped.length > 0 && (
+          <div className={`-mt-1 flex flex-wrap gap-1 ${mine ? "justify-end" : "justify-start"}`}>
+            {grouped.map((g) => (
+              <button
+                key={g.emoji}
+                type="button"
+                title={g.names.join(", ")}
+                onClick={() => onToggleReaction(message, g.mine ? null : g.emoji)}
+                className={`rounded-full border px-1.5 py-0.5 text-[11px] shadow-sm ${g.mine ? "border-blue-300 bg-blue-50" : "border-slate-200 bg-white"}`}
+              >
+                {g.emoji}
+                {g.count > 1 ? ` ${g.count}` : ""}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {!mine && (
+        <button type="button" onClick={() => onMenu(message)} aria-label="Opciones del mensaje" className="mb-2 hidden rounded-full p-1 text-slate-300 hover:bg-slate-100 hover:text-slate-500 group-hover:block focus:block">
+          <Smile size={14} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Ventanas de acciones ---------- */
+
+function ActionSheet({ message, mine, canDeleteAll, canEdit, starred, advanced, onAction, onClose }) {
+  const item = (id, Icon, label, danger = false) => (
+    <button
+      key={id}
+      type="button"
+      onClick={() => onAction(id)}
+      className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium ${danger ? "text-rose-600 hover:bg-rose-50" : "text-slate-700 hover:bg-slate-50"}`}
+    >
+      <Icon size={17} className="shrink-0" /> {label}
+    </button>
+  );
+  return (
+    <Modal title="Mensaje" width="max-w-sm" onClose={onClose}>
+      {advanced && (
+        <div className="mb-2 flex justify-between rounded-2xl bg-slate-50 p-1.5">
+          {REACTIONS.map((emoji) => (
+            <button key={emoji} type="button" onClick={() => onAction(`react:${emoji}`)} className="flex h-10 w-10 items-center justify-center rounded-full text-xl hover:bg-white">
+              {emoji}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="space-y-0.5">
+        {advanced && item("reply", CornerUpLeft, "Responder")}
+        {message.body && item("copy", Copy, "Copiar")}
+        {advanced && item("forward", Forward, "Reenviar")}
+        {canEdit && item("edit", Edit2, "Editar")}
+        {advanced && item(message.pinnedAt ? "unpin" : "pin", message.pinnedAt ? PinOff : Pin, message.pinnedAt ? "Dejar de fijar" : "Fijar")}
+        {advanced && item(starred ? "unstar" : "star", starred ? StarOff : Star, starred ? "Quitar de destacados" : "Destacar")}
+        {mine && advanced && item("info", Info, "Información")}
+        {message.body && advanced && item("translate", Languages, "Traducir")}
+        {advanced && item("hide", Trash2, "Eliminar para mí", true)}
+        {canDeleteAll && item("delete", Trash2, "Eliminar para todos", true)}
+      </div>
+    </Modal>
+  );
+}
+
+function InfoModal({ message, onClose }) {
+  const [rows, setRows] = useState(null);
+  useEffect(() => {
+    supabase.rpc("message_receipts", { target_message: message.id }).then(({ data }) => setRows(data ?? []));
+  }, [message.id]);
+  const read = (rows ?? []).filter((r) => r.readAt);
+  const delivered = (rows ?? []).filter((r) => !r.readAt && r.deliveredAt);
+  const waiting = (rows ?? []).filter((r) => !r.readAt && !r.deliveredAt);
+  const section = (title, list, Icon, field) => (
+    <div>
+      <p className="mb-1 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
+        <Icon size={13} /> {title} ({list.length})
+      </p>
+      {list.length === 0 ? (
+        <p className="text-xs text-slate-400">Nadie todavía.</p>
+      ) : (
+        <ul className="space-y-1">
+          {list.map((r) => (
+            <li key={r.userId} className="flex justify-between gap-2 text-xs text-slate-600">
+              <span className="truncate">{r.name}</span>
+              {field && <span className="shrink-0 text-slate-400">{new Date(r[field]).toLocaleString("es-MX", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+  return (
+    <Modal title="Información del mensaje" width="max-w-sm" onClose={onClose}>
+      <p className="mb-3 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600">
+        Enviado {new Date(message.createdAt).toLocaleString("es-MX", { day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" })}
+      </p>
+      {rows === null ? (
+        <p className="text-xs text-slate-400">Cargando…</p>
+      ) : (
+        <div className="space-y-3">
+          {section("Visto por", read, CheckCheck, "readAt")}
+          {section("Recibido por", delivered, CheckCheck, "deliveredAt")}
+          {section("Aún no lo recibe", waiting, Check, null)}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function ForwardModal({ message, currentChannelId, onClose }) {
+  const inbox = useInbox();
+  const { profile } = useAuth();
+  const { showToast } = useToast();
+  const [selected, setSelected] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const channels = inbox?.channels ?? [];
+  const title = (c) => (c.kind === "general" ? "General" : c.kind === "direct" ? c.otherUserName || "Conversación" : c.name || "Grupo");
+
+  async function send() {
+    setBusy(true);
+    let failed = 0;
+    for (const channelId of selected) {
+      try {
+        let attachment = null;
+        if (message.attachment?.path) {
+          const ext = message.attachment.path.split(".").pop();
+          const path = `${profile.companyId}/${channelId}/${crypto.randomUUID()}.${ext}`;
+          const { error } = await supabase.storage.from("chat").copy(message.attachment.path, path);
+          if (error) throw error;
+          attachment = { ...message.attachment, path };
+        }
+        const { error } = await supabase.from("chat_messages").insert({ channelId, body: message.body || "", kind: message.kind || "text", attachment, forwarded: true });
+        if (error) throw error;
+      } catch {
+        failed += 1;
+      }
+    }
+    setBusy(false);
+    inbox?.reloadChannels();
+    showToast(failed ? `No se pudo reenviar a ${failed} conversación(es).` : "Mensaje reenviado.");
+    onClose();
+  }
+
+  return (
+    <Modal title="Reenviar a…" width="max-w-sm" onClose={onClose}>
+      <div className="max-h-[55vh] space-y-1 overflow-y-auto">
+        {channels
+          .filter((c) => c.id !== currentChannelId)
+          .map((c) => (
+            <label key={c.id} className="flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-2 hover:bg-slate-50">
+              <input type="checkbox" checked={selected.includes(c.id)} onChange={() => setSelected((prev) => (prev.includes(c.id) ? prev.filter((x) => x !== c.id) : [...prev, c.id]))} className="h-4 w-4 accent-blue-600" />
+              <span className="truncate text-sm text-slate-700">{title(c)}</span>
+            </label>
+          ))}
+        {channels.length <= 1 && <p className="py-6 text-center text-xs text-slate-400">No tienes otras conversaciones.</p>}
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+          Cancelar
+        </button>
+        <button type="button" onClick={send} disabled={!selected.length || busy} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
+          {busy ? "Reenviando…" : `Reenviar${selected.length ? ` (${selected.length})` : ""}`}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function ImageViewer({ url, onClose }) {
+  return (
+    <Modal title="Foto" width="max-w-3xl" onClose={onClose}>
+      <img src={url} alt="" className="max-h-[75vh] w-full rounded-xl object-contain" />
+    </Modal>
+  );
+}
+
+/* ---------- Stickers ---------- */
+
+// Lee los archivos de un .zip o .wastickers (paquete de stickers de WhatsApp)
+// sin librerías: el formato zip se recorre a mano y cada archivo se
+// descomprime con el navegador.
+async function readZip(file) {
+  const buffer = new Uint8Array(await file.arrayBuffer());
+  const view = new DataView(buffer.buffer);
+  let end = buffer.length - 22;
+  while (end >= 0 && view.getUint32(end, true) !== 0x06054b50) end -= 1;
+  if (end < 0) throw new Error("El paquete no es un .zip válido.");
+  const count = view.getUint16(end + 10, true);
+  let offset = view.getUint32(end + 16, true);
+  const files = [];
+  for (let i = 0; i < count && files.length < 60; i += 1) {
+    const method = view.getUint16(offset + 10, true);
+    const compressed = view.getUint32(offset + 20, true);
+    const nameLength = view.getUint16(offset + 28, true);
+    const extraLength = view.getUint16(offset + 30, true);
+    const commentLength = view.getUint16(offset + 32, true);
+    const local = view.getUint32(offset + 42, true);
+    const name = new TextDecoder().decode(buffer.subarray(offset + 46, offset + 46 + nameLength));
+    offset += 46 + nameLength + extraLength + commentLength;
+    if (!/\.(webp|png|gif)$/i.test(name) || /tray/i.test(name)) continue;
+    const start = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+    const data = buffer.subarray(start, start + compressed);
+    let bytes = data;
+    if (method === 8) bytes = new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
+    else if (method !== 0) continue;
+    const ext = name.split(".").pop().toLowerCase();
+    files.push(new File([bytes], name.split("/").pop(), { type: ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : "image/webp" }));
+  }
+  return files;
+}
+
+// Un sticker de WhatsApp: 512×512 en WEBP, de menos de 100 KB.
+async function toWhatsAppSticker(blob, size = 512, type = "image/webp", maxBytes = 100 * 1024) {
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const scale = Math.min(size / bitmap.width, size / bitmap.height);
+  const w = bitmap.width * scale;
+  const h = bitmap.height * scale;
+  ctx.drawImage(bitmap, (size - w) / 2, (size - h) / 2, w, h);
+  bitmap.close?.();
+  let quality = 0.9;
+  let out = null;
+  do {
+    out = await new Promise((resolve) => canvas.toBlob(resolve, type, quality));
+    quality -= 0.15;
+  } while (out && out.size > maxBytes && quality > 0.2);
+  return out;
+}
+
+const toBase64 = (blob) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+
+function StickerThumb({ sticker, onClick }) {
+  const url = useMediaUrl(sticker.path);
+  return (
+    <button type="button" onClick={onClick} className="flex h-16 w-16 items-center justify-center rounded-xl hover:bg-slate-100">
+      {url ? <img src={url} alt="" className="max-h-14 max-w-14 object-contain" draggable={false} /> : <span className="h-12 w-12 animate-pulse rounded-lg bg-slate-100" />}
+    </button>
+  );
+}
+
+function StickerPanel({ onSend, onClose }) {
+  const { user, profile } = useAuth();
+  const { showToast } = useToast();
+  const [stickers, setStickers] = useState(null);
+  const [busy, setBusy] = useState("");
+  const [pack, setPack] = useState(null);
+  const fileRef = useRef(null);
+
+  const load = useCallback(async () => {
+    const { data } = await supabase.from("chat_stickers").select("*").order("id", { ascending: false }).limit(300);
+    setStickers(data ?? []);
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const packs = [...new Set((stickers ?? []).map((s) => s.pack))];
+  const currentPack = pack ?? packs[0] ?? null;
+  const shown = (stickers ?? []).filter((s) => s.pack === currentPack);
+
+  async function importFiles(fileList) {
+    const picked = [...fileList];
+    if (!picked.length) return;
+    setBusy("Importando stickers…");
+    let images = [];
+    let packName = "Mis stickers";
+    try {
+      for (const file of picked) {
+        if (/\.(zip|wastickers)$/i.test(file.name)) {
+          images = images.concat(await readZip(file));
+          packName = file.name.replace(/\.(zip|wastickers)$/i, "").slice(0, 60) || packName;
+        } else if (/^image\/(webp|png|gif)$/.test(file.type) || /\.(webp|png|gif)$/i.test(file.name)) {
+          images.push(file);
+        }
+      }
+      let added = 0;
+      for (const image of images.slice(0, 60)) {
+        const blob = image.size > 500 * 1024 || image.type === "image/png" ? await toWhatsAppSticker(image) : image;
+        const file = new File([blob], "sticker.webp", { type: blob.type || "image/webp" });
+        const { path } = await uploadChatFile(file, profile.companyId, `stickers/${user.id}`);
+        const { error } = await supabase.from("chat_stickers").insert({ path, pack: packName });
+        if (!error) added += 1;
+      }
+      showToast(added ? `Se importaron ${added} stickers.` : "No se encontraron stickers en esos archivos.");
+      setPack(packName);
+      await load();
+    } catch (err) {
+      showToast(`No se pudieron importar: ${err.message}`);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  // App Android: el paquete pasa directo a WhatsApp.
+  async function exportToWhatsApp() {
+    const plugin = window.Capacitor?.Plugins?.WhatsAppStickers;
+    if (!plugin) {
+      showToast("Para mandarlos a WhatsApp, abre Navio desde la app de Android (versión 1.0.5 o más nueva).");
+      return;
+    }
+    if (shown.length < 3) {
+      showToast("WhatsApp pide al menos 3 stickers por paquete.");
+      return;
+    }
+    setBusy("Preparando el paquete para WhatsApp…");
+    try {
+      const files = [];
+      for (const s of shown.slice(0, 30)) {
+        const { data, error } = await supabase.storage.from("chat").download(s.path);
+        if (error) throw error;
+        files.push(await toBase64(await toWhatsAppSticker(data)));
+      }
+      const { data: first } = await supabase.storage.from("chat").download(shown[0].path);
+      const tray = await toBase64(await toWhatsAppSticker(first, 96, "image/png", 50 * 1024));
+      await plugin.addPack({ identifier: `navio_${String(currentPack).toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 30)}`, name: currentPack, publisher: "Navio", trayImage: tray, stickers: files });
+    } catch (err) {
+      showToast(`No se pudo enviar a WhatsApp: ${err.message}`);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function removeSticker(sticker) {
+    await supabase.from("chat_stickers").delete().eq("id", sticker.id);
+    supabase.storage.from("chat").remove([sticker.path]).catch(() => {});
+    load();
+  }
+
+  return (
+    <div className="border-t border-slate-100 bg-white p-2.5">
+      <div className="mb-2 flex items-center gap-2">
+        <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
+          {packs.map((p) => (
+            <button key={p} type="button" onClick={() => setPack(p)} className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${p === currentPack ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600"}`}>
+              {p}
+            </button>
+          ))}
+        </div>
+        <button type="button" onClick={() => fileRef.current?.click()} className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+          <Upload size={12} /> Importar
+        </button>
+        {isNativeApp() && shown.length >= 3 && (
+          <button type="button" onClick={exportToWhatsApp} className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-emerald-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-emerald-700">
+            Agregar a WhatsApp
+          </button>
+        )}
+        <button type="button" onClick={onClose} aria-label="Cerrar stickers" className="shrink-0 rounded-lg p-1 text-slate-400 hover:bg-slate-100">
+          <X size={15} />
+        </button>
+        <input ref={fileRef} type="file" multiple accept=".webp,.png,.gif,.zip,.wastickers,image/webp,image/png,image/gif" className="hidden" onChange={(e) => importFiles(e.target.files).finally(() => (e.target.value = ""))} />
+      </div>
+      {busy && <p className="py-2 text-center text-[11px] text-slate-500">{busy}</p>}
+      {stickers === null ? (
+        <p className="py-4 text-center text-xs text-slate-400">Cargando…</p>
+      ) : shown.length === 0 ? (
+        <p className="py-4 text-center text-[11px] leading-relaxed text-slate-400">
+          Importa tus stickers: los de WhatsApp están en el teléfono en la carpeta <b>WhatsApp/Media/WhatsApp Stickers</b> (archivos .webp), o usa un paquete .wastickers.
+        </p>
+      ) : (
+        <div className="grid max-h-52 grid-cols-5 gap-1 overflow-y-auto sm:grid-cols-8">
+          {shown.map((s) => (
+            <div key={s.id} className="group relative">
+              <StickerThumb sticker={s} onClick={() => onSend(s)} />
+              <button type="button" onClick={() => removeSticker(s)} aria-label="Quitar sticker" className="absolute right-0 top-0 hidden rounded-full bg-white p-0.5 text-slate-400 shadow group-hover:block">
+                <X size={10} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {!isNativeApp() && shown.length > 0 && <p className="mt-1 text-[10px] text-slate-400">Para pasar este paquete a WhatsApp, ábrelo desde la app Navio para Android.</p>}
+    </div>
+  );
+}
+
+/* ---------- Notas de voz ---------- */
+
+function VoiceRecorder({ onDone, onCancel }) {
+  const [seconds, setSeconds] = useState(0);
+  const [error, setError] = useState("");
+  const recorder = useRef(null);
+  const chunks = useRef([]);
+  const started = useRef(0);
+  const cancelled = useRef(false);
+
+  useEffect(() => {
+    let stream;
+    let timer;
+    (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const type = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"].find((t) => window.MediaRecorder?.isTypeSupported?.(t)) ?? "";
+        const rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+        recorder.current = rec;
+        rec.ondataavailable = (e) => e.data.size && chunks.current.push(e.data);
+        rec.onstop = () => {
+          stream.getTracks().forEach((t) => t.stop());
+          if (cancelled.current) return;
+          const mime = (rec.mimeType || type || "audio/webm").split(";")[0];
+          onDone(new Blob(chunks.current, { type: mime }), (Date.now() - started.current) / 1000);
+        };
+        started.current = Date.now();
+        rec.start(250);
+        timer = window.setInterval(() => setSeconds(Math.floor((Date.now() - started.current) / 1000)), 250);
+      } catch {
+        setError("Navio no tiene permiso de usar el micrófono. Actívalo en los ajustes del navegador o del teléfono.");
+      }
+    })();
+    return () => {
+      window.clearInterval(timer);
+      if (recorder.current?.state === "recording") {
+        cancelled.current = true;
+        recorder.current.stop();
+      }
+      stream?.getTracks().forEach((t) => t.stop());
+    };
+    // Solo al abrir.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Más de 5 minutos: se envía sola.
+  useEffect(() => {
+    if (seconds >= 300 && recorder.current?.state === "recording") recorder.current.stop();
+  }, [seconds]);
+
+  if (error) {
+    return (
+      <div className="flex flex-1 items-center gap-2 text-[11px] text-rose-600">
+        <span className="flex-1">{error}</span>
+        <button type="button" onClick={onCancel} className="rounded-lg px-2 py-1 font-semibold text-slate-500 hover:bg-slate-100">
+          Cerrar
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-1 items-center gap-2">
+      <button
+        type="button"
+        onClick={() => {
+          cancelled.current = true;
+          recorder.current?.stop();
+          onCancel();
+        }}
+        aria-label="Cancelar nota de voz"
+        className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl text-rose-500 hover:bg-rose-50"
+      >
+        <Trash2 size={17} />
+      </button>
+      <span className="flex flex-1 items-center gap-2 rounded-xl bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-600">
+        <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-500" /> Grabando {durationLabel(seconds)}
+      </span>
+      <button type="button" onClick={() => recorder.current?.stop()} aria-label="Enviar nota de voz" className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700">
+        <Send size={15} />
+      </button>
+    </div>
+  );
+}
+
+/* ---------- La conversación ---------- */
+
+export function ChatConversation({ channel, isAdmin, onBack, header }) {
+  const { user, profile } = useAuth();
+  const inbox = useInbox();
+  const { showToast } = useToast();
+  const [messages, setMessages] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [reactions, setReactions] = useState([]);
+  const [hidden, setHidden] = useState(() => new Set());
+  const [stars, setStars] = useState(() => new Set());
+  const [pinned, setPinned] = useState([]);
+  const [receipts, setReceipts] = useState(null);
+  const [advanced, setAdvanced] = useState(true); // false si falta la migración v25
+  const [draft, setDraft] = useState("");
+  const [replyTo, setReplyTo] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [menuFor, setMenuFor] = useState(null);
+  const [infoFor, setInfoFor] = useState(null);
+  const [forwardFor, setForwardFor] = useState(null);
+  const [viewer, setViewer] = useState(null);
+  const [translations, setTranslations] = useState({});
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [stickersOpen, setStickersOpen] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [uploading, setUploading] = useState("");
+  const [onlyStarred, setOnlyStarred] = useState(false);
+  const [highlight, setHighlight] = useState(null);
+  const scrollRef = useRef(null);
+  const stickRef = useRef(true);
+  const galleryRef = useRef(null);
+  const cameraRef = useRef(null);
+  const docRef = useRef(null);
+  const channelId = channel.id;
+
+  const loadMessages = useCallback(
+    async (beforeId = null) => {
+      let query = supabase.from("chat_messages").select("*").eq("channelId", channelId).order("id", { ascending: false }).limit(PAGE_SIZE);
+      if (beforeId) query = query.lt("id", beforeId);
+      const { data } = await query;
+      const page = (data ?? []).slice().reverse();
+      setHasMore(page.length === PAGE_SIZE);
+      setMessages((prev) => (beforeId ? [...page, ...(prev ?? [])] : page));
+    },
+    [channelId]
+  );
+
+  const loadExtras = useCallback(async () => {
+    const [r, h, s, p] = await Promise.all([
+      supabase.from("chat_reactions").select("*").eq("channelId", channelId).limit(3000),
+      supabase.from("chat_hidden").select("messageId").limit(3000),
+      supabase.from("chat_stars").select("messageId").eq("channelId", channelId).limit(1000),
+      supabase.from("chat_messages").select("*").eq("channelId", channelId).not("pinnedAt", "is", null).order("pinnedAt", { ascending: false }).limit(3),
+    ]);
+    if (r.error) {
+      setAdvanced(false);
+      return;
+    }
+    setReactions(r.data ?? []);
+    setHidden(new Set((h.data ?? []).map((x) => x.messageId)));
+    setStars(new Set((s.data ?? []).map((x) => x.messageId)));
+    setPinned(p.data ?? []);
+  }, [channelId]);
+
+  const loadReceipts = useCallback(async () => {
+    const { data, error } = await supabase.rpc("channel_receipts", { target_channel: channelId });
+    if (!error) setReceipts(Array.isArray(data) ? data[0] : data);
+  }, [channelId]);
+
+  useEffect(() => {
+    setMessages(null);
+    setDraft("");
+    setReplyTo(null);
+    setEditing(null);
+    stickRef.current = true;
+    loadMessages();
+    loadExtras();
+    loadReceipts();
+    inbox.markChannelRead(channelId);
+    const off = inbox.subscribeMessages((payload) => {
+      const table = payload.table ?? "chat_messages";
+      const row = payload.new ?? payload.old;
+      if (table === "chat_reactions") {
+        if (row?.channelId !== channelId) return;
+        setReactions((prev) => {
+          const rest = prev.filter((x) => !(x.messageId === row.messageId && x.userId === row.userId));
+          return payload.eventType === "DELETE" ? rest : [...rest, payload.new];
+        });
+        return;
+      }
+      if (table === "chat_members") {
+        if (row?.channelId === channelId || channel.kind === "general") loadReceipts();
+        return;
+      }
+      if (!row || row.channelId !== channelId) return;
+      setMessages((prev) => {
+        if (!prev) return prev;
+        if (payload.eventType === "INSERT") return prev.some((m) => m.id === row.id) ? prev : [...prev.filter((m) => !(m.pending && m.body === row.body && row.senderId === user?.id)), row];
+        return prev.map((m) => (m.id === row.id ? row : m));
+      });
+      if (payload.eventType === "UPDATE") {
+        setPinned((prev) => {
+          const rest = prev.filter((m) => m.id !== row.id);
+          return row.pinnedAt ? [row, ...rest].slice(0, 3) : rest;
+        });
+      }
+      if (payload.eventType === "INSERT" && row.senderId !== user?.id) inbox.markChannelRead(channelId);
+    });
+    const poll = window.setInterval(loadReceipts, 20000);
+    return () => {
+      off();
+      window.clearInterval(poll);
+    };
+    // "inbox" cambia con cada mensaje; solo interesa la conversación abierta.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channelId, loadMessages, loadExtras, loadReceipts]);
+
+  useEffect(() => {
+    const box = scrollRef.current;
+    if (box && stickRef.current) box.scrollTop = box.scrollHeight;
+  }, [messages, stickersOpen]);
+
+  const byId = useMemo(() => new Map((messages ?? []).map((m) => [m.id, m])), [messages]);
+  const reactionsBy = useMemo(() => {
+    const map = new Map();
+    for (const r of reactions) map.set(r.messageId, [...(map.get(r.messageId) ?? []), r]);
+    return map;
+  }, [reactions]);
+
+  function jumpTo(id) {
+    const el = document.getElementById(`msg-${id}`);
+    if (!el) {
+      showToast("Ese mensaje es más antiguo: carga los anteriores para verlo.");
+      return;
+    }
+    stickRef.current = false;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlight(id);
+    window.setTimeout(() => setHighlight(null), 1600);
+  }
+
+  async function insertMessage(row) {
+    stickRef.current = true;
+    const temp = { id: `tmp-${crypto.randomUUID()}`, channelId, senderId: user?.id, senderName: "", createdAt: new Date().toISOString(), pending: true, kind: "text", ...row };
+    setMessages((prev) => [...(prev ?? []), temp]);
+    const payload = advanced ? row : { channelId, body: row.body };
+    const { data, error } = await supabase.from("chat_messages").insert({ channelId, ...payload }).select().single();
+    if (error) {
+      setMessages((prev) => (prev ?? []).filter((m) => m.id !== temp.id));
+      showToast(`No se pudo enviar: ${error.message}`);
+      return false;
+    }
+    setMessages((prev) => {
+      const rest = (prev ?? []).filter((m) => m.id !== temp.id);
+      return rest.some((m) => m.id === data.id) ? rest : [...rest, data];
+    });
+    inbox.reloadChannels();
+    return true;
+  }
+
+  async function send() {
+    const body = draft.trim();
+    if (!body) return;
+    if (editing) {
+      const { error } = await supabase.rpc("edit_chat_message", { target_message: editing.id, new_body: body });
+      if (error) showToast(error.message);
+      else {
+        setMessages((prev) => prev.map((m) => (m.id === editing.id ? { ...m, body, editedAt: new Date().toISOString() } : m)));
+        setEditing(null);
+        setDraft("");
+      }
+      return;
+    }
+    setDraft("");
+    const reply = replyTo;
+    setReplyTo(null);
+    const ok = await insertMessage({ body, kind: "text", ...(reply ? { replyToId: reply.id } : {}) });
+    if (!ok) setDraft(body);
+  }
+
+  async function sendFile(file, kindOverride = null, extra = {}) {
+    setAttachOpen(false);
+    setUploading(`Enviando ${file.name || "archivo"}…`);
+    try {
+      const { path, mime } = await uploadChatFile(file, profile.companyId, channelId);
+      const kind = kindOverride ?? (mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : "file");
+      const dims = kind === "image" ? await imageSize(file) : {};
+      const reply = replyTo;
+      setReplyTo(null);
+      const caption = draft.trim();
+      if (caption && kind !== "voice") setDraft("");
+      await insertMessage({ body: kind === "voice" ? "" : caption, kind, attachment: { path, name: file.name || null, mime, size: file.size, ...dims, ...extra }, ...(reply ? { replyToId: reply.id } : {}) });
+    } catch (err) {
+      showToast(/bucket|not found|policy|row-level/i.test(err.message) ? "Los archivos del chat se activan al aplicar la actualización v25 de la base de datos." : `No se pudo enviar: ${err.message}`);
+    } finally {
+      setUploading("");
+    }
+  }
+
+  async function sendSticker(sticker) {
+    setStickersOpen(false);
+    const path = `${profile.companyId}/${channelId}/${crypto.randomUUID()}.${sticker.path.split(".").pop()}`;
+    const { error } = await supabase.storage.from("chat").copy(sticker.path, path);
+    if (error) {
+      showToast(`No se pudo enviar el sticker: ${error.message}`);
+      return;
+    }
+    await insertMessage({ body: "", kind: "sticker", attachment: { path, mime: "image/webp" } });
+  }
+
+  async function toggleReaction(message, emoji) {
+    if (!emoji) {
+      setReactions((prev) => prev.filter((r) => !(r.messageId === message.id && r.userId === user?.id)));
+      await supabase.from("chat_reactions").delete().eq("messageId", message.id).eq("userId", user?.id);
+      return;
+    }
+    const mine = { messageId: message.id, userId: user?.id, channelId, emoji, userName: "Tú" };
+    setReactions((prev) => [...prev.filter((r) => !(r.messageId === message.id && r.userId === user?.id)), mine]);
+    const { error } = await supabase.from("chat_reactions").upsert({ messageId: message.id, emoji }, { onConflict: "messageId,userId" });
+    if (error) showToast(`No se pudo reaccionar: ${error.message}`);
+  }
+
+  async function onAction(action) {
+    const message = menuFor;
+    setMenuFor(null);
+    if (!message) return;
+    if (action.startsWith("react:")) return toggleReaction(message, action.slice(6));
+    if (action === "reply") {
+      setEditing(null);
+      setReplyTo(message);
+    } else if (action === "copy") {
+      navigator.clipboard?.writeText(message.body ?? "");
+      showToast("Copiado.");
+    } else if (action === "forward") setForwardFor(message);
+    else if (action === "edit") {
+      setReplyTo(null);
+      setEditing(message);
+      setDraft(message.body ?? "");
+    } else if (action === "pin" || action === "unpin") {
+      const { error } = await supabase.rpc("pin_chat_message", { target_message: message.id, pin: action === "pin" });
+      if (error) showToast(error.message);
+      else loadExtras();
+    } else if (action === "star" || action === "unstar") {
+      const next = new Set(stars);
+      if (action === "star") {
+        next.add(message.id);
+        await supabase.from("chat_stars").insert({ messageId: message.id });
+      } else {
+        next.delete(message.id);
+        await supabase.from("chat_stars").delete().eq("messageId", message.id);
+      }
+      setStars(next);
+    } else if (action === "info") setInfoFor(message);
+    else if (action === "translate") {
+      setTranslations((prev) => ({ ...prev, [message.id]: "Traduciendo…" }));
+      const { data, error } = await supabase.functions.invoke("translate", { body: { text: message.body } });
+      setTranslations((prev) => ({ ...prev, [message.id]: error || !data?.translation ? "No se pudo traducir. (La traducción se activa al publicar la función translate en Supabase.)" : data.translation }));
+    } else if (action === "hide") {
+      setHidden((prev) => new Set([...prev, message.id]));
+      const { error } = await supabase.from("chat_hidden").insert({ messageId: message.id });
+      if (error) showToast(`No se pudo borrar: ${error.message}`);
+    } else if (action === "delete") {
+      const { error } = await supabase.rpc("delete_chat_message", { target_message: message.id });
+      if (error) showToast(`No se pudo borrar: ${error.message}`);
+      else {
+        if (message.attachment?.path) supabase.storage.from("chat").remove([message.attachment.path]).catch(() => {});
+        setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, body: "", attachment: null, deletedAt: new Date().toISOString() } : m)));
+      }
+    }
+    return undefined;
+  }
+
+  const visible = (messages ?? []).filter((m) => !hidden.has(m.id) && (!onlyStarred || stars.has(m.id)));
+  let lastDay = null;
+  const menuMessage = menuFor;
+  const menuMine = menuMessage?.senderId === user?.id;
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center gap-2 border-b border-slate-100 px-3 py-2">
+        {onBack && (
+          <button type="button" onClick={onBack} aria-label="Volver a las conversaciones" className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 lg:hidden">
+            <ArrowLeft size={16} />
+          </button>
+        )}
+        <div className="min-w-0 flex-1">{header}</div>
+        {advanced && (
+          <button type="button" onClick={() => setOnlyStarred((v) => !v)} aria-pressed={onlyStarred} title="Ver solo destacados" className={`flex h-8 w-8 items-center justify-center rounded-lg ${onlyStarred ? "bg-amber-50 text-amber-600" : "text-slate-400 hover:bg-slate-100"}`}>
+            <Star size={15} className={onlyStarred ? "fill-current" : ""} />
+          </button>
+        )}
+      </div>
+
+      {pinned.length > 0 && !onlyStarred && (
+        <div className="space-y-0.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5">
+          {pinned.map((m) => (
+            <button key={m.id} type="button" onClick={() => jumpTo(m.id)} className="flex w-full items-center gap-1.5 text-left text-[11px] text-slate-600">
+              <Pin size={11} className="shrink-0 text-blue-600" />
+              <span className="truncate">
+                <b>{m.senderName}:</b> {previewText(m.kind, m.body) || "Mensaje"}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div
+        ref={scrollRef}
+        onScroll={(e) => {
+          const box = e.currentTarget;
+          stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+        }}
+        className="min-h-0 flex-1 space-y-1.5 overflow-y-auto bg-slate-50/60 px-3 py-3"
+      >
+        {messages === null && <p className="py-8 text-center text-xs text-slate-400">Cargando mensajes…</p>}
+        {hasMore && !onlyStarred && (
+          <button
+            type="button"
+            onClick={() => {
+              stickRef.current = false;
+              loadMessages(messages[0].id);
+            }}
+            className="mx-auto block rounded-full bg-white px-3 py-1 text-[11px] font-semibold text-blue-600 shadow-sm"
+          >
+            Cargar mensajes anteriores
+          </button>
+        )}
+        {messages?.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Todavía no hay mensajes. Escribe el primero.</p>}
+        {onlyStarred && visible.length === 0 && <p className="py-8 text-center text-xs text-slate-400">No hay mensajes destacados en esta conversación.</p>}
+        {visible.map((m) => {
+          const mine = m.senderId === user?.id;
+          const day = dayLabel(m.createdAt);
+          const showDay = day !== lastDay;
+          lastDay = day;
+          return (
+            <div key={m.id}>
+              {showDay && <p className="py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-400">{day}</p>}
+              <Bubble
+                message={m}
+                mine={mine}
+                showSender={channel.kind !== "direct"}
+                reply={m.replyToId ? byId.get(m.replyToId) ?? { senderName: "Mensaje anterior", body: "", kind: "text" } : null}
+                reactions={reactionsBy.get(m.id) ?? []}
+                starred={stars.has(m.id)}
+                receipts={receipts}
+                translation={translations[m.id]}
+                highlighted={highlight === m.id}
+                onMenu={(msg) => !msg.pending && setMenuFor(msg)}
+                onJump={jumpTo}
+                onOpenImage={setViewer}
+                onToggleReaction={toggleReaction}
+                userId={user?.id}
+              />
+            </div>
+          );
+        })}
+      </div>
+
+      {(replyTo || editing) && (
+        <div className="flex items-center gap-2 border-t border-slate-100 bg-white px-3 py-2">
+          <div className="min-w-0 flex-1 border-l-4 border-blue-500 pl-2">
+            <p className="text-[10px] font-bold text-blue-600">{editing ? "Editando mensaje" : `Respondiendo a ${replyTo.senderName || "mensaje"}`}</p>
+            <p className="truncate text-[11px] text-slate-500">{previewText((editing ?? replyTo).kind, (editing ?? replyTo).body)}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setReplyTo(null);
+              if (editing) setDraft("");
+              setEditing(null);
+            }}
+            aria-label="Cancelar"
+            className="rounded-lg p-1 text-slate-400 hover:bg-slate-100"
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
+      {uploading && <p className="border-t border-slate-100 bg-white px-3 py-1.5 text-[11px] text-slate-500">{uploading}</p>}
+      {stickersOpen && <StickerPanel onSend={sendSticker} onClose={() => setStickersOpen(false)} />}
+      {attachOpen && (
+        <div className="grid grid-cols-4 gap-2 border-t border-slate-100 bg-white p-3">
+          {[
+            { label: "Galería", icon: ImageIcon, tone: "bg-violet-50 text-violet-600", go: () => galleryRef.current?.click() },
+            { label: "Cámara", icon: Camera, tone: "bg-rose-50 text-rose-600", go: () => cameraRef.current?.click() },
+            { label: "Documento", icon: FileText, tone: "bg-blue-50 text-blue-600", go: () => docRef.current?.click() },
+            {
+              label: "Stickers",
+              icon: Sticker,
+              tone: "bg-amber-50 text-amber-600",
+              go: () => {
+                setAttachOpen(false);
+                setStickersOpen(true);
+              },
+            },
+          ].map((o) => {
+            const Icon = o.icon;
+            return (
+              <button key={o.label} type="button" onClick={o.go} className="flex flex-col items-center gap-1 rounded-xl p-2 hover:bg-slate-50">
+                <span className={`flex h-11 w-11 items-center justify-center rounded-2xl ${o.tone}`}>
+                  <Icon size={19} />
+                </span>
+                <span className="text-[11px] font-medium text-slate-600">{o.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <input ref={galleryRef} type="file" accept="image/*,video/*" className="hidden" onChange={(e) => [...e.target.files].slice(0, 10).reduce((p, f) => p.then(() => sendFile(f)), Promise.resolve()).finally(() => (e.target.value = ""))} multiple />
+      <input ref={cameraRef} type="file" accept="image/*,video/*" capture="environment" className="hidden" onChange={(e) => e.target.files[0] && sendFile(e.target.files[0]).finally(() => (e.target.value = ""))} />
+      <input
+        ref={docRef}
+        type="file"
+        accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,application/pdf"
+        className="hidden"
+        onChange={(e) => e.target.files[0] && sendFile(e.target.files[0], "file").finally(() => (e.target.value = ""))}
+      />
+
+      <div className="flex items-end gap-2 border-t border-slate-100 bg-white p-2.5">
+        {recording ? (
+          <VoiceRecorder
+            onCancel={() => setRecording(false)}
+            onDone={(blob, seconds) => {
+              setRecording(false);
+              const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
+              sendFile(new File([blob], `nota-de-voz.${ext}`, { type: blob.type }), "voice", { duration: Math.round(seconds * 10) / 10 });
+            }}
+          />
+        ) : (
+          <>
+            {advanced && !editing && (
+              <button
+                type="button"
+                onClick={() => {
+                  setStickersOpen(false);
+                  setAttachOpen((v) => !v);
+                }}
+                aria-label="Adjuntar"
+                aria-expanded={attachOpen}
+                className={`flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl transition ${attachOpen ? "rotate-45 bg-slate-100 text-slate-700" : "text-slate-500 hover:bg-slate-100"}`}
+              >
+                <Plus size={19} />
+              </button>
+            )}
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+              rows={1}
+              maxLength={4000}
+              placeholder={editing ? "Edita tu mensaje…" : "Escribe un mensaje…"}
+              aria-label="Mensaje"
+              className="max-h-32 min-h-[38px] flex-1 resize-none rounded-xl border border-slate-200 px-3 py-2 text-xs focus:border-blue-400 focus:outline-none"
+            />
+            {draft.trim() || editing || !advanced ? (
+              <button type="button" onClick={send} disabled={!draft.trim()} aria-label={editing ? "Guardar cambios" : "Enviar"} className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40">
+                {editing ? <Check size={16} /> : <Send size={15} />}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  setAttachOpen(false);
+                  setStickersOpen(false);
+                  setRecording(true);
+                }}
+                aria-label="Grabar nota de voz"
+                className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700"
+              >
+                <Mic size={16} />
+              </button>
+            )}
+          </>
+        )}
+      </div>
+
+      {menuMessage && (
+        <ActionSheet
+          message={menuMessage}
+          mine={menuMine}
+          advanced={advanced}
+          starred={stars.has(menuMessage.id)}
+          canEdit={menuMine && advanced && !["voice", "sticker"].includes(menuMessage.kind) && Date.now() - time(menuMessage.createdAt) < EDIT_WINDOW_MS}
+          canDeleteAll={menuMine || isAdmin}
+          onAction={onAction}
+          onClose={() => setMenuFor(null)}
+        />
+      )}
+      {infoFor && <InfoModal message={infoFor} onClose={() => setInfoFor(null)} />}
+      {forwardFor && <ForwardModal message={forwardFor} currentChannelId={channelId} onClose={() => setForwardFor(null)} />}
+      {viewer && <ImageViewer url={viewer} onClose={() => setViewer(null)} />}
+    </div>
+  );
+}

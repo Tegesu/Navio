@@ -10,6 +10,7 @@ import { AdminCompaniesPage } from "./admin.jsx";
 import { MobileAppShell } from "./mobile.jsx";
 import { AndroidAppDownload, AppsPage } from "./background.jsx";
 import { Sidebar as NavSidebar, UserMenu, resolveRoute, DEFAULT_SUB } from "./navigation.jsx";
+import { useHistorySync, useBackLayer } from "./history.js";
 import {
   MaintenanceSearchPage,
   ServiceDetailModal,
@@ -21,6 +22,7 @@ import {
   serviceProblem,
   presetMaintenanceSearch,
 } from "./maintenance.jsx";
+import { WorkOrdersPage, InvoiceProgress } from "./workorders.jsx";
 import { CookieNotice, LegalAcceptanceGate } from "./legal.jsx";
 import { HomePage } from "./home.jsx";
 import { FleetDataProvider, VehicleStatusChip, FleetStatusSummary, VehicleDocsTab, VehicleServiceTab, VehicleTiresTab, VehicleHistoryTab, VehicleLocationPanel, WarrantiesPanel, WarrantiesPage, MaintenanceUnitDetail } from "./vehicle.jsx";
@@ -299,7 +301,7 @@ function useToast() {
 function ToastHost({ toast, onDismiss }) {
   if (!toast) return null;
   return (
-    <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2">
+    <div className="toast-host fixed bottom-6 left-1/2 z-50 -translate-x-1/2">
       <div className="flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white shadow-xl">
         <CheckCircle2 size={14} className="text-emerald-400" />
         {toast}
@@ -699,6 +701,8 @@ function getComplianceWidgets(records) {
 /* ---------------------------------------------------------------------- */
 
 function Modal({ title, onClose, children, width = "max-w-md" }) {
+  // "Atrás" en el teléfono cierra la ventana en vez de salir de la app.
+  useBackLayer(true, onClose);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4" onClick={onClose}>
       <div className={`w-full ${width} rounded-2xl border border-slate-200 bg-white p-5 shadow-xl`} onClick={(e) => e.stopPropagation()}>
@@ -1639,13 +1643,14 @@ function buildOrders(invoices, workOrderRows = [], deadlineDays = getDeadlineDay
   const map = new Map();
   const ensure = (project, code) => {
     const key = `${project}\u0001${code}`;
-    if (!map.has(key)) map.set(key, { key, project, code, dueDate: null, createdAt: null, invoices: [] });
+    if (!map.has(key)) map.set(key, { key, project, code, dueDate: null, createdAt: null, invoices: [], row: null });
     return map.get(key);
   };
   for (const wo of workOrderRows) {
     const o = ensure((wo.project || "").trim(), wo.code);
     o.dueDate = wo.dueDate || null;
     o.createdAt = wo.createdAt || null;
+    o.row = wo;
   }
   for (const inv of invoices) {
     if (inv.workOrder && !isInvoiceClosed(inv)) ensure(inv.project, inv.workOrder).invoices.push(inv);
@@ -1670,7 +1675,35 @@ function buildOrders(invoices, workOrderRows = [], deadlineDays = getDeadlineDay
       deadline = candidates.sort()[0] ?? null;
       daysLeft = deadline ? daysFromToday(deadline) : null;
     }
-    return { ...o, createdAt: created[0] ?? null, missingDocs, pendingVerification, complete, deadline, daysLeft };
+    // Proceso para garantías (migración v25): carga → verificación → análisis → cerrada.
+    const row = o.row ?? {};
+    const stage =
+      row.analysisStatus === "done"
+        ? "closed"
+        : !row.invoicesComplete
+        ? "upload"
+        : pendingVerification || missingDocs
+        ? "verification"
+        : "analysis";
+    return {
+      ...o,
+      createdAt: created[0] ?? null,
+      missingDocs,
+      pendingVerification,
+      complete,
+      deadline,
+      daysLeft,
+      id: row.id ?? null,
+      assignedTo: row.assignedTo ?? null,
+      assignedToName: row.assignedToName ?? null,
+      invoicesComplete: !!row.invoicesComplete,
+      invoicesCompleteAt: row.invoicesCompleteAt ?? null,
+      invoicesCompleteByName: row.invoicesCompleteByName ?? null,
+      analysisStatus: row.analysisStatus ?? "open",
+      analysisNotes: row.analysisNotes ?? "",
+      analysisDoneAt: row.analysisDoneAt ?? null,
+      stage,
+    };
   });
 }
 
@@ -3820,7 +3853,18 @@ const INVOICE_COLUMNS = [
   importeColumn("propina", "Propina", (i) => i.propina),
   { id: "origin", label: "Origen", group: "General", render: (inv) => <OriginBadge origin={inv.origin} /> },
   { id: "user", label: "Usuario", group: "General", render: (inv) => orEmpty(inv.uploadedByName) },
-  { id: "status", label: "Estado", group: "General", render: (inv) => <StatusBadge status={inv.status} /> },
+  {
+    id: "status",
+    label: "Estado",
+    group: "General",
+    // La barra muestra en qué parte del proceso va: cargada → verificada → aprobada.
+    render: (inv) => (
+      <div className="space-y-1">
+        <StatusBadge status={inv.status} />
+        <InvoiceProgress invoice={inv} showLabel={false} />
+      </div>
+    ),
+  },
   {
     id: "approved",
     label: "Aprobado",
@@ -7974,8 +8018,28 @@ function NavioApp() {
   const activeTab = PAGE_META[routeTab] ? routeTab : "home";
   const activeSub = (routeTab === activeTab ? routeSub : undefined) ?? storedSubs?.[activeTab] ?? DEFAULT_SUB[activeTab];
   const [selectedVehicleId, setSelectedVehicleId] = useSessionState("navio.nav.vehicle", null);
+  // En el teléfono: pestaña de abajo y pantalla abierta encima.
+  const [mobileTab, setMobileTab] = useSessionState("navio.nav.mobileTab", "home");
+  const [mobileScreen, setMobileScreen] = useSessionState("navio.nav.mobileScreen", null);
+  // Botón de regreso: cada pantalla queda en el historial.
+  useHistorySync(
+    { t: activeTab, s: activeSub ?? null, v: selectedVehicleId ?? null, mt: mobileTab, ms: mobileScreen },
+    useCallback(
+      (snap) => {
+        setActiveTab(snap.t);
+        if (snap.s !== null) setStoredSubs((prev) => ({ ...(prev ?? {}), [snap.t]: snap.s }));
+        setSelectedVehicleId(snap.v);
+        setMobileTab(snap.mt);
+        setMobileScreen(snap.ms);
+      },
+      // Los "set" de React no cambian.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      []
+    )
+  );
   const [notifOpen, setNotifOpen] = useState(false);
   const [serviceDetail, setServiceDetail] = useState(null);
+  const [invoiceDetail, setInvoiceDetail] = useState(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [dateFormat, setDateFormat] = usePersistentState("navio.dateFormat", "DD/MM/AAAA");
@@ -8377,6 +8441,7 @@ function NavioApp() {
                       complianceRecords={complianceRecords}
                       invoices={invoices}
                       trips={trips}
+                      orders={invoiceOrders}
                       currency={profile?.company?.currency || "MXN"}
                       isAdmin={isCompanyAdmin}
                       onSelectVehicle={jumpToVehicle}
@@ -8439,7 +8504,9 @@ function NavioApp() {
                     </div>
                   )}
                   {activeTab === "warranties" &&
-                    (activeSub === "campaigns" ? (
+                    (activeSub === "orders" ? (
+                      <WorkOrdersPage orders={invoiceOrders} onChanged={refreshWorkOrders} onOpenInvoice={setInvoiceDetail} />
+                    ) : activeSub === "campaigns" ? (
                       <CampaignsPage
                         campaigns={campaigns}
                         records={maintenanceRecords}
@@ -8541,6 +8608,21 @@ function NavioApp() {
               onClose={() => setFormModal(null)}
             />
           )}
+          {invoiceDetail && (
+            <InvoiceDetailModal
+              invoice={invoiceDetail}
+              currency={profile?.company?.currency || "MXN"}
+              onEdit={
+                canReviewInvoices
+                  ? (inv) => {
+                      setInvoiceDetail(null);
+                      handleEditInvoice(inv);
+                    }
+                  : undefined
+              }
+              onClose={() => setInvoiceDetail(null)}
+            />
+          )}
           {serviceDetail && (
             <ServiceDetailModal
               record={maintenanceRecords.find((r) => r.id === serviceDetail.id) ?? serviceDetail}
@@ -8634,6 +8716,12 @@ function NavioApp() {
               onOpenRecordForm={(module) => setFormModal({ mode: "add", module, initial: null })}
               page={pageContent}
               pageTitle={headerTitle}
+              homeData={{ invoices, maintenanceRecords, complianceRecords, orders: invoiceOrders, currency: profile?.company?.currency || "MXN" }}
+              onAddInvoice={handleAddInvoice}
+              tab={mobileTab}
+              setTab={setMobileTab}
+              screen={mobileScreen}
+              setScreen={setMobileScreen}
               onGo={(tab, sub, vehicleId) => {
                 goToTab(tab, sub);
                 if (vehicleId) setSelectedVehicleId(vehicleId);

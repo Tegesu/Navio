@@ -20,6 +20,8 @@ import {
 } from "lucide-react";
 import { supabase, useAuth, useToast, useDateFormat, formatDate, Modal, avatarUrl, timeAgoLabel, localISODate } from "./NavioDashboard.jsx";
 import { usePeople, personName } from "./people.jsx";
+import { useBackLayer, goBack } from "./history.js";
+import { ChatConversation, previewText } from "./chat.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Bandeja: alertas, mensajes y tareas de la persona                     */
@@ -69,6 +71,13 @@ export function InboxProvider({ children }) {
     loadNotifications();
     loadTasks();
     supabase.rpc("ensure_general_channel").then(loadChannels);
+    // "Recibido": este equipo ya trajo los mensajes (para las palomitas).
+    let deliveredTimer = null;
+    const markDelivered = () => {
+      window.clearTimeout(deliveredTimer);
+      deliveredTimer = window.setTimeout(() => supabase.rpc("mark_channels_delivered").then(() => {}, () => {}), 800);
+    };
+    markDelivered();
 
     const refreshOverview = () => {
       window.clearTimeout(overviewTimer.current);
@@ -84,6 +93,13 @@ export function InboxProvider({ children }) {
       .on("postgres_changes", { event: "*", schema: "public", table: "chat_messages" }, (payload) => {
         messageListeners.current.forEach((listener) => listener(payload));
         refreshOverview();
+        if (payload.eventType === "INSERT" && payload.new?.senderId !== userId) markDelivered();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "chat_reactions" }, (payload) => {
+        messageListeners.current.forEach((listener) => listener(payload));
+      })
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "chat_members" }, (payload) => {
+        messageListeners.current.forEach((listener) => listener(payload));
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, loadTasks)
       .subscribe();
@@ -274,7 +290,7 @@ export function NotificationsPanel({ isAdmin, onNavigate, onClose }) {
   function open(notification) {
     inbox.markRead([notification.id]);
     if (notification.link?.tab) {
-      onNavigate(notification.link.tab);
+      onNavigate(notification.link.tab, notification.link.sub);
       onClose();
     }
   }
@@ -440,78 +456,14 @@ function NewConversationModal({ group = null, initialMode = "direct", onOpen, on
   );
 }
 
+// La conversación vive en chat.jsx; aquí va su encabezado (participantes,
+// salir del grupo) y la ventana para editar el grupo.
 function Conversation({ channel, isAdmin, onBack, onChanged }) {
   const { user } = useAuth();
   const inbox = useInbox();
   const { showToast } = useToast();
-  const [messages, setMessages] = useState(null);
-  const [hasMore, setHasMore] = useState(false);
-  const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
   const [editing, setEditing] = useState(null);
-  const scrollRef = useRef(null);
-  const stickRef = useRef(true);
   const channelId = channel.id;
-
-  const load = useCallback(
-    async (beforeId = null) => {
-      let query = supabase.from("chat_messages").select("*").eq("channelId", channelId).order("id", { ascending: false }).limit(PAGE_SIZE);
-      if (beforeId) query = query.lt("id", beforeId);
-      const { data } = await query;
-      const page = (data ?? []).slice().reverse();
-      setHasMore(page.length === PAGE_SIZE);
-      setMessages((prev) => (beforeId ? [...page, ...(prev ?? [])] : page));
-    },
-    [channelId]
-  );
-
-  useEffect(() => {
-    setMessages(null);
-    setDraft("");
-    stickRef.current = true;
-    load();
-    inbox.markChannelRead(channelId);
-    return inbox.subscribeMessages((payload) => {
-      const row = payload.new;
-      if (!row || row.channelId !== channelId) return;
-      setMessages((prev) => {
-        if (!prev) return prev;
-        if (payload.eventType === "INSERT") return prev.some((m) => m.id === row.id) ? prev : [...prev, row];
-        return prev.map((m) => (m.id === row.id ? row : m));
-      });
-      if (payload.eventType === "INSERT" && row.senderId !== user?.id) inbox.markChannelRead(channelId);
-    });
-    // "inbox" cambia con cada mensaje; solo interesa el canal abierto.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channelId, load]);
-
-  // Se queda abajo al llegar mensajes, salvo que la persona esté leyendo arriba.
-  useEffect(() => {
-    const box = scrollRef.current;
-    if (box && stickRef.current) box.scrollTop = box.scrollHeight;
-  }, [messages]);
-
-  async function send() {
-    const body = draft.trim();
-    if (!body || sending) return;
-    setSending(true);
-    stickRef.current = true;
-    const { data, error } = await supabase.from("chat_messages").insert({ channelId, body }).select().single();
-    setSending(false);
-    if (error) {
-      showToast(`No se pudo enviar: ${error.message}`);
-      return;
-    }
-    setDraft("");
-    setMessages((prev) => (prev && !prev.some((m) => m.id === data.id) ? [...prev, data] : prev));
-    inbox.reloadChannels();
-  }
-
-  async function removeMessage(message) {
-    const { error } = await supabase.rpc("delete_chat_message", { target_message: message.id });
-    if (error) showToast(`No se pudo borrar: ${error.message}`);
-    else setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, body: "", deletedAt: new Date().toISOString() } : m)));
-  }
 
   async function leave() {
     const { error } = await supabase.rpc("leave_channel", { target_channel: channelId });
@@ -525,108 +477,31 @@ function Conversation({ channel, isAdmin, onBack, onChanged }) {
   }
 
   const canManage = channel.kind === "group" && (channel.createdBy === user?.id || isAdmin);
-  let lastDay = null;
+  const header = (
+    <div className="flex items-center gap-2.5">
+      <ChannelAvatar channel={channel} />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-bold text-slate-800">{channelTitle(channel)}</p>
+        <p className="truncate text-[11px] text-slate-400">
+          {channel.kind === "general" ? `Toda la empresa · ${channel.members} personas` : channel.kind === "group" ? `${channel.members} participantes` : "Conversación directa"}
+        </p>
+      </div>
+      {canManage && (
+        <button onClick={editGroup} className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+          Participantes
+        </button>
+      )}
+      {channel.kind === "group" && channel.createdBy !== user?.id && (
+        <button onClick={leave} className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50">
+          Salir
+        </button>
+      )}
+    </div>
+  );
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2.5 border-b border-slate-100 px-3 py-2.5">
-        <button onClick={onBack} aria-label="Volver a las conversaciones" className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 lg:hidden">
-          <ArrowLeft size={16} />
-        </button>
-        <ChannelAvatar channel={channel} />
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-bold text-slate-800">{channelTitle(channel)}</p>
-          <p className="truncate text-[11px] text-slate-400">
-            {channel.kind === "general" ? `Toda la empresa · ${channel.members} personas` : channel.kind === "group" ? `${channel.members} participantes` : "Conversación directa"}
-          </p>
-        </div>
-        {canManage && (
-          <button onClick={editGroup} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
-            Participantes
-          </button>
-        )}
-        {channel.kind === "group" && channel.createdBy !== user?.id && (
-          <button onClick={leave} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50">
-            Salir
-          </button>
-        )}
-      </div>
-
-      <div
-        ref={scrollRef}
-        onScroll={(e) => {
-          const box = e.currentTarget;
-          stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-        }}
-        className="min-h-0 flex-1 space-y-1 overflow-y-auto bg-slate-50/60 px-3 py-3"
-      >
-        {messages === null && <p className="py-8 text-center text-xs text-slate-400">Cargando mensajes…</p>}
-        {hasMore && (
-          <button
-            onClick={() => {
-              stickRef.current = false;
-              load(messages[0].id);
-            }}
-            className="mx-auto block rounded-full bg-white px-3 py-1 text-[11px] font-semibold text-blue-600 shadow-sm"
-          >
-            Cargar mensajes anteriores
-          </button>
-        )}
-        {messages?.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Todavía no hay mensajes. Escribe el primero.</p>}
-        {messages?.map((m) => {
-          const mine = m.senderId === user?.id;
-          const day = dayLabel(m.createdAt);
-          const showDay = day !== lastDay;
-          lastDay = day;
-          return (
-            <div key={m.id}>
-              {showDay && <p className="py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-400">{day}</p>}
-              <div className={`group flex items-end gap-1.5 ${mine ? "justify-end" : "justify-start"}`}>
-                {mine && !m.deletedAt && (
-                  <button onClick={() => removeMessage(m)} aria-label="Borrar mensaje" className="rounded-md p-1 text-slate-300 opacity-0 hover:text-rose-500 focus:opacity-100 group-hover:opacity-100">
-                    <Trash2 size={12} />
-                  </button>
-                )}
-                <div className={`max-w-[78%] rounded-2xl px-3 py-1.5 ${mine ? "rounded-br-md bg-blue-600 text-white" : "rounded-bl-md bg-white text-slate-700 shadow-sm"}`}>
-                  {!mine && channel.kind !== "direct" && <p className="text-[10px] font-bold text-blue-600">{m.senderName || "Alguien"}</p>}
-                  {m.deletedAt ? (
-                    <p className={`text-xs italic ${mine ? "text-blue-100" : "text-slate-400"}`}>Mensaje borrado</p>
-                  ) : (
-                    <p className="whitespace-pre-wrap break-words text-xs leading-relaxed">{m.body}</p>
-                  )}
-                  <p className={`mt-0.5 text-right text-[9px] ${mine ? "text-blue-100" : "text-slate-400"}`}>{hourLabel(m.createdAt)}</p>
-                </div>
-                {!mine && isAdmin && !m.deletedAt && (
-                  <button onClick={() => removeMessage(m)} aria-label="Borrar mensaje" title="Borrar (administrador)" className="rounded-md p-1 text-slate-300 opacity-0 hover:text-rose-500 focus:opacity-100 group-hover:opacity-100">
-                    <Trash2 size={12} />
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="flex items-end gap-2 border-t border-slate-100 p-2.5">
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-            }
-          }}
-          rows={1}
-          maxLength={4000}
-          placeholder="Escribe un mensaje…"
-          aria-label="Mensaje"
-          className="max-h-32 min-h-[38px] flex-1 resize-none rounded-xl border border-slate-200 px-3 py-2 text-xs focus:border-blue-400 focus:outline-none"
-        />
-        <button onClick={send} disabled={!draft.trim() || sending} aria-label="Enviar" className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40">
-          <Send size={15} />
-        </button>
-      </div>
+    <>
+      <ChatConversation channel={channel} isAdmin={isAdmin} onBack={onBack} header={header} />
       {editing && (
         <NewConversationModal
           group={editing}
@@ -637,7 +512,7 @@ function Conversation({ channel, isAdmin, onBack, onChanged }) {
           onClose={() => setEditing(null)}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -680,6 +555,9 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
     setOpenId(channel.id);
     onOpenChannel?.(channel);
   };
+  // En pantalla angosta la conversación tapa la lista: "atrás" vuelve a ella.
+  const narrow = compact || (typeof window !== "undefined" && window.innerWidth < 1024);
+  useBackLayer(narrow && !!open, () => setOpenId(null));
 
   async function handleOpened(channelId) {
     setCreating(false);
@@ -722,7 +600,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
                   </span>
                   <span className="flex items-center justify-between gap-2">
                     <span className="truncate text-[11px] text-slate-400">
-                      {c.lastMessage ? `${c.kind !== "direct" && c.lastSender ? `${c.lastSender.split(" ")[0]}: ` : ""}${c.lastMessage}` : "Sin mensajes"}
+                      {c.lastMessage || c.lastKind ? `${c.kind !== "direct" && c.lastSender ? `${c.lastSender.split(" ")[0]}: ` : ""}${previewText(c.lastKind, c.lastMessage)}` : "Sin mensajes"}
                     </span>
                     <CountBadge count={c.unread} className="shrink-0" />
                   </span>
@@ -742,7 +620,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
               key={open.id}
               channel={open}
               isAdmin={isAdmin}
-              onBack={() => setOpenId(null)}
+              onBack={() => goBack(() => setOpenId(null))}
               onChanged={(id) => {
                 setOpenId(id);
                 inbox.reloadChannels();

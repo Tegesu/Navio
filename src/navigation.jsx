@@ -11,6 +11,7 @@ import {
   MessageSquare,
   Monitor,
   Moon,
+  Radio,
   Receipt,
   Settings,
   Shield,
@@ -26,6 +27,7 @@ import {
 import { useAuth, InvoiceSidebarMenu, BotFeedPanel } from "./NavioDashboard.jsx";
 import { useInbox, NavBadge } from "./inbox.jsx";
 import { useTheme, THEME_OPTIONS } from "./theme.js";
+import { useBackLayer } from "./history.js";
 
 /* ---------------------------------------------------------------------- */
 /*  Rutas de la app                                                       */
@@ -122,6 +124,7 @@ function buildTree({ groupChats }) {
           children: [
             { key: "w-campaigns", label: "Campañas", route: ["warranties", "campaigns"] },
             { key: "w-warranties", label: "Garantías", route: ["warranties", "warranties"] },
+            { key: "w-orders", label: "Órdenes de trabajo", route: ["warranties", "orders"] },
           ],
         },
         { key: "schedule", label: "Programación de mantenimiento", route: ["schedule"] },
@@ -286,6 +289,8 @@ export function Sidebar({ open, overlay, onClose, tab, sub, onGo, onLogoClick, i
   const tree = useMemo(() => buildTree({ groupChats }), [groupChats]);
   const selection = useMemo(() => findSelection([...tree, ...BOTTOM_ITEMS], tab, sub), [tree, tab, sub]);
   const [expanded, setExpanded] = useStoredExpanded();
+  // Con el menú encima de la página, "atrás" lo cierra.
+  useBackLayer(!!overlay && !!open, onClose);
   const [invoiceExpanded, setInvoiceExpanded] = useState({ invoiceGeneral: true, invoiceProjects: true });
   const toggle = (key, value) => setExpanded((prev) => ({ ...prev, [key]: value }));
   const go = (route) => {
@@ -408,6 +413,7 @@ export const SETTINGS_SECTIONS = [
   { id: "company", group: "Empresa", label: "Datos de la empresa", icon: Truck },
   { id: "team", group: "Empresa", label: "Equipo", icon: Users },
   { id: "bot", group: "Empresa", label: "Bot de Telegram", icon: Bot },
+  { id: "gps", group: "Empresa", label: "Dispositivos GPS", icon: Radio },
   { id: "audit", group: "Empresa", label: "Bitácora", icon: ClipboardList },
   { id: "preferences", group: "General", label: "Preferencias", icon: Settings },
   { id: "privacy", group: "General", label: "Privacidad", icon: Shield },

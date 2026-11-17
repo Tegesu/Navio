@@ -59,6 +59,11 @@ const db = {
   service_campaigns: [
     { id: 1, companyId: COMPANY, code: "CAMP-2026-04", title: "Revisión del sistema de frenos", manufacturer: "Kenworth", affectedUnits: "T680 2021–2023", description: "Cambiar la válvula del freno de servicio.", startDate: thisMonth(1), endDate: null, status: "active", documentUrl: null, createdBy: "u1", createdAt: ago(20) },
   ],
+  chat_reactions: [{ messageId: 3, userId: "u2", channelId: 2, emoji: "👍", userName: "Vania Usuario", createdAt: ago(5) }],
+  chat_hidden: [],
+  chat_stars: [],
+  chat_stickers: [],
+  gps_devices: [],
   task_comments: [
     { id: 1, taskId: 1, companyId: COMPANY, authorId: "u1", authorName: "Johana Viras", kind: "event", body: "Johana Viras creó la tarea y se la asignó a Vania Usuario.", createdAt: ago(4) },
     { id: 2, taskId: 1, companyId: COMPANY, authorId: "u2", authorName: "Vania Usuario", kind: "comment", body: "Ya pedí los comprobantes al proveedor.", createdAt: ago(3) },
@@ -179,6 +184,7 @@ function tableChain(table) {
     neq: (k, v) => { filters.push((r) => r[k] !== v); return chain; },
     in: (k, list) => { filters.push((r) => list.includes(r[k])); return chain; },
     is: (k, v) => { filters.push((r) => (r[k] ?? null) === v); return chain; },
+    not: (k, op, v) => { filters.push((r) => (op === "is" ? (r[k] ?? null) !== v : r[k] !== v)); return chain; },
     gt: (k, v) => { filters.push((r) => r[k] > v); return chain; },
     lt: (k, v) => { filters.push((r) => r[k] < v); return chain; },
     gte: (k, v) => { filters.push((r) => r[k] >= v); return chain; },
@@ -270,7 +276,7 @@ const rpcs = {
         const otherId = c.kind === "direct" ? db.chat_members.find((m) => m.channelId === c.id && m.userId !== ME)?.userId : null;
         return {
           id: c.id, kind: c.kind, name: c.name, createdBy: c.createdBy, otherUserId: otherId ?? null, otherUserName: db.profiles.find((p) => p.id === otherId)?.fullName ?? null,
-          lastMessageAt: c.lastMessageAt, lastMessage: last?.body ?? null, lastSender: last?.senderName ?? null,
+          lastMessageAt: c.lastMessageAt, lastMessage: last?.body ?? null, lastSender: last?.senderName ?? null, lastKind: last?.kind ?? "text",
           unread: msgs.filter((m) => m.senderId !== ME && m.createdAt > (mine?.lastReadAt ?? "")).length,
           members: c.kind === "general" ? db.profiles.length : db.chat_members.filter((m) => m.channelId === c.id).length,
         };
@@ -278,6 +284,34 @@ const rpcs = {
       .sort((a, b) => String(b.lastMessageAt ?? "").localeCompare(String(a.lastMessageAt ?? "")));
   },
   ensure_general_channel: () => 1,
+  mark_channels_delivered() {
+    for (const m of db.chat_members.filter((x) => x.userId === ME)) m.lastDeliveredAt = new Date().toISOString();
+    return null;
+  },
+  channel_receipts({ target_channel }) {
+    const others = db.chat_members.filter((m) => m.channelId === target_channel && m.userId !== ME);
+    const min = (field) => (others.length && others.every((m) => m[field]) ? others.map((m) => m[field]).sort()[0] : null);
+    return [{ deliveredUntil: window.__receipts?.delivered ?? min("lastDeliveredAt") ?? min("lastReadAt"), readUntil: window.__receipts?.read ?? min("lastReadAt"), others: others.length }];
+  },
+  message_receipts({ target_message }) {
+    const msg = db.chat_messages.find((m) => m.id === target_message);
+    return db.chat_members
+      .filter((m) => m.channelId === msg?.channelId && m.userId !== msg?.senderId)
+      .map((m) => ({ userId: m.userId, name: db.profiles.find((p) => p.id === m.userId)?.fullName ?? "Alguien", deliveredAt: m.lastDeliveredAt ?? m.lastReadAt ?? null, readAt: m.lastReadAt ?? null }));
+  },
+  edit_chat_message({ target_message, new_body }) {
+    const msg = db.chat_messages.find((m) => m.id === target_message);
+    if (!msg || msg.senderId !== ME) throw new Error("Solo quien escribió el mensaje puede editarlo.");
+    if (Date.now() - Date.parse(msg.createdAt) > 15 * 60000) throw new Error("Un mensaje solo se puede editar en los primeros 15 minutos.");
+    msg.body = new_body;
+    msg.editedAt = new Date().toISOString();
+    return null;
+  },
+  pin_chat_message({ target_message, pin }) {
+    const msg = db.chat_messages.find((m) => m.id === target_message);
+    if (msg) msg.pinnedAt = pin ? new Date().toISOString() : null;
+    return null;
+  },
   mark_channel_read({ target_channel }) {
     const mine = db.chat_members.find((m) => m.channelId === target_channel && m.userId === ME);
     if (mine) mine.lastReadAt = new Date().toISOString();
@@ -394,7 +428,7 @@ supabase.from = (table) => {
   const chain = realInsert(table);
   if (table === "chat_messages") {
     const insert = chain.insert;
-    chain.insert = (row) => insert({ ...row, senderId: ME, senderName: myName(), deletedAt: null });
+    chain.insert = (row) => insert({ kind: "text", attachment: null, replyToId: null, forwarded: false, editedAt: null, pinnedAt: null, ...row, senderId: ME, senderName: myName(), deletedAt: null });
   }
   if (table === "legal_acceptances" || table === "privacy_requests") {
     const insert = chain.insert;
@@ -404,6 +438,19 @@ supabase.from = (table) => {
   if (table === "warranties") {
     const insert = chain.insert;
     chain.insert = (row) => insert({ status: "active", createdBy: ME, ...row });
+  }
+  if (table === "chat_reactions" || table === "chat_hidden" || table === "chat_stars") {
+    const insert = chain.insert;
+    const stamp = (row) => ({ ...row, userId: ME, userName: myName(), channelId: row.channelId ?? db.chat_messages.find((m) => m.id === row.messageId)?.channelId });
+    chain.insert = (row) => insert(stamp(row));
+    if (chain.upsert) {
+      const upsert = chain.upsert;
+      chain.upsert = (row, opts) => upsert(stamp(row), opts);
+    }
+  }
+  if (table === "chat_stickers") {
+    const insert = chain.insert;
+    chain.insert = (row) => insert({ pack: "Mis stickers", ...row, userId: ME, companyId: COMPANY });
   }
   if (table === "task_comments") {
     const insert = chain.insert;
@@ -428,9 +475,21 @@ const storageApi = {
     upload: async (path, file, opts) => { window.__files[path] = { file, contentType: opts?.contentType }; return { error: null }; },
     download: async (path) => (window.__files[path] ? { data: window.__files[path].file, error: null } : { data: null, error: { message: "Object not found" } }),
     remove: async (paths) => { paths.forEach((p) => delete window.__files[p]); window.__removed.push(...paths); return { error: null }; },
+    copy: async (from, to) => (window.__files[from] ? ((window.__files[to] = { ...window.__files[from] }), { data: { path: to }, error: null }) : { data: null, error: { message: "Object not found" } }),
   }),
 };
 Object.defineProperty(supabase, "storage", { get: () => storageApi, configurable: true });
+window.__invokes = [];
+Object.defineProperty(supabase, "functions", {
+  configurable: true,
+  get: () => ({
+    invoke: async (name, { body } = {}) => {
+      window.__invokes.push({ name, body });
+      if (name === "translate") return { data: { translation: `[EN] ${body?.text ?? ""}` }, error: null };
+      return { data: null, error: { message: "función sin simular" } };
+    },
+  }),
+});
 
 // ---- GPS simulado: window.__geo.fix(lat, lng, kmh) ----
 const geo = { watchers: new Map(), seq: 1, denied: false, last: { lat: 18.14, lng: -94.45 } };

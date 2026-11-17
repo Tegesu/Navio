@@ -16,6 +16,8 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // "Agregar a WhatsApp" para los stickers de Mensajes.
+        registerPlugin(WhatsAppStickersPlugin.class);
         super.onCreate(savedInstanceState);
         // Android 13 o más reciente: sin este permiso no se ve el aviso fijo de
         // "viaje en curso" que acompaña al registro en segundo plano.
