@@ -12,6 +12,11 @@ import {
   Search,
   ShieldCheck,
   CheckCheck,
+  ChevronDown,
+  Download,
+  FileText,
+  Paperclip,
+  Upload,
   CheckCircle2,
   ClipboardList,
   Lock,
@@ -1060,6 +1065,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
 const TASK_STATUS = {
   open: { label: "Por hacer", className: "bg-slate-100 text-slate-600" },
   in_progress: { label: "En proceso", className: "bg-blue-50 text-blue-700" },
+  review: { label: "Entregada", className: "bg-violet-50 text-violet-700" },
   done: { label: "Terminada", className: "bg-emerald-50 text-emerald-700" },
   cancelled: { label: "Cancelada", className: "bg-rose-50 text-rose-600" },
 };
@@ -1185,8 +1191,26 @@ function TaskChat({ task }) {
   const [missing, setMissing] = useState(false);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [uploading, setUploading] = useState("");
   const scrollRef = useRef(null);
+  const fileRef = useRef(null);
   const closed = task.status === "done" || task.status === "cancelled";
+
+  async function attach(files) {
+    const list = Array.from(files ?? []).slice(0, 10);
+    for (let i = 0; i < list.length; i += 1) {
+      setUploading(`Subiendo ${i + 1} de ${list.length}…`);
+      try {
+        const attachment = await uploadTaskFile(task, list[i]);
+        const { data, error } = await supabase.from("task_comments").insert({ taskId, body: "", attachment }).select().single();
+        if (error) throw error;
+        setItems((prev) => (prev && !prev.some((m) => m.id === data.id) ? [...prev, data] : prev));
+      } catch (err) {
+        showToast(err?.message ?? "No se pudo subir el archivo.");
+      }
+    }
+    setUploading("");
+  }
   const taskId = task.id;
 
   const load = useCallback(async () => {
@@ -1244,7 +1268,7 @@ function TaskChat({ task }) {
   let lastDay = null;
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200">
-      <div ref={scrollRef} className="min-h-[220px] flex-1 space-y-1 overflow-y-auto bg-slate-50/60 px-3 py-3">
+      <div ref={scrollRef} className="min-h-[160px] flex-1 space-y-1 overflow-y-auto overscroll-contain bg-slate-50/60 px-3 py-3">
         {items === null && <p className="py-6 text-center text-xs text-slate-400">Cargando conversación…</p>}
         {items?.length === 0 && <p className="py-6 text-center text-xs text-slate-400">Aún no hay mensajes. Escribe para dar seguimiento.</p>}
         {items?.map((m) => {
@@ -1268,7 +1292,7 @@ function TaskChat({ task }) {
               <div className={`flex ${mine ? "justify-end" : "justify-start"}`}>
                 <div className={`max-w-[82%] rounded-2xl px-3 py-1.5 ${mine ? "rounded-br-md bg-blue-600 text-white" : "rounded-bl-md bg-white text-slate-700 shadow-sm"}`}>
                   {!mine && <p className="text-[10px] font-bold text-blue-600">{m.authorName || "Alguien"}</p>}
-                  <p className="whitespace-pre-wrap break-words text-xs leading-relaxed">{m.body}</p>
+                  {m.attachment ? <TaskFile attachment={m.attachment} mine={mine} /> : <p className="whitespace-pre-wrap break-words text-xs leading-relaxed">{m.body}</p>}
                   <p className={`mt-0.5 text-right text-[9px] ${mine ? "text-blue-100" : "text-slate-400"}`}>{hourLabel(m.createdAt)}</p>
                 </div>
               </div>
@@ -1282,6 +1306,26 @@ function TaskChat({ task }) {
         </p>
       ) : (
         <div className="flex items-end gap-2 border-t border-slate-100 bg-white p-2.5">
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={!!uploading}
+            aria-label="Adjuntar archivo"
+            title={uploading || "Adjuntar archivo (fotos, PDF, documentos)"}
+            className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 disabled:animate-pulse"
+          >
+            <Paperclip size={17} />
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              attach(e.target.files);
+              e.target.value = "";
+            }}
+          />
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -1319,15 +1363,188 @@ function useWide(query = "(min-width: 1024px)") {
   return wide;
 }
 
-// Detalle de una tarea con sus acciones y su conversación.
+// Archivos de las tareas (almacén "tasks", migración v29).
+const TASK_EXT = ["jpg", "png", "webp", "gif", "heic", "mp4", "webm", "mov", "m4a", "mp3", "ogg", "aac", "wav", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "zip", "xml"];
+const TASK_FILE_MB = 25;
+const fileSize = (bytes) => (bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round((bytes || 0) / 1024))} KB`);
+async function uploadTaskFile(task, file) {
+  let ext = (file.name.split(".").pop() || "").toLowerCase();
+  if (ext === "jpeg") ext = "jpg";
+  if (!TASK_EXT.includes(ext)) throw new Error(`"${file.name}" no es un tipo de archivo permitido.`);
+  if (file.size > TASK_FILE_MB * 1048576) throw new Error(`"${file.name}" pesa más de ${TASK_FILE_MB} MB.`);
+  const path = `${task.companyId}/${task.id}/${crypto.randomUUID()}.${ext}`;
+  const { error } = await supabase.storage.from("tasks").upload(path, file, { contentType: file.type || undefined });
+  if (error) throw new Error(/bucket|not found/i.test(error.message) ? "Los archivos de tareas se activan con la actualización v29 de la base de datos." : `No se pudo subir "${file.name}".`);
+  return { path, name: file.name.slice(0, 200), mime: file.type || null, size: file.size };
+}
+async function openTaskFile(attachment) {
+  const { data, error } = await supabase.storage.from("tasks").createSignedUrl(attachment.path, 3600, { download: attachment.name || true });
+  if (!error && data?.signedUrl) window.open(data.signedUrl, "_blank", "noopener");
+}
+
+// Un archivo dentro de la conversación de la tarea.
+function TaskFile({ attachment, mine }) {
+  const [thumb, setThumb] = useState(null);
+  const image = /^image\//.test(attachment?.mime ?? "");
+  useEffect(() => {
+    if (!image || !attachment?.path) return;
+    let alive = true;
+    supabase.storage
+      .from("tasks")
+      .createSignedUrl(attachment.path, 3600)
+      .then(({ data }) => alive && setThumb(data?.signedUrl ?? null));
+    return () => {
+      alive = false;
+    };
+  }, [attachment?.path, image]);
+  return (
+    <button type="button" onClick={() => openTaskFile(attachment)} className={`mt-1 flex w-full items-center gap-2 rounded-xl p-1.5 text-left ${mine ? "bg-[rgb(255_255_255/0.14)]" : "bg-slate-100"}`}>
+      {thumb ? (
+        <img src={thumb} alt="" className="h-12 w-12 shrink-0 rounded-lg object-cover" />
+      ) : (
+        <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${mine ? "bg-[rgb(255_255_255/0.2)]" : "bg-white text-blue-600"}`}>
+          <FileText size={16} />
+        </span>
+      )}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[11px] font-semibold">{attachment.name || "Archivo"}</span>
+        <span className={`block text-[10px] ${mine ? "text-blue-100" : "text-slate-400"}`}>{attachment.size ? fileSize(attachment.size) : "Toca para abrir"}</span>
+      </span>
+      <Download size={13} className="shrink-0 opacity-70" />
+    </button>
+  );
+}
+
+// Barra de avance: Por hacer → En proceso → Entregada → Resuelta.
+const TASK_STEPS = [
+  ["open", "Por hacer"],
+  ["in_progress", "En proceso"],
+  ["review", "Entregada"],
+  ["done", "Resuelta"],
+];
+function TaskProgress({ status, small = false }) {
+  if (status === "cancelled") return <p className={`${small ? "text-[10px]" : "text-[11px]"} font-semibold text-slate-400`}>Tarea cancelada</p>;
+  const index = Math.max(0, TASK_STEPS.findIndex(([id]) => id === status));
+  const finished = status === "done";
+  return (
+    <div className="flex items-start gap-1" aria-label={`Avance: ${TASK_STEPS[index][1]}`}>
+      {TASK_STEPS.map(([id, label], i) => (
+        <div key={id} className="min-w-0 flex-1">
+          <div className={`${small ? "h-1" : "h-1.5"} rounded-full transition-colors duration-500 ${i <= index ? (finished ? "bg-emerald-500" : "bg-blue-600") : "bg-slate-200"}`} />
+          {!small && <p className={`mt-1 truncate text-[10px] ${i === index ? "font-bold text-slate-700" : i < index ? "text-slate-500" : "text-slate-400"}`}>{label}</p>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Entregar la tarea: un comentario y los archivos que lo demuestran.
+function DeliverModal({ task, onClose, onDelivered }) {
+  const { showToast } = useToast();
+  const [note, setNote] = useState("");
+  const [files, setFiles] = useState([]);
+  const [busy, setBusy] = useState("");
+  const pickRef = useRef(null);
+
+  async function deliver() {
+    setBusy("Entregando…");
+    try {
+      if (note.trim()) {
+        const { error } = await supabase.from("task_comments").insert({ taskId: task.id, body: note.trim() });
+        if (error) throw error;
+      }
+      for (let i = 0; i < files.length; i += 1) {
+        setBusy(`Subiendo ${i + 1} de ${files.length}…`);
+        const attachment = await uploadTaskFile(task, files[i]);
+        const { error } = await supabase.from("task_comments").insert({ taskId: task.id, body: "", attachment });
+        if (error) throw error;
+      }
+      const { error } = await supabase.from("tasks").update({ status: "review" }).eq("id", task.id);
+      if (error) throw error;
+      showToast("Tarea entregada. Le avisamos a quien la asignó para que la revise.");
+      onDelivered?.();
+      onClose();
+    } catch (err) {
+      setBusy("");
+      showToast(/review|check constraint|tasks_status_check/i.test(err?.message ?? "") ? "Entregar tareas se activa con la actualización v29 de la base de datos." : err?.message ?? "No se pudo entregar.");
+    }
+  }
+
+  return (
+    <Modal title="Entregar tarea" width="max-w-md" onClose={busy ? () => {} : onClose}>
+      <div className="space-y-3">
+        <p className="text-xs text-slate-500">
+          <b className="text-slate-700">{task.title}</b>
+          <br />
+          Escribe qué hiciste y adjunta lo que lo demuestra (fotos, PDF, documentos). Quien te asignó la tarea la revisará.
+        </p>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          rows={3}
+          maxLength={2000}
+          placeholder="Ej. Ya revisé la factura y coincide con la orden."
+          className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none"
+        />
+        <div className="space-y-1.5">
+          {files.map((f, i) => (
+            <div key={`${f.name}-${i}`} className="flex items-center gap-2 rounded-lg border border-slate-200 px-2.5 py-1.5">
+              <FileText size={14} className="shrink-0 text-blue-600" />
+              <span className="min-w-0 flex-1 truncate text-xs text-slate-700">{f.name}</span>
+              <span className="shrink-0 text-[10px] text-slate-400">{fileSize(f.size)}</span>
+              <button type="button" onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))} aria-label={`Quitar ${f.name}`} className="rounded p-0.5 text-slate-400 hover:bg-slate-100">
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+          <button type="button" onClick={() => pickRef.current?.click()} className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-slate-300 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+            <Paperclip size={13} /> Adjuntar archivos
+          </button>
+          <input
+            ref={pickRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              // Se copian antes de limpiar el campo (si no, la lista queda vacía).
+              const picked = Array.from(e.target.files ?? []);
+              setFiles((prev) => [...prev, ...picked].slice(0, 10));
+              e.target.value = "";
+            }}
+          />
+        </div>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} disabled={!!busy} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100 disabled:opacity-50">
+            Cancelar
+          </button>
+          <button
+            type="button"
+            onClick={deliver}
+            disabled={!!busy || (!note.trim() && files.length === 0)}
+            className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-violet-700 disabled:opacity-50"
+          >
+            <Upload size={13} /> {busy || "Entregar"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// Detalle de una tarea con su avance, sus acciones y su conversación.
 function TaskDetail({ task, isAdmin, onEdit, onSetStatus, onClose }) {
   const { user } = useAuth();
   const { format } = useDateFormat();
+  const inbox = useInbox();
+  const [delivering, setDelivering] = useState(false);
   const mine = task.assignedTo === user?.id;
-  const canEdit = isAdmin || task.createdBy === user?.id;
+  const isCreator = task.createdBy === user?.id;
+  const canReview = isAdmin || isCreator;
+  const selfTask = mine && isCreator;
   const status = TASK_STATUS[task.status] ?? TASK_STATUS.open;
-  const isOpen = task.status === "open" || task.status === "in_progress";
-  const canMove = mine || canEdit;
+  const pending = ["open", "in_progress", "review"].includes(task.status);
+  const working = task.status === "open" || task.status === "in_progress";
+  const button = "rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold transition";
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
@@ -1350,93 +1567,123 @@ function TaskDetail({ task, isAdmin, onEdit, onSetStatus, onClose }) {
           </button>
         )}
       </div>
-      {task.description && <p className="whitespace-pre-wrap break-words rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600">{task.description}</p>}
-      {task.relatedLabel && <p className="text-[11px] text-slate-500">Relacionada con: <b>{task.relatedLabel}</b></p>}
-      {canMove && (
-        <div className="flex flex-wrap gap-1.5">
-          {task.status === "open" && mine && (
-            <button onClick={() => onSetStatus(task, "in_progress")} className="rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-[11px] font-semibold text-blue-700 hover:bg-blue-100">
-              Empezar
-            </button>
-          )}
-          {isOpen && (
-            <button onClick={() => onSetStatus(task, "done")} className="flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100">
-              <CheckCircle2 size={12} /> Marcar como resuelta
-            </button>
-          )}
-          {!isOpen && (
-            <button onClick={() => onSetStatus(task, "open")} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
-              Reabrir
-            </button>
-          )}
-          {canEdit && isOpen && (
-            <button onClick={() => onEdit(task)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
-              Editar
-            </button>
-          )}
-          {canEdit && isOpen && (
-            <button onClick={() => onSetStatus(task, "cancelled")} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50">
-              Cancelar tarea
-            </button>
+      <TaskProgress status={task.status} />
+      {(task.description || task.relatedLabel) && (
+        <div className="max-h-28 shrink-0 space-y-1 overflow-y-auto">
+          {task.description && <p className="whitespace-pre-wrap break-words rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600">{task.description}</p>}
+          {task.relatedLabel && (
+            <p className="text-[11px] text-slate-500">
+              Relacionada con: <b>{task.relatedLabel}</b>
+            </p>
           )}
         </div>
       )}
+      <div className="flex flex-wrap gap-1.5">
+        {task.status === "open" && mine && (
+          <button onClick={() => onSetStatus(task, "in_progress")} className={`${button} border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100`}>
+            Empezar
+          </button>
+        )}
+        {working && mine && !selfTask && (
+          <button onClick={() => setDelivering(true)} className={`${button} flex items-center gap-1 border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100`}>
+            <Upload size={12} /> Entregar
+          </button>
+        )}
+        {working && (canReview || selfTask) && (
+          <button onClick={() => onSetStatus(task, "done")} className={`${button} flex items-center gap-1 border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100`}>
+            <CheckCircle2 size={12} /> Marcar como resuelta
+          </button>
+        )}
+        {task.status === "review" && canReview && (
+          <>
+            <button onClick={() => onSetStatus(task, "done")} className={`${button} flex items-center gap-1 border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100`}>
+              <CheckCircle2 size={12} /> Aprobar y resolver
+            </button>
+            <button onClick={() => onSetStatus(task, "in_progress")} className={`${button} border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100`}>
+              Pedir cambios
+            </button>
+          </>
+        )}
+        {task.status === "review" && mine && !canReview && <span className="rounded-lg bg-violet-50 px-2.5 py-1.5 text-[11px] font-medium text-violet-700">Entregada: falta que {task.createdByName || "quien la asignó"} la revise.</span>}
+        {!pending && (canReview || mine) && (
+          <button onClick={() => onSetStatus(task, "open")} className={`${button} border-slate-200 text-slate-600 hover:bg-slate-50`}>
+            Reabrir
+          </button>
+        )}
+        {canReview && pending && (
+          <button onClick={() => onEdit(task)} className={`${button} border-slate-200 text-slate-600 hover:bg-slate-50`}>
+            Editar
+          </button>
+        )}
+        {canReview && pending && (
+          <button onClick={() => onSetStatus(task, "cancelled")} className={`${button} border-slate-200 text-slate-500 hover:bg-slate-50`}>
+            Cancelar tarea
+          </button>
+        )}
+      </div>
       <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
-        <MessageSquare size={12} /> {isOpen ? "Seguimiento" : "Historial hasta su resolución"}
+        <MessageSquare size={12} /> {pending ? "Seguimiento" : "Historial hasta su resolución"}
       </p>
       <TaskChat task={task} />
+      {delivering && <DeliverModal task={task} onClose={() => setDelivering(false)} onDelivered={() => inbox.reloadTasks()} />}
     </div>
   );
 }
 
-// Vistas: "open" (tareas asignadas sin completar) y "done" (resueltas).
+// Tareas: Todas, Mis tareas y Las que asigné. Las pendientes arriba y las
+// resueltas abajo (no desaparecen al resolverlas).
 export function TasksPage({ isAdmin, compact = false, view = "open", focusId = null }) {
   const { user } = useAuth();
   const { format } = useDateFormat();
   const { showToast } = useToast();
   const inbox = useInbox();
   const wide = useWide();
-  const [scope, setScope] = useState("mine");
+  const [scope, setScope] = useState("all");
   const [form, setForm] = useState(null);
   const [selectedId, setSelectedId] = useState(focusId);
+  const [showClosed, setShowClosed] = useState(true);
   const tasks = inbox?.tasks ?? [];
   const today = localISODate();
-  const resolved = view === "done";
 
   useEffect(() => {
     if (focusId) setSelectedId(focusId);
   }, [focusId]);
+  useEffect(() => {
+    if (view === "done") setShowClosed(true);
+  }, [view]);
 
   const scopes = [
+    { id: "all", label: "Todas", filter: () => true },
     { id: "mine", label: "Mis tareas", filter: (t) => t.assignedTo === user?.id },
     { id: "given", label: "Las que asigné", filter: (t) => t.createdBy === user?.id && t.assignedTo !== user?.id },
-    ...(isAdmin ? [{ id: "all", label: "Todas", filter: () => true }] : []),
   ];
   const current = scopes.find((s) => s.id === scope) ?? scopes[0];
-  const isOpen = (t) => t.status === "open" || t.status === "in_progress";
-  const inView = (t) => (resolved ? !isOpen(t) : isOpen(t));
-  const listed = tasks
-    .filter(current.filter)
-    .filter(inView)
-    .sort((a, b) =>
-      resolved
-        ? String(b.completedAt ?? b.updatedAt ?? "").localeCompare(String(a.completedAt ?? a.updatedAt ?? "")) || b.id - a.id
-        : String(a.dueDate ?? "9999").localeCompare(String(b.dueDate ?? "9999")) || b.id - a.id
-    );
+  const isPending = (t) => ["open", "in_progress", "review"].includes(t.status);
+  const inScope = tasks.filter(current.filter);
+  const pendingList = inScope
+    .filter(isPending)
+    .sort((a, b) => String(a.dueDate ?? "9999").localeCompare(String(b.dueDate ?? "9999")) || b.id - a.id);
+  const closedList = inScope
+    .filter((t) => !isPending(t))
+    .sort((a, b) => String(b.completedAt ?? b.updatedAt ?? "").localeCompare(String(a.completedAt ?? a.updatedAt ?? "")) || b.id - a.id);
   const selected = tasks.find((t) => t.id === selectedId) ?? null;
+  const sidePanel = wide && !compact;
 
   // En pantalla ancha, la primera tarea de la lista se abre sola.
   useEffect(() => {
-    if (wide && !compact && (!selected || !inView(selected)) && listed.length > 0 && !focusId) setSelectedId(listed[0].id);
+    if (sidePanel && (!selected || !current.filter(selected)) && !focusId) {
+      const first = pendingList[0] ?? closedList[0];
+      if (first) setSelectedId(first.id);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wide, compact, view, scope, listed.length]);
+  }, [sidePanel, scope, pendingList.length, closedList.length]);
 
   async function setStatus(task, status) {
     const { error } = await supabase.from("tasks").update({ status }).eq("id", task.id);
     if (error) showToast(`No se pudo actualizar: ${error.message}`);
     else {
       inbox.reloadTasks();
-      if (status === "done") showToast("Tarea resuelta. Su conversación queda en \"Tareas resueltas\".");
+      if (status === "done") showToast("Tarea resuelta. Sigue en la lista, en \"Resueltas\".");
     }
   }
 
@@ -1453,122 +1700,135 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
     return <p className="rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-10 text-center text-xs text-slate-400">Las tareas se activan al aplicar la actualización de la base de datos.</p>;
   }
 
+  const row = (t) => {
+    const pending = isPending(t);
+    const overdue = pending && t.dueDate && t.dueDate < today;
+    const mine = t.assignedTo === user?.id;
+    const canEdit = isAdmin || t.createdBy === user?.id;
+    const status = TASK_STATUS[t.status] ?? TASK_STATUS.open;
+    const active = selected?.id === t.id && sidePanel;
+    return (
+      <div
+        key={t.id}
+        className={`flex items-start gap-3 rounded-2xl border bg-white p-3.5 shadow-sm transition ${active ? "border-blue-300 ring-2 ring-blue-100" : overdue ? "border-rose-200" : "border-slate-200"}`}
+      >
+        <button
+          onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
+          disabled={!canEdit && !(mine && t.createdBy === user?.id)}
+          aria-label={t.status === "done" ? "Reabrir tarea" : "Marcar como resuelta"}
+          title={canEdit ? (t.status === "done" ? "Reabrir" : "Marcar como resuelta") : "Solo quien asignó la tarea la marca como resuelta"}
+          className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition disabled:opacity-40 ${
+            t.status === "done" ? "border-emerald-500 bg-emerald-500 text-white" : "border-slate-300 text-transparent hover:border-emerald-400"
+          }`}
+        >
+          <CheckCircle2 size={12} />
+        </button>
+        <button onClick={() => setSelectedId(t.id)} className="min-w-0 flex-1 text-left">
+          <p className={`break-words text-sm font-semibold ${t.status === "cancelled" ? "text-slate-400 line-through" : pending ? "text-slate-800" : "text-slate-600"}`}>{t.title}</p>
+          {t.description && <p className="mt-0.5 line-clamp-2 whitespace-pre-wrap break-words text-xs text-slate-500">{t.description}</p>}
+          <span className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
+            <span className={`rounded-full px-2 py-0.5 font-semibold ${status.className}`}>{status.label}</span>
+            <span className="flex items-center gap-1">
+              <User size={11} /> {mine ? "Yo" : t.assignedToName || "Sin asignar"}
+            </span>
+            {t.dueDate && pending && (
+              <span className={`flex items-center gap-1 ${overdue ? "font-semibold text-rose-600" : ""}`}>
+                {overdue && <AlertTriangle size={11} />}
+                {overdue ? "Venció el" : "Para el"} {formatDate(t.dueDate, format)}
+              </span>
+            )}
+            {!pending && t.completedAt && <span>Resuelta el {formatDate(t.completedAt.slice(0, 10), format)}</span>}
+            {t.priority === "high" && pending && <span className={`font-semibold ${TASK_PRIORITY.high.className}`}>Prioridad alta</span>}
+            {t.relatedLabel && <span>· {t.relatedLabel}</span>}
+          </span>
+          <span className="mt-2 block max-w-[220px]">
+            <TaskProgress status={t.status} small />
+          </span>
+        </button>
+        {canEdit && (
+          <button onClick={() => remove(t)} aria-label="Eliminar tarea" className="shrink-0 rounded-lg border border-slate-200 p-1.5 text-slate-400 hover:bg-slate-50 hover:text-rose-500">
+            <Trash2 size={12} />
+          </button>
+        )}
+      </div>
+    );
+  };
+
   const list = (
     <div className="space-y-2">
-      {listed.map((t) => {
-        const overdue = isOpen(t) && t.dueDate && t.dueDate < today;
-        const mine = t.assignedTo === user?.id;
-        const canEdit = isAdmin || t.createdBy === user?.id;
-        const status = TASK_STATUS[t.status] ?? TASK_STATUS.open;
-        const active = selected?.id === t.id && (wide && !compact);
-        return (
-          <div
-            key={t.id}
-            className={`flex items-start gap-3 rounded-2xl border bg-white p-3.5 shadow-sm transition ${active ? "border-blue-300 ring-2 ring-blue-100" : overdue ? "border-rose-200" : "border-slate-200"}`}
-          >
-            <button
-              onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
-              disabled={!mine && !canEdit}
-              aria-label={t.status === "done" ? "Reabrir tarea" : "Marcar como resuelta"}
-              className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition disabled:opacity-40 ${
-                t.status === "done" ? "border-emerald-500 bg-emerald-500 text-white" : "border-slate-300 text-transparent hover:border-emerald-400"
-              }`}
-            >
-              <CheckCircle2 size={12} />
-            </button>
-            <button onClick={() => setSelectedId(t.id)} className="min-w-0 flex-1 text-left">
-              <p className={`break-words text-sm font-semibold ${t.status === "cancelled" ? "text-slate-400 line-through" : resolved ? "text-slate-600" : "text-slate-800"}`}>{t.title}</p>
-              {t.description && <p className="mt-0.5 line-clamp-2 whitespace-pre-wrap break-words text-xs text-slate-500">{t.description}</p>}
-              <span className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
-                <span className={`rounded-full px-2 py-0.5 font-semibold ${status.className}`}>{status.label}</span>
-                <span className="flex items-center gap-1">
-                  <User size={11} /> {mine ? "Yo" : t.assignedToName || "Sin asignar"}
-                </span>
-                {t.dueDate && !resolved && (
-                  <span className={`flex items-center gap-1 ${overdue ? "font-semibold text-rose-600" : ""}`}>
-                    {overdue && <AlertTriangle size={11} />}
-                    {overdue ? "Venció el" : "Para el"} {formatDate(t.dueDate, format)}
-                  </span>
-                )}
-                {resolved && t.completedAt && <span>Resuelta el {formatDate(t.completedAt.slice(0, 10), format)}</span>}
-                {t.priority === "high" && !resolved && <span className={`font-semibold ${TASK_PRIORITY.high.className}`}>Prioridad alta</span>}
-                {t.relatedLabel && <span>· {t.relatedLabel}</span>}
-                <span className="flex items-center gap-1 font-semibold text-blue-600">
-                  <MessageSquare size={11} /> {resolved ? "Ver historial" : "Conversación"}
-                </span>
-              </span>
-            </button>
-            {canEdit && (
-              <button onClick={() => remove(t)} aria-label="Eliminar tarea" className="shrink-0 rounded-lg border border-slate-200 p-1.5 text-slate-400 hover:bg-slate-50 hover:text-rose-500">
-                <Trash2 size={12} />
-              </button>
-            )}
-          </div>
-        );
-      })}
-      {listed.length === 0 && (
-        <p className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-slate-200 bg-white py-10 text-center text-xs text-slate-400">
+      {pendingList.map(row)}
+      {pendingList.length === 0 && (
+        <p className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-slate-200 bg-white py-8 text-center text-xs text-slate-400">
           <CheckCheck size={20} className="text-emerald-400" />
-          {resolved ? "Todavía no hay tareas resueltas en esta vista." : current.id === "mine" ? "No tienes tareas pendientes." : "Sin tareas pendientes en esta vista."}
+          {current.id === "mine" ? "No tienes tareas pendientes." : "Sin tareas pendientes en esta vista."}
         </p>
+      )}
+      {closedList.length > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setShowClosed((v) => !v)}
+            aria-expanded={showClosed}
+            className="flex w-full items-center gap-2 px-1 pt-3 text-left text-[11px] font-bold uppercase tracking-wide text-slate-400 hover:text-slate-600"
+          >
+            <ChevronDown size={13} className={`transition ${showClosed ? "" : "-rotate-90"}`} /> Resueltas y canceladas ({closedList.length})
+          </button>
+          {showClosed && closedList.map(row)}
+        </>
       )}
     </div>
   );
 
-  const sidePanel = wide && !compact;
-  return (
-    <div className={compact ? "space-y-4 p-4 pb-24" : "space-y-5"}>
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="page-intro">
-          <h1 className="text-xl font-bold text-slate-900">{resolved ? "Tareas resueltas" : "Tareas asignadas"}</h1>
-          {!compact && (
-            <p className="mt-1 text-sm text-slate-500">
-              {resolved ? "Lo que ya se terminó, con su conversación completa hasta que se resolvió." : "Lo que falta por hacer. Cada tarea tiene su propia conversación para dar seguimiento."}
-            </p>
-          )}
-        </div>
-        {!resolved && (
-          <button onClick={() => setForm({})} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700">
-            <Plus size={15} /> Nueva tarea
+  const toolbar = (
+    <div className="flex flex-wrap items-center gap-2">
+      {scopes.map((s) => {
+        const count = tasks.filter(s.filter).filter(isPending).length;
+        return (
+          <button
+            key={s.id}
+            onClick={() => setScope(s.id)}
+            className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
+              current.id === s.id ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+            }`}
+          >
+            {s.label} <b className={current.id === s.id ? "text-blue-100" : "text-slate-400"}>{count}</b>
           </button>
-        )}
-      </div>
+        );
+      })}
+      <button onClick={() => setForm({})} className="ml-auto flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700">
+        <Plus size={15} /> Nueva tarea
+      </button>
+    </div>
+  );
 
-      <div className="flex flex-wrap gap-2">
-        {scopes.map((s) => {
-          const count = tasks.filter(s.filter).filter(inView).length;
-          return (
-            <button
-              key={s.id}
-              onClick={() => setScope(s.id)}
-              className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
-                current.id === s.id ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-              }`}
-            >
-              {s.label} <b className={current.id === s.id ? "text-blue-100" : "text-slate-400"}>{count}</b>
-            </button>
-          );
-        })}
-      </div>
-
-      {sidePanel ? (
-        <div className="grid grid-cols-[minmax(0,1fr)_minmax(360px,420px)] items-start gap-4">
-          {list}
-          <div className="sticky top-20 flex h-[calc(100vh-7rem)] min-h-[420px] flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+  // PC: la lista y el detalle llenan la pantalla y cada uno se desplaza por dentro.
+  if (sidePanel) {
+    return (
+      <div className="flex h-[calc(100vh-7.5rem)] min-h-[480px] flex-col gap-3">
+        {toolbar}
+        <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(360px,440px)] gap-4">
+          <div className="min-h-0 overflow-y-auto overscroll-contain pr-1">{list}</div>
+          <div className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
             {selected ? (
               <TaskDetail task={selected} isAdmin={isAdmin} onEdit={setForm} onSetStatus={setStatus} onClose={() => setSelectedId(null)} />
             ) : (
-              <p className="m-auto text-center text-xs text-slate-400">Elige una tarea para ver su conversación.</p>
+              <p className="m-auto text-center text-xs text-slate-400">Elige una tarea para ver su avance y su conversación.</p>
             )}
           </div>
         </div>
-      ) : (
-        list
-      )}
+        {form && <TaskFormModal initial={form} isAdmin={isAdmin} onClose={() => setForm(null)} />}
+      </div>
+    );
+  }
 
-      {!sidePanel && selected && (
+  return (
+    <div className={compact ? "space-y-4 p-4 pb-24" : "space-y-4"}>
+      {compact && <h1 className="text-xl font-bold text-slate-900">Tareas</h1>}
+      {toolbar}
+      {list}
+      {selected && (
         <Modal title="Tarea" width="max-w-lg" onClose={() => setSelectedId(null)}>
-          <div className="flex h-[70vh] min-h-0 flex-col">
+          <div className="flex h-[75vh] min-h-0 flex-col">
             <TaskDetail task={selected} isAdmin={isAdmin} onEdit={setForm} onSetStatus={setStatus} />
           </div>
         </Modal>

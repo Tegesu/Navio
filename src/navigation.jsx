@@ -144,10 +144,6 @@ function buildTree({ groupChats }) {
       icon: ClipboardList,
       badge: "tasks",
       route: ["tasks", "open"],
-      children: [
-        { key: "tk-open", label: "Tareas asignadas", route: ["tasks", "open"] },
-        { key: "tk-done", label: "Tareas resueltas", route: ["tasks", "done"] },
-      ],
     },
   ];
 }

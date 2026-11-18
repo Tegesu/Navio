@@ -1179,7 +1179,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
   };
 
   // Tareas pendientes de este chat.
-  const chatTasks = (inbox?.tasks ?? []).filter((t) => Number(t.channelId) === Number(channelId) && (t.status === "open" || t.status === "in_progress"));
+  const chatTasks = (inbox?.tasks ?? []).filter((t) => Number(t.channelId) === Number(channelId) && ["open", "in_progress", "review"].includes(t.status));
   const toggleTasks = () =>
     setTasksOpen((v) => {
       try {

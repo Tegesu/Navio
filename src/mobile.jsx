@@ -291,10 +291,6 @@ const MENU = [
     tone: "bg-violet-50 text-violet-600",
     badge: "myOpenTasks",
     route: ["tasks", "open"],
-    items: [
-      { label: "Tareas asignadas", route: ["tasks", "open"] },
-      { label: "Tareas resueltas", route: ["tasks", "done"] },
-    ],
   },
 ];
 
