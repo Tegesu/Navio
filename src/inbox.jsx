@@ -3,6 +3,14 @@ import {
   AlertTriangle,
   ArrowLeft,
   Bell,
+  BellOff,
+  LogOut,
+  MoreHorizontal,
+  MoreVertical,
+  Pin,
+  PinOff,
+  Search,
+  ShieldCheck,
   CheckCheck,
   CheckCircle2,
   ClipboardList,
@@ -122,6 +130,7 @@ export function InboxProvider({ children }) {
       window.clearTimeout(overviewTimer.current);
       overviewTimer.current = window.setTimeout(loadChannels, 400);
     };
+    let retryTimer = null;
     const channel = supabase
       .channel(`inbox-${++inboxChannelSeq}`)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications" }, (payload) => {
@@ -135,8 +144,8 @@ export function InboxProvider({ children }) {
         if (payload.eventType === "INSERT" && payload.new?.senderId !== userId) {
           markDelivered();
           const m = payload.new;
-          if (m && m.senderId && m.kind !== "call" && m.channelId !== openChannelRef.current && document.visibilityState === "visible") {
-            const ch = channelsRef.current.find((c) => c.id === m.channelId);
+          const ch = channelsRef.current.find((c) => Number(c.id) === Number(m?.channelId));
+          if (m && m.senderId && m.kind !== "call" && Number(m.channelId) !== Number(openChannelRef.current) && !ch?.muted && document.visibilityState === "visible") {
             const where = ch?.kind === "general" ? " · General" : ch?.kind === "group" ? ` · ${ch.name || "Grupo"}` : "";
             setBanner({ id: m.id, channelId: m.channelId, name: m.senderName || "Mensaje nuevo", where, text: previewText(m.kind, m.body) || "Mensaje" });
             window.clearTimeout(bannerTimer.current);
@@ -151,7 +160,15 @@ export function InboxProvider({ children }) {
         messageListeners.current.forEach((listener) => listener(payload));
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, loadTasks)
-      .subscribe();
+      .subscribe((status) => {
+        // Si la conexión en tiempo real falla, se vuelve a abrir en unos segundos.
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          window.clearTimeout(retryTimer);
+          retryTimer = window.setTimeout(() => setEpoch((n) => n + 1), 4000);
+        }
+      });
+    // Por si el tiempo real se atrasa: la lista se revisa cada 30 s.
+    const overviewPoll = window.setInterval(() => document.visibilityState === "visible" && loadChannels(), 30000);
     // El teléfono pausa las páginas en segundo plano y la conexión en tiempo
     // real se pierde: al volver se traen avisos, conversaciones y tareas, y si
     // la conexión se cayó se abre otra.
@@ -168,6 +185,8 @@ export function InboxProvider({ children }) {
     window.addEventListener("focus", resume);
     return () => {
       window.clearTimeout(overviewTimer.current);
+      window.clearTimeout(retryTimer);
+      window.clearInterval(overviewPoll);
       document.removeEventListener("visibilitychange", resume);
       window.removeEventListener("online", resume);
       window.removeEventListener("focus", resume);
@@ -533,14 +552,16 @@ function NewConversationModal({ group = null, initialMode = "direct", onOpen, on
   );
 }
 
-// La conversación vive en chat.jsx; aquí va su encabezado (participantes,
-// salir del grupo) y la ventana para editar el grupo.
-function Conversation({ channel, isAdmin, onBack, onChanged }) {
+// La conversación vive en chat.jsx; aquí va su encabezado (llamar,
+// participantes, permisos, fijar, silenciar, salir del grupo).
+function Conversation({ channel, isAdmin, onBack, onChanged, jumpTo }) {
   const { user } = useAuth();
   const inbox = useInbox();
   const calls = useCalls();
   const { showToast } = useToast();
   const [editing, setEditing] = useState(null);
+  const [permissions, setPermissions] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const channelId = channel.id;
 
   async function leave() {
@@ -555,53 +576,70 @@ function Conversation({ channel, isAdmin, onBack, onChanged }) {
   }
 
   const canManage = channel.kind === "group" && (channel.createdBy === user?.id || isAdmin);
+  const canCall = calls.available && (channel.kind === "direct" ? !!channel.otherUserId : channel.kind === "group");
+  const canSetPermissions = channel.kind !== "direct" && (channel.isChannelAdmin || isAdmin);
+  const menu = [
+    canManage && { label: "Participantes", icon: Users, run: editGroup },
+    canSetPermissions && { label: "Quién puede escribir", icon: ShieldCheck, run: () => setPermissions(true) },
+    { label: channel.pinnedAt ? "Dejar de fijar" : "Fijar conversación", icon: channel.pinnedAt ? PinOff : Pin, run: () => channelAction(inbox, showToast, "pin", channel) },
+    { label: channel.muted ? "Activar avisos" : "Silenciar avisos", icon: channel.muted ? Bell : BellOff, run: () => channelAction(inbox, showToast, "mute", channel) },
+    channel.kind === "group" && channel.createdBy !== user?.id && { label: "Salir del grupo", icon: LogOut, run: leave, danger: true },
+  ].filter(Boolean);
+
   const header = (
-    <div className="flex items-center gap-2.5">
+    <div className="flex items-center gap-1.5">
       <ChannelAvatar channel={channel} />
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-bold text-slate-800">{channelTitle(channel)}</p>
+      <div className="ml-1 min-w-0 flex-1">
+        <p className="flex items-center gap-1 truncate text-sm font-bold text-slate-800">
+          {channelTitle(channel)}
+          {channel.muted && <BellOff size={12} className="shrink-0 text-slate-400" />}
+        </p>
         <p className="truncate text-[11px] text-slate-400">
           {channel.kind === "general" ? `Toda la empresa · ${channel.members} personas` : channel.kind === "group" ? `${channel.members} participantes` : "Conversación directa"}
+          {channel.postingMode && channel.postingMode !== "all" && channel.kind !== "direct" ? " · escriben solo algunos" : ""}
         </p>
       </div>
-      {channel.kind === "direct" && calls.available && channel.otherUserId && (
+      {canCall && (
         <>
-          <button
-            type="button"
-            onClick={() => calls.start(channel, "audio")}
-            aria-label="Llamada de voz"
-            title="Llamada de voz"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50"
-          >
+          <button type="button" onClick={() => calls.start(channel, "audio")} aria-label="Llamada de voz" title="Llamada de voz" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50">
             <Phone size={17} />
           </button>
-          <button
-            type="button"
-            onClick={() => calls.start(channel, "video")}
-            aria-label="Videollamada"
-            title="Videollamada"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50"
-          >
+          <button type="button" onClick={() => calls.start(channel, "video")} aria-label="Videollamada" title="Videollamada" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50">
             <Video size={18} />
           </button>
         </>
       )}
-      {canManage && (
-        <button onClick={editGroup} className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
-          Participantes
+      <div className="relative shrink-0">
+        <button type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="Más opciones del chat" aria-expanded={menuOpen} className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100">
+          <MoreVertical size={17} />
         </button>
-      )}
-      {channel.kind === "group" && channel.createdBy !== user?.id && (
-        <button onClick={leave} className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50">
-          Salir
-        </button>
-      )}
+        {menuOpen && (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setMenuOpen(false)} />
+            <div className="absolute right-0 top-10 z-50 w-56 rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
+              {menu.map((item) => (
+                <button
+                  key={item.label}
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    item.run();
+                  }}
+                  className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium hover:bg-slate-50 ${item.danger ? "text-rose-600" : "text-slate-700"}`}
+                >
+                  <item.icon size={14} className="shrink-0" /> {item.label}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 
   return (
     <>
-      <ChatConversation channel={channel} isAdmin={isAdmin} onBack={onBack} header={header} />
+      <ChatConversation channel={channel} isAdmin={isAdmin} onBack={onBack} header={header} jumpTo={jumpTo} />
       {editing && (
         <NewConversationModal
           group={editing}
@@ -612,48 +650,285 @@ function Conversation({ channel, isAdmin, onBack, onChanged }) {
           onClose={() => setEditing(null)}
         />
       )}
+      {permissions && <ChannelPermissionsModal channel={channel} onClose={() => setPermissions(false)} onSaved={() => inbox.reloadChannels()} />}
     </>
   );
 }
 
-// Vistas de Mensajes: "all", "group" (chats grupales), "direct" (privados) o
-// "channel:<id>" (un chat en particular).
-const MESSAGE_VIEWS = {
-  all: { title: "Mensajes", hint: "Conversaciones entre las personas de tu empresa. Nadie de fuera puede leerlas.", filter: () => true },
-  group: { title: "Chats grupales", hint: "El chat general de la empresa y los grupos en los que participas.", filter: (c) => c.kind === "general" || c.kind === "group" },
-  direct: { title: "Chats privados", hint: "Conversaciones uno a uno. Solo las ven las dos personas.", filter: (c) => c.kind === "direct" },
-};
+// Fijar, silenciar y marcar como leída una conversación.
+async function channelAction(inbox, showToast, action, channel) {
+  let result;
+  if (action === "pin") result = await supabase.rpc("pin_channel", { target_channel: channel.id, pin: !channel.pinnedAt });
+  else if (action === "mute") result = await supabase.rpc("mute_channel", { target_channel: channel.id, mute: !channel.muted });
+  else if (action === "read") {
+    await inbox.markChannelRead(channel.id);
+    return;
+  }
+  if (result?.error) {
+    showToast(/function|schema cache/i.test(result.error.message) ? "Esta opción se activa con la actualización v28 de la base de datos." : result.error.message);
+    return;
+  }
+  showToast(
+    action === "pin" ? (channel.pinnedAt ? "Ya no está fijada." : "Conversación fijada arriba.") : channel.muted ? "Avisos activados." : "No te llegarán avisos de esta conversación."
+  );
+  inbox.reloadChannels();
+}
 
-export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenChannel }) {
+// Quién puede escribir en el chat general o en un grupo.
+function ChannelPermissionsModal({ channel, onClose, onSaved }) {
+  const { showToast } = useToast();
+  const [people, setPeople] = useState(null);
+  const [mode, setMode] = useState(channel.postingMode || "all");
+  const [posters, setPosters] = useState([]);
+  const [admins, setAdmins] = useState([]);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    supabase.rpc("channel_people", { target_channel: channel.id }).then(({ data, error }) => {
+      if (error) {
+        showToast(/function|schema cache/i.test(error.message) ? "Los permisos se activan con la actualización v28 de la base de datos." : error.message);
+        onClose();
+        return;
+      }
+      setPeople(data ?? []);
+      setPosters((data ?? []).filter((p) => p.canPost).map((p) => p.userId));
+      setAdmins((data ?? []).filter((p) => p.isAdmin && !(channel.kind === "group" && channel.createdBy === p.userId)).map((p) => p.userId));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel.id]);
+
+  const toggle = (list, setList, id) => setList(list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
+
+  async function save() {
+    setBusy(true);
+    const { error } = await supabase.rpc("set_channel_posting", { target_channel: channel.id, mode, poster_ids: mode === "selected" ? posters : [], admin_ids: admins });
+    setBusy(false);
+    if (error) {
+      showToast(error.message);
+      return;
+    }
+    showToast("Permisos guardados.");
+    onSaved?.();
+    onClose();
+  }
+
+  const options = [
+    ["all", "Todos", "Cualquiera en el chat puede escribir."],
+    ["admins", "Solo administradores", channel.kind === "general" ? "Los administradores de la empresa y quienes nombres aquí." : "Quien creó el grupo y quienes nombres administradores."],
+    ["selected", "Personas elegidas", "Los administradores y las personas que marques."],
+  ];
+
+  return (
+    <Modal title="Quién puede escribir" width="max-w-md" onClose={onClose}>
+      <div className="space-y-3">
+        <div className="space-y-1.5">
+          {options.map(([id, label, hint]) => (
+            <label key={id} className={`flex cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2 ${mode === id ? "border-blue-300 bg-blue-50" : "border-slate-200"}`}>
+              <input type="radio" name="posting" checked={mode === id} onChange={() => setMode(id)} className="mt-0.5 accent-blue-600" />
+              <span>
+                <span className="block text-xs font-semibold text-slate-700">{label}</span>
+                <span className="block text-[11px] text-slate-500">{hint}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+        <div>
+          <p className="mb-1 text-[11px] font-semibold text-slate-500">Personas</p>
+          <div className="max-h-60 space-y-0.5 overflow-y-auto rounded-xl border border-slate-100 p-1">
+            {people === null && <p className="py-4 text-center text-xs text-slate-400">Cargando…</p>}
+            {(people ?? []).map((p) => {
+              const owner = channel.kind === "group" && channel.createdBy === p.userId;
+              const fixedAdmin = owner || p.companyAdmin;
+              return (
+                <div key={p.userId} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-slate-50">
+                  <img src={avatarUrl(p.fullName)} alt="" className="h-7 w-7 shrink-0 rounded-full" />
+                  <span className="min-w-0 flex-1 truncate text-xs text-slate-700">
+                    {p.fullName}
+                    {fixedAdmin && <span className="ml-1 text-[10px] text-slate-400">{owner ? "· creó el grupo" : "· administrador"}</span>}
+                  </span>
+                  {mode === "selected" && !fixedAdmin && (
+                    <label className="flex items-center gap-1 text-[10px] text-slate-500">
+                      <input type="checkbox" checked={posters.includes(p.userId) || admins.includes(p.userId)} disabled={admins.includes(p.userId)} onChange={() => toggle(posters, setPosters, p.userId)} className="accent-blue-600" />
+                      Escribe
+                    </label>
+                  )}
+                  {!fixedAdmin && (
+                    <label className="flex items-center gap-1 text-[10px] text-slate-500">
+                      <input type="checkbox" checked={admins.includes(p.userId)} onChange={() => toggle(admins, setAdmins, p.userId)} className="accent-blue-600" />
+                      Admin.
+                    </label>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">
+            Cancelar
+          </button>
+          <button type="button" onClick={save} disabled={busy || people === null} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
+            {busy ? "Guardando…" : "Guardar"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// Un renglón de la lista: tocarlo abre el chat; los tres puntos (o mantener
+// presionado en el teléfono) dan las opciones.
+function ChannelRow({ channel: c, active, onOpen }) {
+  const inbox = useInbox();
+  const { showToast } = useToast();
+  const [menu, setMenu] = useState(false);
+  const timer = useRef(null);
+  const press = {
+    onPointerDown: (e) => {
+      if (e.pointerType === "mouse") return;
+      timer.current = window.setTimeout(() => setMenu(true), 500);
+    },
+    onPointerUp: () => window.clearTimeout(timer.current),
+    onPointerLeave: () => window.clearTimeout(timer.current),
+    onPointerMove: () => window.clearTimeout(timer.current),
+    onContextMenu: (e) => {
+      e.preventDefault();
+      setMenu(true);
+    },
+  };
+  const items = [
+    { label: c.pinnedAt ? "Dejar de fijar" : "Fijar", icon: c.pinnedAt ? PinOff : Pin, run: () => channelAction(inbox, showToast, "pin", c) },
+    { label: c.muted ? "Activar avisos" : "Silenciar avisos", icon: c.muted ? Bell : BellOff, run: () => channelAction(inbox, showToast, "mute", c) },
+    c.unread > 0 && { label: "Marcar como leída", icon: CheckCheck, run: () => channelAction(inbox, showToast, "read", c) },
+  ].filter(Boolean);
+  return (
+    <div className="group relative">
+      <button
+        type="button"
+        onClick={() => onOpen(c)}
+        {...press}
+        className={`flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition ${active ? "bg-blue-50" : "hover:bg-slate-50"}`}
+      >
+        <ChannelAvatar channel={c} />
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center justify-between gap-2">
+            <span className={`flex min-w-0 items-center gap-1 truncate text-xs ${c.unread ? "font-bold text-slate-900" : "font-semibold text-slate-700"}`}>
+              <span className="truncate">{channelTitle(c)}</span>
+              {c.pinnedAt && <Pin size={10} className="shrink-0 text-slate-400" />}
+              {c.muted && <BellOff size={10} className="shrink-0 text-slate-400" />}
+            </span>
+            {c.lastMessageAt && <span className="shrink-0 text-[10px] text-slate-400 group-hover:invisible">{timeAgoLabel(c.lastMessageAt).replace("hace ", "")}</span>}
+          </span>
+          <span className="flex items-center justify-between gap-2">
+            <span className="truncate text-[11px] text-slate-400">
+              {c.lastMessage || (c.lastKind && c.lastKind !== "text") ? `${c.kind !== "direct" && c.lastSender ? `${c.lastSender.split(" ")[0]}: ` : ""}${previewText(c.lastKind, c.lastMessage) ?? ""}` : "Sin mensajes"}
+            </span>
+            <CountBadge count={c.unread} className="shrink-0" />
+          </span>
+        </span>
+      </button>
+      <button
+        type="button"
+        onClick={() => setMenu((v) => !v)}
+        aria-label={`Opciones de ${channelTitle(c)}`}
+        className="absolute right-2 top-1.5 hidden h-6 w-6 items-center justify-center rounded-md bg-white text-slate-500 shadow-sm hover:bg-slate-100 group-hover:flex"
+      >
+        <MoreHorizontal size={14} />
+      </button>
+      {menu && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setMenu(false)} />
+          <div className="absolute right-2 top-8 z-50 w-48 rounded-xl border border-slate-200 bg-white p-1 shadow-xl">
+            {items.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                onClick={() => {
+                  setMenu(false);
+                  item.run();
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
+              >
+                <item.icon size={14} className="shrink-0" /> {item.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Resalta la palabra buscada dentro de un texto.
+function Highlight({ text, term }) {
+  const value = String(text ?? "");
+  if (!term) return value;
+  const index = value.toLowerCase().indexOf(term.toLowerCase());
+  if (index < 0) return value;
+  const start = Math.max(0, index - 30);
+  return (
+    <>
+      {start > 0 ? "…" : ""}
+      {value.slice(start, index)}
+      <mark className="rounded bg-amber-200 px-0.5 text-slate-900">{value.slice(index, index + term.length)}</mark>
+      {value.slice(index + term.length)}
+    </>
+  );
+}
+
+// Mensajes: todas las conversaciones juntas (general, grupos y directas).
+// view "channel:<id>" abre una en particular.
+export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
   const inbox = useInbox();
   const [openId, setOpenId] = useState(null);
+  const [jump, setJump] = useState(null); // { channelId, messageId }
   const [creating, setCreating] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [query, setQuery] = useState("");
+  const [found, setFound] = useState([]);
   const pinnedId = typeof view === "string" && view.startsWith("channel:") ? Number(view.slice(8)) : null;
-  const viewKey = pinnedId ? "group" : MESSAGE_VIEWS[view] ? view : "all";
-  const meta = MESSAGE_VIEWS[viewKey];
-  const allChannels = inbox?.channels ?? [];
-  const channels = allChannels.filter(meta.filter);
-  const open = allChannels.find((c) => c.id === openId) ?? null;
+  const channels = inbox?.channels ?? [];
+  const open = channels.find((c) => c.id === openId) ?? null;
+  const term = query.trim();
+  const shown = term ? channels.filter((c) => channelTitle(c).toLowerCase().includes(term.toLowerCase())) : channels;
 
-  // Un chat elegido desde el menú se abre directo.
+  // Un chat elegido desde un aviso se abre directo.
   useEffect(() => {
     if (pinnedId) setOpenId(pinnedId);
   }, [pinnedId]);
-
-  // Al cambiar de vista, la conversación abierta debe ser de esa vista.
-  useEffect(() => {
-    if (!pinnedId && open && !meta.filter(open)) setOpenId(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewKey]);
 
   // En pantalla ancha siempre hay una conversación abierta.
   useEffect(() => {
     if (!compact && openId === null && channels.length > 0 && window.innerWidth >= 1024) setOpenId(channels[0].id);
   }, [compact, openId, channels]);
 
-  const choose = (channel) => {
+  // Buscar palabras en todos los chats (los que la persona puede ver).
+  useEffect(() => {
+    if (term.length < 3) {
+      setFound([]);
+      return undefined;
+    }
+    let alive = true;
+    const timer = window.setTimeout(async () => {
+      const { data } = await supabase
+        .from("chat_messages")
+        .select("id, channelId, body, senderName, createdAt, kind")
+        .ilike("body", `%${term.replace(/[%_\\]/g, (m) => `\\${m}`)}%`)
+        .is("deletedAt", null)
+        .neq("kind", "call")
+        .order("id", { ascending: false })
+        .limit(40);
+      if (alive) setFound(data ?? []);
+    }, 300);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [term]);
+
+  const choose = (channel, messageId = null) => {
     setOpenId(channel.id);
-    onOpenChannel?.(channel);
+    setJump(messageId ? { channelId: channel.id, messageId, at: Date.now() } : null);
   };
   // En pantalla angosta la conversación tapa la lista: "atrás" vuelve a ella.
   const narrow = compact || (typeof window !== "undefined" && window.innerWidth < 1024);
@@ -673,46 +948,86 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
     <div className={compact ? "flex h-[calc(100vh-7.5rem)] flex-col" : "space-y-4"}>
       {!compact && (
         <div className="page-intro">
-          <h1 className="text-xl font-bold text-slate-900">{meta.title}</h1>
-          <p className="mt-1 text-sm text-slate-500">{meta.hint}</p>
+          <h1 className="text-xl font-bold text-slate-900">Mensajes</h1>
+          <p className="mt-1 text-sm text-slate-500">Conversaciones entre las personas de tu empresa. Nadie de fuera puede leerlas.</p>
         </div>
       )}
       {!open && <PushInvite compact={compact} />}
       <div className={`grid min-h-0 flex-1 overflow-hidden border-slate-200 bg-white lg:grid-cols-[300px_minmax(0,1fr)] ${compact ? "" : "messages-panel h-[calc(100vh-14rem)] min-h-[420px] rounded-2xl border shadow-sm"}`}>
         <div className={`min-h-0 flex-col border-slate-100 lg:flex lg:border-r ${open ? "hidden" : "flex"}`}>
           <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2.5">
-            <p className="text-xs font-bold text-slate-700">{viewKey === "all" ? "Conversaciones" : meta.title}</p>
-            <button onClick={() => setCreating(true)} className="flex items-center gap-1 rounded-lg bg-blue-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700">
-              <Plus size={12} /> Nueva
-            </button>
-          </div>
-          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-1.5">
-            {channels.map((c) => (
+            <p className="text-xs font-bold text-slate-700">Conversaciones</p>
+            <div className="flex items-center gap-1">
               <button
-                key={c.id}
-                onClick={() => choose(c)}
-                className={`flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition ${openId === c.id ? "bg-blue-50" : "hover:bg-slate-50"}`}
+                type="button"
+                onClick={() => {
+                  setSearching((v) => !v);
+                  setQuery("");
+                }}
+                aria-label="Buscar en los chats"
+                title="Buscar personas o palabras"
+                aria-pressed={searching}
+                className={`flex h-7 w-7 items-center justify-center rounded-lg ${searching ? "bg-blue-50 text-blue-600" : "text-slate-500 hover:bg-slate-100"}`}
               >
-                <ChannelAvatar channel={c} />
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center justify-between gap-2">
-                    <span className={`truncate text-xs ${c.unread ? "font-bold text-slate-900" : "font-semibold text-slate-700"}`}>{channelTitle(c)}</span>
-                    {c.lastMessageAt && <span className="shrink-0 text-[10px] text-slate-400">{timeAgoLabel(c.lastMessageAt).replace("hace ", "")}</span>}
-                  </span>
-                  <span className="flex items-center justify-between gap-2">
-                    <span className="truncate text-[11px] text-slate-400">
-                      {c.lastMessage || c.lastKind ? `${c.kind !== "direct" && c.lastSender ? `${c.lastSender.split(" ")[0]}: ` : ""}${previewText(c.lastKind, c.lastMessage)}` : "Sin mensajes"}
-                    </span>
-                    <CountBadge count={c.unread} className="shrink-0" />
-                  </span>
-                </span>
+                <Search size={14} />
               </button>
+              <button onClick={() => setCreating(true)} className="flex items-center gap-1 rounded-lg bg-blue-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700">
+                <Plus size={12} /> Nueva
+              </button>
+            </div>
+          </div>
+          {searching && (
+            <div className="border-b border-slate-100 px-3 py-2">
+              <div className="relative">
+                <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  autoFocus
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Buscar personas o palabras"
+                  aria-label="Buscar personas o palabras"
+                  className="h-8 w-full rounded-lg border border-slate-200 pl-8 pr-7 text-xs focus:border-blue-400 focus:outline-none"
+                />
+                {query && (
+                  <button type="button" onClick={() => setQuery("")} aria-label="Borrar búsqueda" className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:bg-slate-100">
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-1.5">
+            {term && <p className="px-2 pb-1 pt-1 text-[10px] font-bold uppercase tracking-wide text-slate-400">Conversaciones</p>}
+            {shown.map((c) => (
+              <ChannelRow key={c.id} channel={c} active={openId === c.id} onOpen={(ch) => choose(ch)} />
             ))}
-            {channels.length === 0 && (
-              <p className="py-8 text-center text-xs text-slate-400">
-                {allChannels.length === 0 ? "Cargando conversaciones…" : viewKey === "direct" ? "Todavía no tienes chats privados. Presiona \"Nueva\"." : "Sin conversaciones en esta vista."}
-              </p>
+            {term && shown.length === 0 && <p className="px-2 py-2 text-[11px] text-slate-400">Ninguna conversación con ese nombre.</p>}
+            {term.length >= 3 && (
+              <>
+                <p className="px-2 pb-1 pt-3 text-[10px] font-bold uppercase tracking-wide text-slate-400">Mensajes</p>
+                {found.length === 0 && <p className="px-2 py-2 text-[11px] text-slate-400">Ningún mensaje con esa palabra.</p>}
+                {found.map((m) => {
+                  const ch = channels.find((c) => c.id === m.channelId);
+                  if (!ch) return null;
+                  return (
+                    <button key={m.id} type="button" onClick={() => choose(ch, m.id)} className="flex w-full items-start gap-2.5 rounded-xl px-2 py-2 text-left hover:bg-slate-50">
+                      <ChannelAvatar channel={ch} size="h-7 w-7" />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="truncate text-[11px] font-semibold text-slate-700">{channelTitle(ch)}</span>
+                          <span className="shrink-0 text-[10px] text-slate-400">{timeAgoLabel(m.createdAt).replace("hace ", "")}</span>
+                        </span>
+                        <span className="line-clamp-2 text-[11px] text-slate-500">
+                          {m.senderName ? `${m.senderName.split(" ")[0]}: ` : ""}
+                          <Highlight text={m.body} term={term} />
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </>
             )}
+            {!term && channels.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Cargando conversaciones…</p>}
           </div>
         </div>
         <div className={`min-h-0 lg:block ${open ? "block" : "hidden"}`}>
@@ -721,6 +1036,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
               key={open.id}
               channel={open}
               isAdmin={isAdmin}
+              jumpTo={jump?.channelId === open.id ? jump : null}
               onBack={() => goBack(() => setOpenId(null))}
               onChanged={(id) => {
                 setOpenId(id);
@@ -732,7 +1048,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
           )}
         </div>
       </div>
-      {creating && <NewConversationModal initialMode={viewKey === "group" ? "group" : "direct"} onOpen={handleOpened} onClose={() => setCreating(false)} />}
+      {creating && <NewConversationModal initialMode="direct" onOpen={handleOpened} onClose={() => setCreating(false)} />}
     </div>
   );
 }
@@ -749,13 +1065,28 @@ const TASK_STATUS = {
 };
 const TASK_PRIORITY = { high: { label: "Alta", className: "text-rose-600" }, normal: { label: "Normal", className: "text-slate-400" }, low: { label: "Baja", className: "text-slate-400" } };
 
-function TaskFormModal({ initial, isAdmin, onClose }) {
+// channel y message: la tarea nace de un mensaje del chat.
+export function TaskFormModal({ initial, isAdmin, onClose, channel = null, message = null }) {
   const { user } = useAuth();
-  const { people } = usePeople();
+  const { people: everyone } = usePeople();
   const { showToast } = useToast();
   const inbox = useInbox();
-  const [title, setTitle] = useState(initial?.title ?? "");
-  const [description, setDescription] = useState(initial?.description ?? "");
+  // En una directa o un grupo se le puede asignar a cualquiera de sus participantes.
+  const chatAssign = !!channel && channel.kind !== "general";
+  const [memberIds, setMemberIds] = useState(null);
+  useEffect(() => {
+    if (!chatAssign) return;
+    supabase
+      .from("chat_members")
+      .select("userId")
+      .eq("channelId", channel.id)
+      .then(({ data }) => setMemberIds((data ?? []).map((m) => m.userId)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel?.id]);
+  const people = chatAssign && memberIds && !isAdmin ? everyone.filter((p) => memberIds.includes(p.id) || p.id === user?.id) : everyone;
+  const fromText = message?.body ? String(message.body).replace(/\s+/g, " ").trim() : "";
+  const [title, setTitle] = useState(initial?.title ?? fromText.slice(0, 200));
+  const [description, setDescription] = useState(initial?.description ?? (message ? `De ${message.senderName || "un mensaje"} en el chat${fromText.length > 200 ? `: "${fromText}"` : "."}` : ""));
   const [assignedTo, setAssignedTo] = useState(initial?.assignedTo ?? user?.id ?? "");
   const [dueDate, setDueDate] = useState(initial?.dueDate ?? "");
   const [priority, setPriority] = useState(initial?.priority ?? "normal");
@@ -774,6 +1105,10 @@ function TaskFormModal({ initial, isAdmin, onClose }) {
     setSaving(true);
     setError("");
     const row = { title: title.trim(), description: description.trim() || null, assignedTo: assignedTo || null, dueDate: dueDate || null, priority, relatedLabel: relatedLabel.trim() || null };
+    if (channel && !initial?.id) {
+      row.channelId = channel.id;
+      if (message?.id && !String(message.id).startsWith("tmp-")) row.messageId = message.id;
+    }
     const { error: saveError } = initial?.id ? await supabase.from("tasks").update(row).eq("id", initial.id) : await supabase.from("tasks").insert(row);
     setSaving(false);
     if (saveError) {
@@ -786,7 +1121,7 @@ function TaskFormModal({ initial, isAdmin, onClose }) {
   }
 
   return (
-    <Modal title={initial?.id ? "Editar tarea" : "Nueva tarea"} width="max-w-md" onClose={onClose}>
+    <Modal title={initial?.id ? "Editar tarea" : channel ? "Asignar como tarea" : "Nueva tarea"} width="max-w-md" onClose={onClose}>
       <form onSubmit={handleSubmit} className="space-y-3">
         <div>
           <label className={labelClass}>Qué hay que hacer</label>
@@ -799,7 +1134,7 @@ function TaskFormModal({ initial, isAdmin, onClose }) {
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className={labelClass}>Responsable</label>
-            <select value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)} disabled={!isAdmin} className={`${inputClass} disabled:bg-slate-50 disabled:text-slate-400`}>
+            <select value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)} disabled={!isAdmin && !chatAssign} className={`${inputClass} disabled:bg-slate-50 disabled:text-slate-400`}>
               {people.map((p) => (
                 <option key={p.id} value={p.id}>
                   {personName(p)}
@@ -825,7 +1160,8 @@ function TaskFormModal({ initial, isAdmin, onClose }) {
             <input value={relatedLabel} onChange={(e) => setRelatedLabel(e.target.value)} placeholder="Ej. Unidad 07, OT24053" className={inputClass} />
           </div>
         </div>
-        {!isAdmin && <p className="text-[11px] text-slate-400">Solo un administrador puede asignar tareas a otras personas.</p>}
+        {!isAdmin && !chatAssign && <p className="text-[11px] text-slate-400">Solo un administrador puede asignar tareas a otras personas.</p>}
+        {chatAssign && !isAdmin && <p className="text-[11px] text-slate-400">Puedes asignarla a quien participa en esta conversación.</p>}
         {error && <p className="rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] font-medium text-rose-700">{error}</p>}
         <div className="flex justify-end gap-2">
           <button type="button" onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100">

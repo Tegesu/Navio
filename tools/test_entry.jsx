@@ -100,9 +100,11 @@ const db = {
   chat_channels: [
     { id: 1, companyId: COMPANY, kind: "general", name: "General", createdBy: "u1", createdAt: ago(100), lastMessageAt: ago(2) },
     { id: 2, companyId: COMPANY, kind: "direct", name: null, directKey: "7:u1:u2", createdBy: "u1", createdAt: ago(50), lastMessageAt: ago(6) },
+    { id: 3, companyId: COMPANY, kind: "group", name: "Ruta norte", createdBy: "u1", createdAt: ago(40), lastMessageAt: ago(8) },
   ],
   chat_members: [
     { channelId: 2, userId: "u1", lastReadAt: ago(1) }, { channelId: 2, userId: "u2", lastReadAt: ago(1) }, { channelId: 1, userId: ME, lastReadAt: ago(3) },
+    { channelId: 3, userId: "u1", lastReadAt: ago(1) }, { channelId: 3, userId: "u2", lastReadAt: ago(1) }, { channelId: 3, userId: "u3", lastReadAt: ago(1) },
   ],
   chat_messages: [
     { id: 1, channelId: 1, companyId: COMPANY, senderId: "u3", senderName: "Carlos Ruiz", body: "Buenos días, ya salí de Minatitlán.", createdAt: ago(2.5), deletedAt: null },
@@ -183,6 +185,7 @@ function tableChain(table) {
     limit: (n) => { limit = n; return chain; },
     eq: (k, v) => { filters.push((r) => r[k] === v); return chain; },
     neq: (k, v) => { filters.push((r) => r[k] !== v); return chain; },
+    ilike: (k, pattern) => { const needle = String(pattern).replace(/^%|%$/g, "").split("\\").join("").toLowerCase(); filters.push((r) => String(r[k] ?? "").toLowerCase().includes(needle)); return chain; },
     in: (k, list) => { filters.push((r) => list.includes(r[k])); return chain; },
     is: (k, v) => { filters.push((r) => (r[k] ?? null) === v); return chain; },
     not: (k, op, v) => { filters.push((r) => (op === "is" ? (r[k] ?? null) !== v : r[k] !== v)); return chain; },
@@ -280,107 +283,207 @@ const waitIce = (pc) => new Promise((resolve) => {
 });
 const otherOf = (channelId) => db.chat_members.find((m) => m.channelId === channelId && m.userId !== ME)?.userId;
 const nameOf = (id) => db.profiles.find((p) => p.id === id)?.fullName ?? "Alguien";
-function finishCall(row, by, reason) {
-  if (!row || !["ringing", "accepted"].includes(row.status)) return;
-  let status;
-  if (row.status === "ringing") status = by === row.callerId ? (["missed", "failed"].includes(reason) ? reason : "cancelled") : ["busy", "failed"].includes(reason) ? reason : "declined";
-  else status = reason === "failed" ? "failed" : "ended";
-  const seconds = row.answeredAt ? Math.max(0, Math.round((Date.now() - Date.parse(row.answeredAt)) / 1000)) : null;
-  Object.assign(row, { status, endedAt: new Date().toISOString(), endedBy: by });
-  emit("calls", "UPDATE", { ...row });
-  const label = row.kind === "video" ? "Videollamada" : "Llamada de voz";
+const nowIso = () => new Date().toISOString();
+db.call_participants = [];
+db.call_signals = [];
+const parts = (callId) => db.call_participants.filter((p) => p.callId === callId);
+const setPart = (callId, userId, patch) => {
+  let row = db.call_participants.find((p) => p.callId === callId && p.userId === userId);
+  const isNew = !row;
+  if (!row) {
+    row = { id: nextId++, callId, companyId: COMPANY, userId, userName: nameOf(userId), status: "ringing", invitedAt: nowIso(), joinedAt: null, leftAt: null };
+    db.call_participants.push(row);
+  }
+  Object.assign(row, patch);
+  emit("call_participants", isNew ? "INSERT" : "UPDATE", { ...row });
+  return row;
+};
+// Como finish_call_if_done de la v28.
+function finishIfDone(callId, by) {
+  const call = db.calls.find((c) => c.id === callId);
+  if (!call || !["ringing", "accepted"].includes(call.status)) return;
+  const list = parts(callId);
+  const joined = list.filter((p) => p.status === "joined").length;
+  const ringing = list.filter((p) => p.status === "ringing" && Date.now() - Date.parse(p.invitedAt) < 60000).length;
+  if (joined >= 2 || (joined === 1 && ringing > 0)) return;
+  const status = call.answeredAt ? "ended" : list.some((p) => p.status === "declined") ? "declined" : list.some((p) => p.status === "busy") ? "busy" : "missed";
+  Object.assign(call, { status, endedAt: nowIso(), endedBy: by });
+  emit("calls", "UPDATE", { ...call });
+  for (const p of list) if (p.status === "joined") setPart(callId, p.userId, { status: "left", leftAt: nowIso() });
+  for (const p of list) if (p.status === "ringing") setPart(callId, p.userId, { status: "missed" });
+  const seconds = call.answeredAt ? Math.max(0, Math.round((Date.now() - Date.parse(call.answeredAt)) / 1000)) : null;
+  const label = call.kind === "video" ? "Videollamada" : "Llamada de voz";
+  const people = list.filter((p) => p.joinedAt).length;
   const msg = {
-    id: nextId++, channelId: row.channelId, companyId: COMPANY, senderId: row.callerId, senderName: row.callerName, kind: "call",
+    id: nextId++, channelId: call.channelId, companyId: COMPANY, senderId: call.callerId, senderName: call.callerName, kind: "call",
     body: seconds != null ? `${label} · ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}` : `${label} perdida`,
-    attachment: { call: row.kind, status, ...(seconds != null ? { duration: seconds } : {}), callId: row.id },
-    replyToId: null, forwarded: false, editedAt: null, pinnedAt: null, createdAt: new Date().toISOString(), deletedAt: null,
+    attachment: { call: call.kind, status, ...(seconds != null ? { duration: seconds } : {}), callId: call.id, ...(people > 2 ? { people } : {}) },
+    replyToId: null, forwarded: false, editedAt: null, pinnedAt: null, createdAt: nowIso(), deletedAt: null,
   };
   db.chat_messages.push(msg);
-  const ch = db.chat_channels.find((c) => c.id === row.channelId);
+  const ch = db.chat_channels.find((c) => c.id === call.channelId);
   if (ch) ch.lastMessageAt = msg.createdAt;
   emit("chat_messages", "INSERT", msg);
 }
-const peer = { autoAnswer: true, answerDelay: 1200, pc: null, row: null };
-window.__peer = peer;
-peer.reset = () => {
-  try {
-    peer.pc?.close();
-  } catch {
-    // ya cerrada
-  }
-  peer.pc = null;
-};
-// La otra persona contesta mi llamada.
-peer.accept = async () => {
-  const row = db.calls.find((c) => c.id === peer.row?.id);
-  if (!row || row.status !== "ringing") return false;
-  peer.reset();
-  const pc = new RTCPeerConnection({ iceServers: [] });
-  peer.pc = pc;
-  const media = await fakeMedia(row.kind, "otra");
-  media.getTracks().forEach((t) => pc.addTrack(t, media));
-  await pc.setRemoteDescription(row.offer);
-  await pc.setLocalDescription(await pc.createAnswer());
-  await waitIce(pc);
-  Object.assign(row, { status: "accepted", answer: { type: "answer", sdp: pc.localDescription.sdp }, answeredAt: new Date().toISOString() });
-  emit("calls", "UPDATE", { ...row });
-  return true;
-};
-// La otra persona me llama.
-peer.call = async (kind = "audio", channelId = 2) => {
-  const other = otherOf(channelId);
-  peer.reset();
-  const pc = new RTCPeerConnection({ iceServers: [] });
-  peer.pc = pc;
-  const media = await fakeMedia(kind, "otra");
-  media.getTracks().forEach((t) => pc.addTrack(t, media));
-  await pc.setLocalDescription(await pc.createOffer());
-  await waitIce(pc);
-  const row = {
-    id: nextId++, companyId: COMPANY, channelId, callerId: other, callerName: nameOf(other), calleeId: ME, calleeName: myName(), kind, status: "ringing",
-    offer: { type: "offer", sdp: pc.localDescription.sdp }, answer: null, createdAt: new Date().toISOString(), answeredAt: null, endedAt: null, endedBy: null,
-  };
-  db.calls.unshift(row);
-  peer.row = row;
-  emit("calls", "INSERT", { ...row });
-  return row.id;
-};
-peer.hangUp = (reason = "ended") => {
-  const row = db.calls.find((c) => c.id === peer.row?.id);
-  finishCall(row, row?.callerId === ME ? row?.calleeId : row?.callerId, reason);
-  peer.reset();
+const signal = (callId, fromUser, toUser, kind, sdp) => {
+  const row = { id: nextId++, callId, fromUser, toUser, kind, sdp, createdAt: nowIso() };
+  db.call_signals.push(row);
+  emit("call_signals", "INSERT", { ...row });
+  return row;
 };
 
+// La "otra persona": conexiones de verdad dentro de esta misma página.
+const peer = { autoAnswer: true, answerDelay: 1200, pcs: new Map(), callId: null, users: [] };
+window.__peer = peer;
+peer.reset = () => {
+  for (const pc of peer.pcs.values()) {
+    try {
+      pc.close();
+    } catch {
+      // ya cerrada
+    }
+  }
+  peer.pcs.clear();
+};
+Object.defineProperty(peer, "pc", { get: () => [...peer.pcs.values()][0] ?? null });
+async function peerPc(userId, kind) {
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  const media = await fakeMedia(kind, "otra");
+  media.getTracks().forEach((t) => pc.addTrack(t, media));
+  peer.pcs.set(userId, pc);
+  return pc;
+}
+// La otra persona se une a la llamada y me manda su oferta (es la nueva).
+peer.join = async (userId = peer.users[0]) => {
+  const call = db.calls.find((c) => c.id === peer.callId);
+  if (!call || !["ringing", "accepted"].includes(call.status)) return false;
+  setPart(call.id, userId, { status: "joined", joinedAt: nowIso() });
+  if (!call.answeredAt && userId !== call.callerId) {
+    Object.assign(call, { status: "accepted", answeredAt: nowIso() });
+    emit("calls", "UPDATE", { ...call });
+  }
+  const pc = await peerPc(userId, call.kind);
+  await pc.setLocalDescription(await pc.createOffer());
+  await waitIce(pc);
+  signal(call.id, userId, ME, "offer", pc.localDescription.sdp);
+  return true;
+};
+peer.accept = () => peer.join();
+// Alguien me llama (desde la conversación directa 2 o un grupo).
+peer.call = async (kind = "audio", channelId = 2) => {
+  const caller = otherOf(channelId);
+  peer.reset();
+  const call = { id: nextId++, companyId: COMPANY, channelId, callerId: caller, callerName: nameOf(caller), calleeId: ME, calleeName: myName(), kind, status: "ringing", createdAt: nowIso(), answeredAt: null, endedAt: null, endedBy: null };
+  db.calls.unshift(call);
+  peer.callId = call.id;
+  peer.users = [caller];
+  setPart(call.id, caller, { status: "joined", joinedAt: nowIso(), invitedBy: caller, invitedByName: nameOf(caller) });
+  setPart(call.id, ME, { status: "ringing", invitedBy: caller, invitedByName: nameOf(caller) });
+  return call.id;
+};
+peer.hangUp = (userId = peer.users[0]) => {
+  const call = db.calls.find((c) => c.id === peer.callId);
+  if (!call) return;
+  const mine = db.call_participants.find((p) => p.callId === call.id && p.userId === userId);
+  setPart(call.id, userId, { status: mine?.status === "ringing" ? "declined" : "left", leftAt: nowIso() });
+  peer.pcs.get(userId)?.close();
+  peer.pcs.delete(userId);
+  finishIfDone(call.id, userId);
+};
+peer.decline = () => peer.hangUp();
+
 const rpcs = {
-  start_call({ target_channel, call_kind, call_offer }) {
-    const ch = db.chat_channels.find((c) => c.id === target_channel && c.kind === "direct");
-    if (!ch) throw new Error("Solo se puede llamar desde una conversación directa.");
-    for (const old of db.calls.filter((c) => c.callerId === ME && c.status === "ringing")) Object.assign(old, { status: "cancelled", endedAt: new Date().toISOString(), endedBy: ME });
-    const other = otherOf(ch.id);
-    const row = {
-      id: nextId++, companyId: COMPANY, channelId: ch.id, callerId: ME, callerName: myName(), calleeId: other, calleeName: nameOf(other), kind: call_kind, status: "ringing",
-      offer: call_offer, answer: null, createdAt: new Date().toISOString(), answeredAt: null, endedAt: null, endedBy: null,
-    };
-    db.calls.unshift(row);
-    peer.row = row;
-    emit("calls", "INSERT", { ...row });
-    if (peer.autoAnswer) setTimeout(() => peer.accept(), peer.answerDelay);
-    return row;
+  call_open({ target_channel, call_kind }) {
+    const ch = db.chat_channels.find((c) => c.id === target_channel && (c.kind === "direct" || c.kind === "group"));
+    if (!ch) throw new Error("Solo se puede llamar desde una conversación directa o de grupo.");
+    const others = db.chat_members.filter((m) => m.channelId === ch.id && m.userId !== ME).map((m) => m.userId);
+    peer.reset();
+    const call = { id: nextId++, companyId: COMPANY, channelId: ch.id, callerId: ME, callerName: myName(), calleeId: others[0], calleeName: nameOf(others[0]), kind: call_kind, status: "ringing", createdAt: nowIso(), answeredAt: null, endedAt: null, endedBy: null };
+    db.calls.unshift(call);
+    peer.callId = call.id;
+    peer.users = others;
+    setPart(call.id, ME, { status: "joined", joinedAt: nowIso(), invitedBy: ME, invitedByName: myName() });
+    for (const u of others) setPart(call.id, u, { status: "ringing", invitedBy: ME, invitedByName: myName() });
+    if (peer.autoAnswer) setTimeout(() => peer.join(others[0]), peer.answerDelay);
+    return call;
   },
-  answer_call({ target_call, call_answer }) {
-    const row = db.calls.find((c) => c.id === target_call && c.calleeId === ME);
-    if (!row) throw new Error("La llamada ya no existe.");
-    if (row.status !== "ringing") throw new Error("La llamada ya terminó.");
-    Object.assign(row, { status: "accepted", answer: call_answer, answeredAt: new Date().toISOString() });
-    emit("calls", "UPDATE", { ...row });
-    if (peer.pc && peer.row?.id === row.id) peer.pc.setRemoteDescription(call_answer);
+  call_join({ target_call }) {
+    const call = db.calls.find((c) => c.id === target_call);
+    if (!call || !["ringing", "accepted"].includes(call.status)) throw new Error("La llamada ya terminó.");
+    setPart(call.id, ME, { status: "joined", joinedAt: nowIso(), leftAt: null });
+    if (!call.answeredAt && call.callerId !== ME) {
+      Object.assign(call, { status: "accepted", answeredAt: nowIso() });
+      emit("calls", "UPDATE", { ...call });
+    }
+    return call;
+  },
+  call_leave({ target_call, reason }) {
+    const row = db.call_participants.find((p) => p.callId === target_call && p.userId === ME);
+    if (!row) throw new Error("No estás en esa llamada.");
+    if (row.status === "joined") setPart(target_call, ME, { status: "left", leftAt: nowIso() });
+    else if (row.status === "ringing") setPart(target_call, ME, { status: ["busy", "missed"].includes(reason) ? reason : "declined", leftAt: nowIso() });
+    finishIfDone(target_call, ME);
+    if (peer.callId === target_call) peer.reset();
     return null;
   },
-  end_call({ target_call, end_reason }) {
-    const row = db.calls.find((c) => c.id === target_call && (c.callerId === ME || c.calleeId === ME));
-    if (!row) throw new Error("La llamada ya no existe.");
-    finishCall(row, ME, end_reason);
-    if (peer.row?.id === row.id) peer.reset();
+  async call_signal({ target_call, to_user, signal_kind, signal_sdp }) {
+    signal(target_call, ME, to_user, signal_kind, signal_sdp);
+    const call = db.calls.find((c) => c.id === target_call);
+    // La otra persona contesta (o recibe la respuesta) como lo haría su Navio.
+    setTimeout(async () => {
+      if (signal_kind === "offer") {
+        const pc = peer.pcs.get(to_user) ?? (await peerPc(to_user, call?.kind ?? "audio"));
+        await pc.setRemoteDescription({ type: "offer", sdp: signal_sdp });
+        await pc.setLocalDescription(await pc.createAnswer());
+        await waitIce(pc);
+        signal(target_call, to_user, ME, "answer", pc.localDescription.sdp);
+      } else {
+        await peer.pcs.get(to_user)?.setRemoteDescription({ type: "answer", sdp: signal_sdp });
+      }
+    }, 50);
+    return null;
+  },
+  call_invite({ target_call, user_ids }) {
+    for (const u of user_ids) {
+      setPart(target_call, u, { status: "ringing", invitedAt: nowIso(), invitedBy: ME, invitedByName: myName() });
+      if (!peer.users.includes(u)) peer.users.push(u);
+    }
+    if (peer.autoAnswer) setTimeout(() => user_ids.forEach((u) => peer.join(u)), peer.answerDelay);
+    return null;
+  },
+  call_preview({ target_call }) {
+    const call = db.calls.find((c) => c.id === target_call);
+    return call ? [{ id: call.id, kind: call.kind, status: call.status, callerName: call.callerName, channelId: call.channelId, people: parts(call.id).filter((p) => p.status === "joined").length }] : [];
+  },
+  pin_channel({ target_channel, pin }) {
+    let m = db.chat_members.find((x) => x.channelId === target_channel && x.userId === ME);
+    if (!m) db.chat_members.push((m = { channelId: target_channel, userId: ME }));
+    m.pinnedAt = pin ? nowIso() : null;
+    return null;
+  },
+  mute_channel({ target_channel, mute }) {
+    let m = db.chat_members.find((x) => x.channelId === target_channel && x.userId === ME);
+    if (!m) db.chat_members.push((m = { channelId: target_channel, userId: ME }));
+    m.mutedAt = mute ? nowIso() : null;
+    return null;
+  },
+  channel_people({ target_channel }) {
+    const ch = db.chat_channels.find((c) => c.id === target_channel);
+    const people = ch.kind === "general" ? db.profiles : db.profiles.filter((p) => db.chat_members.some((m) => m.channelId === ch.id && m.userId === p.id));
+    return people.map((p) => {
+      const m = db.chat_members.find((x) => x.channelId === ch.id && x.userId === p.id);
+      return { userId: p.id, fullName: p.fullName, isAdmin: !!m?.isAdmin || (ch.kind === "group" && ch.createdBy === p.id), canPost: !!m?.canPost, companyAdmin: p.companyRole === "admin" };
+    });
+  },
+  set_channel_posting({ target_channel, mode, poster_ids = [], admin_ids = null }) {
+    const ch = db.chat_channels.find((c) => c.id === target_channel);
+    if (db.profiles.find((p) => p.id === ME).companyRole !== "admin" && ch.createdBy !== ME) throw new Error("Solo quien administra el chat puede cambiar quién escribe.");
+    ch.postingMode = mode;
+    for (const u of [...poster_ids, ...(admin_ids ?? [])]) if (!db.chat_members.some((m) => m.channelId === ch.id && m.userId === u)) db.chat_members.push({ channelId: ch.id, userId: u });
+    for (const m of db.chat_members.filter((x) => x.channelId === ch.id)) {
+      m.canPost = poster_ids.includes(m.userId);
+      if (admin_ids) m.isAdmin = admin_ids.includes(m.userId);
+    }
     return null;
   },
   start_route({ target_vehicle, target_trip, route_source = "phone" }) {
@@ -436,9 +539,18 @@ const rpcs = {
           lastMessageAt: c.lastMessageAt, lastMessage: last?.body ?? null, lastSender: last?.senderName ?? null, lastKind: last?.kind ?? "text",
           unread: msgs.filter((m) => m.senderId !== ME && m.createdAt > (mine?.lastReadAt ?? "")).length,
           members: c.kind === "general" ? db.profiles.length : db.chat_members.filter((m) => m.channelId === c.id).length,
+          pinnedAt: mine?.pinnedAt ?? null,
+          muted: !!mine?.mutedAt,
+          postingMode: c.postingMode ?? "all",
+          canPost: (() => {
+            const admin = db.profiles.find((p) => p.id === ME).companyRole === "admin" || (c.kind === "group" && c.createdBy === ME) || !!mine?.isAdmin;
+            const mode = c.postingMode ?? "all";
+            return c.kind === "direct" || mode === "all" || admin || (mode === "selected" && !!mine?.canPost);
+          })(),
+          isChannelAdmin: c.kind !== "direct" && (db.profiles.find((p) => p.id === ME).companyRole === "admin" || (c.kind === "group" && c.createdBy === ME) || !!mine?.isAdmin),
         };
       })
-      .sort((a, b) => String(b.lastMessageAt ?? "").localeCompare(String(a.lastMessageAt ?? "")));
+      .sort((a, b) => String(b.pinnedAt ?? "").localeCompare(String(a.pinnedAt ?? "")) || String(b.lastMessageAt ?? "").localeCompare(String(a.lastMessageAt ?? "")));
   },
   ensure_general_channel: () => 1,
   mark_channels_delivered() {
@@ -455,6 +567,14 @@ const rpcs = {
     return db.chat_members
       .filter((m) => m.channelId === msg?.channelId && m.userId !== msg?.senderId)
       .map((m) => ({ userId: m.userId, name: db.profiles.find((p) => p.id === m.userId)?.fullName ?? "Alguien", deliveredAt: m.lastDeliveredAt ?? m.lastReadAt ?? null, readAt: m.lastReadAt ?? null }));
+  },
+  save_push_device_v2({ device_token, device_rich }) {
+    window.__pushDevices = [...(window.__pushDevices ?? []), device_token];
+    window.__pushRich = device_rich;
+    return "clave-de-prueba-0123456789abcdef0123456789abcdef0123456789abcdef";
+  },
+  save_push_subscription_v2() {
+    return "clave-web-de-prueba";
   },
   save_push_device({ device_token }) {
     window.__pushDevices = [...(window.__pushDevices ?? []), device_token];

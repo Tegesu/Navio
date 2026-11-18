@@ -4,6 +4,13 @@ import {
   Camera,
   Check,
   CheckCheck,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  ListPlus,
+  ListTodo,
+  Lock,
+  Search,
   Clock,
   Copy,
   CornerUpLeft,
@@ -33,12 +40,13 @@ import {
   X,
 } from "lucide-react";
 import { supabase, useAuth, useToast, Modal } from "./NavioDashboard.jsx";
-import { useInbox } from "./inbox.jsx";
+import { useInbox, TaskFormModal } from "./inbox.jsx";
 import { isNativeApp } from "./tracking.jsx";
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { useVoiceNote, RecordingBar, MicButton, CameraCapture, AttachmentPreview, GifPanel } from "./chatcomposer.jsx";
 import { usePermissionGate } from "./permissions.jsx";
 import { useCalls, callDuration } from "./calls.jsx";
+import { clearChatNotifications } from "./push.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Conversación: mensajes, archivos, voz, stickers y acciones            */
@@ -197,6 +205,29 @@ function useLongPress(onLongPress, ms = 450) {
   };
 }
 
+// Marca dentro del texto cada vez que aparece la palabra buscada.
+function markTerm(text, term) {
+  const value = String(text ?? "");
+  if (!term) return value;
+  const lower = value.toLowerCase();
+  const needle = term.toLowerCase();
+  const parts = [];
+  let from = 0;
+  let index = lower.indexOf(needle);
+  while (index >= 0 && parts.length < 40) {
+    if (index > from) parts.push(value.slice(from, index));
+    parts.push(
+      <mark key={index} className="rounded bg-amber-200 px-0.5 text-slate-900">
+        {value.slice(index, index + needle.length)}
+      </mark>
+    );
+    from = index + needle.length;
+    index = lower.indexOf(needle, from);
+  }
+  if (from < value.length) parts.push(value.slice(from));
+  return parts;
+}
+
 /* ---------- Deslizar para responder ---------- */
 
 // En el teléfono, deslizar a la derecha un mensaje de la otra persona lo
@@ -330,7 +361,7 @@ function ReplyQuote({ reply, mine, onJump }) {
 }
 
 // En la PC, al pasar el mouse junto al mensaje: responder, reenviar y más.
-function HoverActions({ onReply, onForward, onMore }) {
+function HoverActions({ onReply, onForward, onTask, onMore }) {
   const button = (label, Icon, onClick) => (
     <button
       type="button"
@@ -346,12 +377,13 @@ function HoverActions({ onReply, onForward, onMore }) {
     <div className="mb-1.5 hidden shrink-0 items-center rounded-full border border-slate-100 bg-white shadow-sm group-hover:flex group-focus-within:flex">
       {onReply && button("Responder", CornerUpLeft, onReply)}
       {onForward && button("Reenviar", Forward, onForward)}
+      {onTask && button("Asignar como tarea", ListPlus, onTask)}
       {button("Más opciones", Smile, onMore)}
     </div>
   );
 }
 
-function Bubble({ message, mine, showSender, reply, reactions, starred, receipts, translation, highlighted, onMenu, onJump, onOpenImage, onToggleReaction, onSwipeReply, onReply, onForward, userId }) {
+function Bubble({ message, mine, showSender, reply, reactions, starred, receipts, translation, highlighted, onMenu, onJump, onOpenImage, onToggleReaction, onSwipeReply, onReply, onForward, onTask, searchTerm, userId }) {
   const press = useLongPress(() => onMenu(message));
   const swipe = useSwipeReply(message.deletedAt ? null : onSwipeReply);
   const attachment = message.attachment;
@@ -397,7 +429,7 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
           <CornerUpLeft size={14} />
         </span>
       )}
-      {mine && <HoverActions onReply={onReply && (() => onReply(message))} onForward={onForward && (() => onForward(message))} onMore={() => onMenu(message)} />}
+      {mine && <HoverActions onReply={onReply && (() => onReply(message))} onForward={onForward && (() => onForward(message))} onTask={onTask && (() => onTask(message))} onMore={() => onMenu(message)} />}
       <div className="min-w-0 max-w-[80%]" style={swipe.dx ? { transform: `translateX(${swipe.dx}px)` } : { transition: "transform 160ms ease-out" }}>
         <div
           {...press}
@@ -417,7 +449,7 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
           {attachment && message.kind === "video" && <VideoAttachment attachment={attachment} />}
           {attachment && message.kind === "voice" && <VoiceAttachment attachment={attachment} mine={mine} />}
           {attachment && message.kind === "file" && <FileAttachment attachment={attachment} mine={mine} />}
-          {message.body && <p className="whitespace-pre-wrap break-words px-0.5 pt-0.5 text-xs leading-relaxed">{message.body}</p>}
+          {message.body && <p className="whitespace-pre-wrap break-words px-0.5 pt-0.5 text-xs leading-relaxed">{markTerm(message.body, searchTerm)}</p>}
           {translation && (
             <p className={`mt-1 border-t pt-1 text-[11px] italic ${mine ? "border-blue-400 text-blue-50" : "border-slate-100 text-slate-500"}`}>
               <Languages size={10} className="mr-1 inline" />
@@ -443,7 +475,7 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
           </div>
         )}
       </div>
-      {!mine && <HoverActions onReply={onReply && (() => onReply(message))} onForward={onForward && (() => onForward(message))} onMore={() => onMenu(message)} />}
+      {!mine && <HoverActions onReply={onReply && (() => onReply(message))} onForward={onForward && (() => onForward(message))} onTask={onTask && (() => onTask(message))} onMore={() => onMenu(message)} />}
     </div>
   );
 }
@@ -467,6 +499,7 @@ function CallLogBubble({ message, mine, onCallBack }) {
     ? "Llamada sin respuesta"
     : "Llamada perdida";
   const missed = !answered && !mine;
+  const people = Number(info.people) > 2 ? Number(info.people) : 0;
   return (
     <div id={`msg-${message.id}`} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
       <div className={`flex min-w-[190px] max-w-[80%] items-center gap-2.5 rounded-2xl px-2.5 py-2 ${mine ? "rounded-br-md bg-blue-600 text-white" : "rounded-bl-md bg-white text-slate-700 shadow-sm"}`}>
@@ -478,6 +511,7 @@ function CallLogBubble({ message, mine, onCallBack }) {
           <span className={`block text-[10px] ${mine ? "text-blue-100" : "text-slate-400"}`}>
             {hourLabel(message.createdAt)}
             {answered ? ` · ${callDuration(info.duration)}` : ""}
+            {people ? ` · ${people} personas` : ""}
           </span>
         </span>
         {onCallBack && (
@@ -524,6 +558,7 @@ function ActionSheet({ message, mine, canDeleteAll, canEdit, starred, advanced, 
         {advanced && item("reply", CornerUpLeft, "Responder")}
         {message.body && item("copy", Copy, "Copiar")}
         {advanced && item("forward", Forward, "Reenviar")}
+        {advanced && item("task", ListPlus, "Asignar como tarea")}
         {canEdit && item("edit", Edit2, "Editar")}
         {advanced && item(message.pinnedAt ? "unpin" : "pin", message.pinnedAt ? PinOff : Pin, message.pinnedAt ? "Dejar de fijar" : "Fijar")}
         {advanced && item(starred ? "unstar" : "star", starred ? StarOff : Star, starred ? "Quitar de destacados" : "Destacar")}
@@ -863,11 +898,26 @@ function StickerPanel({ onSend, onClose }) {
 
 /* ---------- La conversación ---------- */
 
-export function ChatConversation({ channel, isAdmin, onBack, header }) {
+export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jumpRequest = null }) {
   const { user, profile } = useAuth();
   const inbox = useInbox();
   const calls = useCalls();
   const composerRef = useRef(null);
+  // Buscar en este chat, tareas del chat y "asignar como tarea".
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchText, setSearchText] = useState("");
+  const [searchHits, setSearchHits] = useState(null); // ids, del más nuevo al más viejo
+  const [searchIndex, setSearchIndex] = useState(0);
+  const [taskFrom, setTaskFrom] = useState(null); // mensaje (o {} para una tarea suelta)
+  const [tasksOpen, setTasksOpen] = useState(() => {
+    try {
+      return window.localStorage.getItem("navio.chat.tasks") === "open" && window.innerWidth >= 1024;
+    } catch {
+      return false;
+    }
+  });
+  const pendingJump = useRef(null);
+  const lastIdRef = useRef(0);
   const { showToast } = useToast();
   const [messages, setMessages] = useState(null);
   const [hasMore, setHasMore] = useState(false);
@@ -937,6 +987,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
   // Mientras esta conversación está abierta, sus mensajes no salen como aviso.
   useEffect(() => {
     inbox.setOpenChannel?.(channelId);
+    clearChatNotifications(channelId);
     return () => inbox.setOpenChannel?.(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channelId]);
@@ -955,7 +1006,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
       const table = payload.table ?? "chat_messages";
       const row = payload.new ?? payload.old;
       if (table === "chat_reactions") {
-        if (row?.channelId !== channelId) return;
+        if (Number(row?.channelId) !== Number(channelId)) return;
         setReactions((prev) => {
           const rest = prev.filter((x) => !(x.messageId === row.messageId && x.userId === row.userId));
           return payload.eventType === "DELETE" ? rest : [...rest, payload.new];
@@ -963,10 +1014,10 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
         return;
       }
       if (table === "chat_members") {
-        if (row?.channelId === channelId || channel.kind === "general") loadReceipts();
+        if (Number(row?.channelId) === Number(channelId) || channel.kind === "general") loadReceipts();
         return;
       }
-      if (!row || row.channelId !== channelId) return;
+      if (!row || Number(row.channelId) !== Number(channelId)) return;
       setMessages((prev) => {
         if (!prev) return prev;
         if (payload.eventType === "INSERT") return prev.some((m) => m.id === row.id) ? prev : [...prev.filter((m) => !(m.pending && m.body === row.body && row.senderId === user?.id)), row];
@@ -981,6 +1032,20 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
       if (payload.eventType === "INSERT" && row.senderId !== user?.id) inbox.markChannelRead(channelId);
     });
     const poll = window.setInterval(loadReceipts, 20000);
+    const freshPoll = window.setInterval(async () => {
+      if (document.visibilityState !== "visible") return;
+      const last = lastIdRef.current;
+      if (!last) return;
+      const { data } = await supabase.from("chat_messages").select("*").eq("channelId", channelId).gt("id", last).order("id", { ascending: true }).limit(50);
+      if (!data?.length) return;
+      setMessages((prev) => {
+        if (!prev) return prev;
+        const byId = new Map(prev.filter((m) => !m.pending || !data.some((d) => d.senderId === m.senderId && d.body === m.body)).map((m) => [m.id, m]));
+        for (const row of data) byId.set(row.id, row);
+        return [...byId.values()].sort((x, y) => (typeof x.id === "number" && typeof y.id === "number" ? x.id - y.id : 0));
+      });
+      if (data.some((m) => m.senderId !== user?.id)) inbox.markChannelRead(channelId);
+    }, 8000);
     // Si el teléfono pausó Navio (otra app, pantalla apagada), al volver se
     // traen los mensajes que llegaron mientras tanto.
     const catchUp = async () => {
@@ -1003,6 +1068,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
     return () => {
       off();
       window.clearInterval(poll);
+      window.clearInterval(freshPoll);
       document.removeEventListener("visibilitychange", catchUp);
       window.removeEventListener("online", catchUp);
       window.removeEventListener("focus", catchUp);
@@ -1026,13 +1092,110 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
   function jumpTo(id) {
     const el = document.getElementById(`msg-${id}`);
     if (!el) {
-      showToast("Ese mensaje es más antiguo: carga los anteriores para verlo.");
+      loadAround(id);
       return;
     }
     stickRef.current = false;
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     setHighlight(id);
     window.setTimeout(() => setHighlight(null), 1600);
+  }
+
+  // Trae un mensaje viejo (y los que siguen) para poder ir a él.
+  async function loadAround(id) {
+    stickRef.current = false;
+    pendingJump.current = id;
+    const [after, before] = await Promise.all([
+      supabase.from("chat_messages").select("*").eq("channelId", channelId).gte("id", id).order("id", { ascending: true }).limit(300),
+      supabase.from("chat_messages").select("*").eq("channelId", channelId).lt("id", id).order("id", { ascending: false }).limit(20),
+    ]);
+    const rows = [...(before.data ?? []), ...(after.data ?? [])];
+    if (!rows.some((m) => m.id === id)) {
+      pendingJump.current = null;
+      showToast("No se encontró ese mensaje.");
+      return;
+    }
+    setHasMore((before.data ?? []).length === 20);
+    setMessages((prev) => {
+      const byId = new Map((prev ?? []).filter((m) => !m.pending).map((m) => [m.id, m]));
+      for (const row of rows) byId.set(row.id, row);
+      return [...byId.values()].sort((x, y) => x.id - y.id);
+    });
+  }
+
+  // Al terminar de cargar, se va al mensaje pendiente.
+  useEffect(() => {
+    const id = pendingJump.current;
+    if (!id) return;
+    const el = document.getElementById(`msg-${id}`);
+    if (!el) return;
+    pendingJump.current = null;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlight(id);
+    window.setTimeout(() => setHighlight(null), 1600);
+  }, [messages]);
+
+  // Desde la búsqueda de la lista: ir al mensaje encontrado.
+  useEffect(() => {
+    if (!jumpRequest?.messageId || messages === null) return;
+    jumpTo(jumpRequest.messageId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpRequest?.at, messages === null]);
+
+  // Buscar palabras en este chat.
+  const searchTerm = searchOpen ? searchText.trim() : "";
+  useEffect(() => {
+    if (searchTerm.length < 2) {
+      setSearchHits(null);
+      return undefined;
+    }
+    let alive = true;
+    const timer = window.setTimeout(async () => {
+      const { data } = await supabase
+        .from("chat_messages")
+        .select("id")
+        .eq("channelId", channelId)
+        .ilike("body", `%${searchTerm.replace(/[%_\\]/g, (m) => `\\${m}`)}%`)
+        .is("deletedAt", null)
+        .order("id", { ascending: false })
+        .limit(200);
+      if (!alive) return;
+      const ids = (data ?? []).map((m) => m.id);
+      setSearchHits(ids);
+      setSearchIndex(0);
+      if (ids[0]) jumpTo(ids[0]);
+    }, 350);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchTerm, channelId]);
+  const moveSearch = (step) => {
+    if (!searchHits?.length) return;
+    const next = (searchIndex + step + searchHits.length) % searchHits.length;
+    setSearchIndex(next);
+    jumpTo(searchHits[next]);
+  };
+
+  // Tareas pendientes de este chat.
+  const chatTasks = (inbox?.tasks ?? []).filter((t) => Number(t.channelId) === Number(channelId) && (t.status === "open" || t.status === "in_progress"));
+  const toggleTasks = () =>
+    setTasksOpen((v) => {
+      try {
+        window.localStorage.setItem("navio.chat.tasks", v ? "closed" : "open");
+      } catch {
+        // Solo es comodidad.
+      }
+      return !v;
+    });
+  async function finishTask(task) {
+    const { error } = await supabase.from("tasks").update({ status: "done" }).eq("id", task.id);
+    if (error) showToast(error.message);
+    else {
+      showToast("Tarea terminada.");
+      inbox.reloadTasks?.();
+    }
   }
 
   async function insertMessage(row) {
@@ -1162,6 +1325,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
       navigator.clipboard?.writeText(message.body ?? "");
       showToast("Copiado.");
     } else if (action === "forward") setForwardFor(message);
+    else if (action === "task") setTaskFrom(message);
     else if (action === "edit") {
       setReplyTo(null);
       setEditing(message);
@@ -1201,6 +1365,8 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
   }
 
   const visible = (messages ?? []).filter((m) => !hidden.has(m.id) && (!onlyStarred || stars.has(m.id)));
+  lastIdRef.current = (messages ?? []).reduce((max, m) => (typeof m.id === "number" && m.id > max ? m.id : max), 0);
+  const canPost = channel.canPost !== false;
   let lastDay = null;
   const menuMessage = menuFor;
   const menuMine = menuMessage?.senderId === user?.id;
@@ -1214,12 +1380,73 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
           </button>
         )}
         <div className="min-w-0 flex-1">{header}</div>
+        <button
+          type="button"
+          onClick={() => {
+            setSearchOpen((v) => !v);
+            setSearchText("");
+          }}
+          aria-pressed={searchOpen}
+          aria-label="Buscar en este chat"
+          title="Buscar en este chat"
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${searchOpen ? "bg-blue-50 text-blue-600" : "text-slate-400 hover:bg-slate-100"}`}
+        >
+          <Search size={15} />
+        </button>
+        <button
+          type="button"
+          onClick={toggleTasks}
+          aria-pressed={tasksOpen}
+          aria-label="Tareas pendientes de este chat"
+          title="Tareas pendientes de este chat"
+          className={`relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${tasksOpen ? "bg-blue-50 text-blue-600" : "text-slate-400 hover:bg-slate-100"}`}
+        >
+          <ListTodo size={15} />
+          {chatTasks.length > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-blue-600 px-1 text-[9px] font-bold text-white">{chatTasks.length}</span>
+          )}
+        </button>
         {advanced && (
-          <button type="button" onClick={() => setOnlyStarred((v) => !v)} aria-pressed={onlyStarred} title="Ver solo destacados" className={`flex h-8 w-8 items-center justify-center rounded-lg ${onlyStarred ? "bg-amber-50 text-amber-600" : "text-slate-400 hover:bg-slate-100"}`}>
+          <button type="button" onClick={() => setOnlyStarred((v) => !v)} aria-pressed={onlyStarred} title="Ver solo destacados" className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${onlyStarred ? "bg-amber-50 text-amber-600" : "text-slate-400 hover:bg-slate-100"}`}>
             <Star size={15} className={onlyStarred ? "fill-current" : ""} />
           </button>
         )}
       </div>
+      {searchOpen && (
+        <div className="flex items-center gap-1.5 border-b border-slate-100 bg-white px-3 py-1.5">
+          <div className="relative min-w-0 flex-1">
+            <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              autoFocus
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  moveSearch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "Escape") setSearchOpen(false);
+              }}
+              placeholder="Buscar en este chat"
+              aria-label="Buscar en este chat"
+              className="h-8 w-full rounded-lg border border-slate-200 pl-8 pr-2 text-xs focus:border-blue-400 focus:outline-none"
+            />
+          </div>
+          <span className="shrink-0 text-[11px] text-slate-400">
+            {searchHits === null ? "" : searchHits.length === 0 ? "Sin resultados" : `${searchIndex + 1} de ${searchHits.length}`}
+          </span>
+          <button type="button" onClick={() => moveSearch(1)} disabled={!searchHits?.length} aria-label="Resultado anterior" title="Más antiguo" className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-40">
+            <ChevronUp size={15} />
+          </button>
+          <button type="button" onClick={() => moveSearch(-1)} disabled={!searchHits?.length} aria-label="Resultado siguiente" title="Más reciente" className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-40">
+            <ChevronDown size={15} />
+          </button>
+          <button type="button" onClick={() => setSearchOpen(false)} aria-label="Cerrar búsqueda" className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+      <div className="relative flex min-h-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
 
       {pinned.length > 0 && !onlyStarred && (
         <div className="space-y-0.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5">
@@ -1266,7 +1493,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
             <div key={m.id}>
               {showDay && <p className="py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-400">{day}</p>}
               {m.kind === "call" ? (
-                <CallLogBubble message={m} mine={mine} onCallBack={calls.available && channel.kind === "direct" ? (kind) => calls.start(channel, kind) : null} />
+                <CallLogBubble message={m} mine={mine} onCallBack={calls.available && channel.kind !== "general" ? (kind) => calls.start(channel, kind) : null} />
               ) : (
               <Bubble
                 message={m}
@@ -1282,9 +1509,11 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
                 onJump={jumpTo}
                 onOpenImage={setViewer}
                 onToggleReaction={toggleReaction}
-                onSwipeReply={!mine && !m.pending ? () => startReply(m) : null}
-                onReply={advanced && !m.pending ? startReply : null}
+                onSwipeReply={!mine && !m.pending && canPost ? () => startReply(m) : null}
+                onReply={advanced && !m.pending && canPost ? startReply : null}
                 onForward={advanced && !m.pending ? setForwardFor : null}
+                onTask={advanced && !m.pending ? setTaskFrom : null}
+                searchTerm={searchTerm.length >= 2 ? searchTerm : ""}
                 userId={user?.id}
               />
               )}
@@ -1370,7 +1599,12 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
         onChange={(e) => addPending(e.target.files, "file", () => (e.target.value = ""))}
       />
 
-      {pending.length > 0 ? (
+      {!canPost ? (
+        <p className="flex items-center justify-center gap-1.5 border-t border-slate-100 bg-slate-50 px-3 py-3 text-center text-[11px] text-slate-500">
+          <Lock size={12} className="shrink-0" />
+          {channel.postingMode === "admins" ? "Solo los administradores pueden enviar mensajes en este chat." : "Solo algunas personas pueden enviar mensajes en este chat."}
+        </p>
+      ) : pending.length > 0 ? (
         <AttachmentPreview
           items={pending}
           onRemove={(index) =>
@@ -1486,6 +1720,57 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
       {infoFor && <InfoModal message={infoFor} onClose={() => setInfoFor(null)} />}
       {forwardFor && <ForwardModal message={forwardFor} currentChannelId={channelId} onClose={() => setForwardFor(null)} />}
       {viewer && <ImageViewer url={viewer} onClose={() => setViewer(null)} />}
+      {taskFrom && <TaskFormModal isAdmin={isAdmin} channel={channel} message={taskFrom.id ? taskFrom : null} onClose={() => setTaskFrom(null)} />}
+      </div>
+      {tasksOpen && (
+        <aside className="absolute inset-y-0 right-0 z-20 flex w-[85%] max-w-[300px] flex-col border-l border-slate-100 bg-white shadow-xl lg:static lg:z-auto lg:w-64 lg:shadow-none">
+          <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2.5">
+            <p className="text-xs font-bold text-slate-700">Tareas pendientes</p>
+            <div className="flex items-center gap-1">
+              <button type="button" onClick={() => setTaskFrom({})} title="Nueva tarea en este chat" className="flex items-center gap-1 rounded-lg bg-blue-600 px-2 py-1 text-[10px] font-semibold text-white hover:bg-blue-700">
+                <Plus size={11} /> Nueva
+              </button>
+              <button type="button" onClick={toggleTasks} aria-label="Ocultar tareas" className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100">
+                <X size={13} />
+              </button>
+            </div>
+          </div>
+          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
+            {chatTasks.length === 0 && (
+              <p className="px-2 py-6 text-center text-[11px] leading-relaxed text-slate-400">
+                No hay tareas pendientes en este chat. Pasa el mouse junto a un mensaje (o mantenlo presionado) y elige "Asignar como tarea".
+              </p>
+            )}
+            {chatTasks.map((t) => {
+              const canFinish = isAdmin || t.assignedTo === user?.id || t.createdBy === user?.id;
+              const late = t.dueDate && t.dueDate < new Date().toISOString().slice(0, 10);
+              return (
+                <div key={t.id} className="rounded-xl border border-slate-200 bg-white p-2.5">
+                  <button
+                    type="button"
+                    onClick={() => t.messageId && jumpTo(t.messageId)}
+                    className={`block w-full text-left text-xs font-semibold text-slate-700 ${t.messageId ? "hover:text-blue-600" : "cursor-default"}`}
+                    title={t.messageId ? "Ir al mensaje" : undefined}
+                  >
+                    {t.title}
+                  </button>
+                  <p className="mt-0.5 text-[10px] text-slate-400">
+                    {t.assignedToName || "Sin responsable"}
+                    {t.dueDate ? <span className={late ? "font-semibold text-amber-600" : ""}> · {late ? "venció" : "para"} el {t.dueDate.split("-").reverse().join("/")}</span> : null}
+                    {t.priority === "high" ? " · prioridad alta" : ""}
+                  </p>
+                  {canFinish && (
+                    <button type="button" onClick={() => finishTask(t)} className="mt-1.5 inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-slate-50">
+                      <CheckCircle2 size={11} /> Terminar
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </aside>
+      )}
+      </div>
     </div>
   );
 }

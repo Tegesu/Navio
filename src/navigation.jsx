@@ -135,16 +135,8 @@ function buildTree({ groupChats }) {
       label: "Mensajes",
       icon: MessageSquare,
       badge: "messages",
+      // Todas las conversaciones van juntas en Mensajes (sin subsecciones).
       route: ["messages", "all"],
-      children: [
-        {
-          key: "m-group",
-          label: "Chats grupales",
-          route: ["messages", "group"],
-          children: groupChats.map((c) => ({ key: `m-${c.id}`, label: c.kind === "general" ? "General" : c.name || "Grupo", route: ["messages", `channel:${c.id}`], count: c.unread })),
-        },
-        { key: "m-direct", label: "Chats privados", route: ["messages", "direct"] },
-      ],
     },
     {
       key: "tasks",

@@ -35,6 +35,8 @@ if (new URLSearchParams(window.location.search).has("native")) {
     PluginHeaders: [
       { name: "BackgroundGeolocation", methods: [{ name: "addWatcher", rtype: "callback" }, { name: "removeWatcher", rtype: "promise" }, { name: "openSettings", rtype: "promise" }] },
       { name: "CapacitorHttp", methods: [{ name: "request", rtype: "promise" }] },
+      // App 1.0.7: notificaciones armadas por la app (?oldapp la quita).
+      ...(new URLSearchParams(window.location.search).has("oldapp") ? [] : [{ name: "NavioNotifications", methods: ["info", "configure", "forget", "clear"].map((n) => ({ name: n, rtype: "promise" })) }]),
       {
         name: "PushNotifications",
         methods: ["checkPermissions", "requestPermissions", "register", "unregister", "removeAllListeners", "createChannel"].map((n) => ({ name: n, rtype: "promise" })).concat([{ name: "addListener", rtype: "callback" }, { name: "removeListener", rtype: "promise" }]),
@@ -75,6 +77,12 @@ if (new URLSearchParams(window.location.search).has("native")) {
           return Promise.resolve();
         }
         if (method === "removeListener") native.pushListeners.delete(options.callbackId);
+        return Promise.resolve();
+      }
+      if (plugin === "NavioNotifications") {
+        if (method === "configure") native.richConfig = options;
+        if (method === "clear") native.cleared = [...(native.cleared ?? []), options.channelId];
+        if (method === "info") return Promise.resolve({ rich: true, version: 1 });
         return Promise.resolve();
       }
       if (plugin === "BackgroundGeolocation" && method === "removeWatcher") watchers.delete(options.id);

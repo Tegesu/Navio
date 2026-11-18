@@ -284,10 +284,6 @@ const MENU = [
     tone: "bg-sky-50 text-sky-600",
     badge: "unreadMessages",
     route: ["messages", "all"],
-    items: [
-      { label: "Chats grupales", route: ["messages", "group"] },
-      { label: "Chats privados", route: ["messages", "direct"] },
-    ],
   },
   {
     title: "Tareas",

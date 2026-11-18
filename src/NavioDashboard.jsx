@@ -8592,13 +8592,7 @@ function NavioApp() {
                     />
                   )}
                   {activeTab === "messages" && (
-                    <MessagesPage
-                      isAdmin={isCompanyAdmin}
-                      view={activeSub}
-                      onOpenChannel={(c) => {
-                        if (c.kind !== "direct") setStoredSubs((prev) => ({ ...(prev ?? {}), messages: `channel:${c.id}` }));
-                      }}
-                    />
+                    <MessagesPage isAdmin={isCompanyAdmin} view={activeSub} />
                   )}
                   {activeTab === "tasks" && <TasksPage isAdmin={isCompanyAdmin} view={activeSub} />}
                   {activeTab === "settings" && (

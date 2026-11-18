@@ -26,6 +26,39 @@ function nativePlugin() {
     return null;
   }
 }
+// Notificaciones armadas por la app (1.0.7 o más nueva): responder desde el aviso.
+let richPlugin = null;
+function navioNotifications() {
+  if (!isNativeApp()) return null;
+  try {
+    if (!Capacitor.isPluginAvailable("NavioNotifications")) return null;
+    richPlugin = richPlugin ?? registerPlugin("NavioNotifications");
+    return richPlugin;
+  } catch {
+    return null;
+  }
+}
+const missingV28 = (error) => /function|schema cache|does not exist|could not find/i.test(error?.message ?? "");
+
+// Al abrir un chat se quitan sus notificaciones (en el teléfono y en el navegador).
+export async function clearChatNotifications(channelId) {
+  if (!channelId) return;
+  try {
+    await navioNotifications()?.clear?.({ channelId: Number(channelId) });
+  } catch {
+    // Sin la app nueva.
+  }
+  try {
+    if (!isNativeApp() && "serviceWorker" in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      const list = (await reg?.getNotifications?.({ tag: `chat-${channelId}` })) ?? [];
+      list.forEach((n) => n.close());
+    }
+  } catch {
+    // El navegador no deja verlas.
+  }
+}
+
 const webSupported = () =>
   typeof window !== "undefined" && !isNativeApp() && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window && !!PUSH_PUBLIC_KEY;
 export const pushSupported = () => !!nativePlugin() || webSupported();
@@ -76,12 +109,26 @@ async function registration() {
 
 async function saveSubscription(sub) {
   const json = sub.toJSON();
-  const { error } = await supabase.rpc("save_push_subscription", {
+  const args = {
     sub_endpoint: json.endpoint,
     sub_p256dh: json.keys?.p256dh,
     sub_auth: json.keys?.auth,
     sub_agent: navigator.userAgent.slice(0, 300),
-  });
+  };
+  // Con la v28, el navegador recibe su clave para "Marcar como leído" desde el aviso.
+  const { data: secret, error } = await supabase.rpc("save_push_subscription_v2", args);
+  if (error && missingV28(error)) return (await supabase.rpc("save_push_subscription", args)).error;
+  if (!error && secret) {
+    try {
+      const cache = await caches.open("navio-push");
+      await cache.put(
+        "/__navio-push-key",
+        new Response(JSON.stringify({ endpoint: json.endpoint, secret, url: supabase.supabaseUrl, anon: supabase.supabaseKey }), { headers: { "content-type": "application/json" } })
+      );
+    } catch {
+      // Sin almacenamiento: el aviso funciona igual, sin "Marcar como leído".
+    }
+  }
   return error;
 }
 
@@ -118,8 +165,19 @@ async function enableNativePush() {
     })();
     window.setTimeout(() => reject(new Error("tiempo")), 20000);
   }).finally(() => handles.forEach((h) => h?.remove?.()));
-  const { error } = await supabase.rpc("save_push_device", { device_token: token, device_platform: "android" });
-  if (error) throw error;
+  const rich = navioNotifications();
+  const { data: secret, error: richError } = await supabase.rpc("save_push_device_v2", { device_token: token, device_platform: "android", device_rich: !!rich });
+  if (richError) {
+    if (!missingV28(richError)) throw richError;
+    const { error } = await supabase.rpc("save_push_device", { device_token: token, device_platform: "android" });
+    if (error) throw error;
+  } else if (rich && secret) {
+    try {
+      await rich.configure({ token, secret, url: supabase.supabaseUrl, anon: supabase.supabaseKey });
+    } catch {
+      // La notificación sale igual, sin responder desde el aviso.
+    }
+  }
   writeKey(NATIVE_KEY, token);
   announce();
   return true;
@@ -136,6 +194,7 @@ async function disableNativePush() {
   if (token) await supabase.rpc("remove_push_device", { device_token: token });
   try {
     await nativePlugin()?.unregister?.();
+    await navioNotifications()?.forget?.();
   } catch {
     // Ya no estaba registrado.
   }
@@ -155,6 +214,11 @@ export async function disablePush() {
   const sub = await reg?.pushManager.getSubscription();
   if (!sub) return undefined;
   await supabase.rpc("remove_push_subscription", { sub_endpoint: sub.endpoint });
+  try {
+    await (await caches.open("navio-push")).delete("/__navio-push-key");
+  } catch {
+    // Sin almacenamiento.
+  }
   return sub.unsubscribe();
 }
 
