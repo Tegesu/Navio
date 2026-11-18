@@ -239,7 +239,8 @@ export function MaintenanceSearchPage({ records, vehicles, campaigns = [], onOpe
       </div>
 
       <div className={`${card} p-2.5`}>
-        <div className="grid grid-cols-1 gap-x-2.5 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-5">
+        {/* Cada campo mide lo justo (unos 190 px); caben los que quepan por renglón. */}
+        <div className="grid grid-cols-1 gap-x-3 gap-y-1.5 sm:grid-cols-[repeat(auto-fill,minmax(176px,196px))]">
           {SEARCH_FIELDS.map((field) => (
             <SearchField
               key={field.id}
