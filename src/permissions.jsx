@@ -2,6 +2,22 @@ import { useCallback, useEffect, useState } from "react";
 import { Bell, Camera, MapPin, Mic, ShieldCheck } from "lucide-react";
 import { Modal } from "./NavioDashboard.jsx";
 import { isNativeApp } from "./tracking.jsx";
+import { Capacitor, registerPlugin } from "@capacitor/core";
+
+// En la app de Android, el permiso de notificaciones lo da el plugin de
+// Capacitor (el navegador interno no tiene "Notification").
+let pushPlugin = null;
+function nativePushPlugin() {
+  if (!isNativeApp()) return null;
+  try {
+    if (!Capacitor.isPluginAvailable("PushNotifications")) return null;
+    pushPlugin = pushPlugin ?? registerPlugin("PushNotifications");
+    return pushPlugin;
+  } catch {
+    return null;
+  }
+}
+const nativeState = (receive) => (receive === "granted" ? "granted" : receive === "denied" ? "denied" : "prompt");
 
 /* ---------------------------------------------------------------------- */
 /*  Permisos: micrófono, cámara, ubicación y notificaciones               */
@@ -48,6 +64,15 @@ export function usePermission(name) {
   const [state, setState] = useState(() => (name === "notifications" ? readNotificationState() : "unknown"));
   const refresh = useCallback(async () => {
     if (name === "notifications") {
+      const plugin = nativePushPlugin();
+      if (plugin) {
+        try {
+          setState(nativeState((await plugin.checkPermissions()).receive));
+        } catch {
+          setState("prompt");
+        }
+        return;
+      }
       setState(readNotificationState());
       return;
     }
@@ -98,6 +123,11 @@ async function askSystem(name) {
       return { ok: true };
     }
     if (name === "notifications") {
+      const plugin = nativePushPlugin();
+      if (plugin) {
+        const perm = await plugin.requestPermissions();
+        return perm.receive === "granted" ? { ok: true } : { ok: false, reason: "denied" };
+      }
       if (typeof Notification === "undefined") return { ok: false, reason: "unsupported" };
       return (await Notification.requestPermission()) === "granted" ? { ok: true } : { ok: false, reason: "denied" };
     }

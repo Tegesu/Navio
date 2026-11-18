@@ -10,12 +10,14 @@ import {
   Megaphone,
   MessageSquare,
   Navigation,
+  Phone,
   Plus,
   Receipt,
   Send,
   Trash2,
   User,
   Users,
+  Video,
   X,
 } from "lucide-react";
 import { supabase, useAuth, useToast, useDateFormat, formatDate, Modal, avatarUrl, timeAgoLabel, localISODate } from "./NavioDashboard.jsx";
@@ -23,6 +25,7 @@ import { usePeople, personName } from "./people.jsx";
 import { useBackLayer, goBack } from "./history.js";
 import { ChatConversation, previewText } from "./chat.jsx";
 import { PushInvite } from "./push.jsx";
+import { useCalls } from "./calls.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Bandeja: alertas, mensajes y tareas de la persona                     */
@@ -39,6 +42,33 @@ export function useInbox() {
 
 let inboxChannelSeq = 0;
 
+// Aviso arriba de la pantalla: "Fulano: mensaje". Tocarlo abre la conversación.
+function MessageBanner({ banner, onClose }) {
+  const open = () => {
+    onClose();
+    window.postMessage({ type: "navio:open", url: `/?open=messages&sub=channel:${banner.channelId}` }, window.location.origin);
+  };
+  return (
+    <div role="status" className="fixed left-1/2 top-[max(env(safe-area-inset-top),0.5rem)] z-[60] w-[min(92vw,380px)] -translate-x-1/2">
+      <div className="flex items-center gap-2.5 rounded-2xl border border-slate-200 bg-white p-2.5 shadow-xl">
+        <button type="button" onClick={open} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
+          <img src={avatarUrl(banner.name)} alt="" className="h-9 w-9 shrink-0 rounded-full" />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-xs font-bold text-slate-800">
+              {banner.name}
+              <span className="font-normal text-slate-400">{banner.where}</span>
+            </span>
+            <span className="block truncate text-[11px] text-slate-500">{banner.text}</span>
+          </span>
+        </button>
+        <button type="button" onClick={onClose} aria-label="Cerrar aviso" className="shrink-0 rounded-lg p-1 text-slate-400 hover:bg-slate-100">
+          <X size={14} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function InboxProvider({ children }) {
   const { user, profile } = useAuth();
   const { showToast } = useToast();
@@ -48,6 +78,12 @@ export function InboxProvider({ children }) {
   const [available, setAvailable] = useState(true); // false si falta la migración v17
   const messageListeners = useRef(new Set());
   const overviewTimer = useRef(null);
+  // Aviso dentro de Navio cuando llega un mensaje de otra conversación.
+  const [banner, setBanner] = useState(null);
+  const bannerTimer = useRef(null);
+  const openChannelRef = useRef(null);
+  const channelsRef = useRef([]);
+  channelsRef.current = channels;
   const userId = user?.id ?? null;
   const companyId = profile?.companyId ?? null;
   // Sube cuando hay que volver a conectar el tiempo real (al regresar a Navio).
@@ -96,7 +132,17 @@ export function InboxProvider({ children }) {
       .on("postgres_changes", { event: "*", schema: "public", table: "chat_messages" }, (payload) => {
         messageListeners.current.forEach((listener) => listener(payload));
         refreshOverview();
-        if (payload.eventType === "INSERT" && payload.new?.senderId !== userId) markDelivered();
+        if (payload.eventType === "INSERT" && payload.new?.senderId !== userId) {
+          markDelivered();
+          const m = payload.new;
+          if (m && m.senderId && m.kind !== "call" && m.channelId !== openChannelRef.current && document.visibilityState === "visible") {
+            const ch = channelsRef.current.find((c) => c.id === m.channelId);
+            const where = ch?.kind === "general" ? " · General" : ch?.kind === "group" ? ` · ${ch.name || "Grupo"}` : "";
+            setBanner({ id: m.id, channelId: m.channelId, name: m.senderName || "Mensaje nuevo", where, text: previewText(m.kind, m.body) || "Mensaje" });
+            window.clearTimeout(bannerTimer.current);
+            bannerTimer.current = window.setTimeout(() => setBanner(null), 5000);
+          }
+        }
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "chat_reactions" }, (payload) => {
         messageListeners.current.forEach((listener) => listener(payload));
@@ -144,6 +190,11 @@ export function InboxProvider({ children }) {
     await supabase.from("notifications").delete().eq("id", id);
   }, []);
 
+  // La conversación abierta en pantalla (de esa no se muestra el aviso).
+  const setOpenChannel = useCallback((id) => {
+    openChannelRef.current = id;
+  }, []);
+
   const subscribeMessages = useCallback((listener) => {
     messageListeners.current.add(listener);
     return () => messageListeners.current.delete(listener);
@@ -167,13 +218,19 @@ export function InboxProvider({ children }) {
       reloadChannels: loadChannels,
       markChannelRead,
       subscribeMessages,
+      setOpenChannel,
       tasks,
       myOpenTasks: openTasks.length,
       reloadTasks: loadTasks,
     };
-  }, [available, notifications, channels, tasks, userId, markRead, removeNotification, loadChannels, markChannelRead, subscribeMessages, loadTasks]);
+  }, [available, notifications, channels, tasks, userId, markRead, removeNotification, loadChannels, markChannelRead, subscribeMessages, setOpenChannel, loadTasks]);
 
-  return <InboxContext.Provider value={value}>{children}</InboxContext.Provider>;
+  return (
+    <InboxContext.Provider value={value}>
+      {children}
+      {banner && <MessageBanner banner={banner} onClose={() => setBanner(null)} />}
+    </InboxContext.Provider>
+  );
 }
 
 function CountBadge({ count, className = "" }) {
@@ -481,6 +538,7 @@ function NewConversationModal({ group = null, initialMode = "direct", onOpen, on
 function Conversation({ channel, isAdmin, onBack, onChanged }) {
   const { user } = useAuth();
   const inbox = useInbox();
+  const calls = useCalls();
   const { showToast } = useToast();
   const [editing, setEditing] = useState(null);
   const channelId = channel.id;
@@ -506,6 +564,28 @@ function Conversation({ channel, isAdmin, onBack, onChanged }) {
           {channel.kind === "general" ? `Toda la empresa · ${channel.members} personas` : channel.kind === "group" ? `${channel.members} participantes` : "Conversación directa"}
         </p>
       </div>
+      {channel.kind === "direct" && calls.available && channel.otherUserId && (
+        <>
+          <button
+            type="button"
+            onClick={() => calls.start(channel, "audio")}
+            aria-label="Llamada de voz"
+            title="Llamada de voz"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50"
+          >
+            <Phone size={17} />
+          </button>
+          <button
+            type="button"
+            onClick={() => calls.start(channel, "video")}
+            aria-label="Videollamada"
+            title="Videollamada"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50"
+          >
+            <Video size={18} />
+          </button>
+        </>
+      )}
       {canManage && (
         <button onClick={editGroup} className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
           Participantes

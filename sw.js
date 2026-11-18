@@ -33,6 +33,9 @@ self.addEventListener("push", (event) => {
         badge: "/icons/icon-192.png",
         tag: data.tag || undefined,
         renotify: !!data.tag,
+        // Las llamadas se quedan en pantalla hasta que se tocan.
+        requireInteraction: !!data.requireInteraction,
+        vibrate: data.requireInteraction ? [400, 200, 400, 200, 400] : undefined,
         data: { url: data.url || "/" },
       });
     })

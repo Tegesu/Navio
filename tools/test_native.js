@@ -14,7 +14,13 @@ if (new URLSearchParams(window.location.search).has("native")) {
     http: [],
     denied: false,
     pushPermission: "prompt",
+    pushDeny: false, // el teléfono dice "No permitir"
+    channels: [],
     pushListeners: new Map(),
+    // Llega un aviso con la app abierta (Android no lo muestra arriba).
+    receivePush(data = {}) {
+      for (const l of native.pushListeners.values()) if (l.event === "pushNotificationReceived") l.callback({ title: "Navio", body: "", data });
+    },
     // Simula tocar una notificación con la app abierta.
     tapPush(url) {
       for (const l of native.pushListeners.values()) if (l.event === "pushNotificationActionPerformed") l.callback({ notification: { data: { url } } });
@@ -31,7 +37,7 @@ if (new URLSearchParams(window.location.search).has("native")) {
       { name: "CapacitorHttp", methods: [{ name: "request", rtype: "promise" }] },
       {
         name: "PushNotifications",
-        methods: ["checkPermissions", "requestPermissions", "register", "unregister", "removeAllListeners"].map((n) => ({ name: n, rtype: "promise" })).concat([{ name: "addListener", rtype: "callback" }, { name: "removeListener", rtype: "promise" }]),
+        methods: ["checkPermissions", "requestPermissions", "register", "unregister", "removeAllListeners", "createChannel"].map((n) => ({ name: n, rtype: "promise" })).concat([{ name: "addListener", rtype: "callback" }, { name: "removeListener", rtype: "promise" }]),
       },
     ],
     nativeCallback(plugin, method, options, callback) {
@@ -55,8 +61,12 @@ if (new URLSearchParams(window.location.search).has("native")) {
       if (plugin === "PushNotifications") {
         if (method === "checkPermissions") return Promise.resolve({ receive: native.pushPermission });
         if (method === "requestPermissions") {
-          native.pushPermission = "granted";
-          return Promise.resolve({ receive: "granted" });
+          native.pushPermission = native.pushDeny ? "denied" : "granted";
+          return Promise.resolve({ receive: native.pushPermission });
+        }
+        if (method === "createChannel") {
+          if (!native.channels.some((c) => c.id === options.id)) native.channels.push(options);
+          return Promise.resolve();
         }
         if (method === "register") {
           window.setTimeout(() => {

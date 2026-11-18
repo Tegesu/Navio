@@ -4,6 +4,7 @@ import { PeopleProvider } from "./people.jsx";
 import { TrackingProvider, TrackingPill, DriverModeModal, LiveMapPage } from "./tracking.jsx";
 import { TransfersPage } from "./trips.jsx";
 import { InboxProvider, NavBadge, BellButton, NotificationsPanel, MessagesPage, TasksPage } from "./inbox.jsx";
+import { CallProvider } from "./calls.jsx";
 import { hideSplash, FullScreenLoader, SupabaseSetupNotice, LoginPage, UpdatePasswordPage, MfaChallengePage, OnboardingPage, CompanyInactivePage, ConnectionErrorPage, WeakPasswordPrompt } from "./auth.jsx";
 import { ConfigurationPage, IdleGuard } from "./settings.jsx";
 import { AdminCompaniesPage } from "./admin.jsx";
@@ -7987,13 +7988,15 @@ function AppProviders({ fleet, children }) {
   return (
     <PeopleProvider>
       <InboxProvider>
-        <TrackingProvider>
-          <FleetDataProvider value={fleet}>{children}</FleetDataProvider>
-          <IdleGuard />
-          <PushKeeper />
-          <LegalAcceptanceGate />
-          <CookieNotice />
-        </TrackingProvider>
+        <CallProvider>
+          <TrackingProvider>
+            <FleetDataProvider value={fleet}>{children}</FleetDataProvider>
+            <IdleGuard />
+            <PushKeeper />
+            <LegalAcceptanceGate />
+            <CookieNotice />
+          </TrackingProvider>
+        </CallProvider>
       </InboxProvider>
     </PeopleProvider>
   );

@@ -15,6 +15,10 @@ import {
   Info,
   Languages,
   Mic,
+  Phone,
+  PhoneIncoming,
+  PhoneMissed,
+  PhoneOutgoing,
   Pin,
   PinOff,
   Plus,
@@ -25,6 +29,7 @@ import {
   Sticker,
   Trash2,
   Upload,
+  Video,
   X,
 } from "lucide-react";
 import { supabase, useAuth, useToast, Modal } from "./NavioDashboard.jsx";
@@ -33,6 +38,7 @@ import { isNativeApp } from "./tracking.jsx";
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { useVoiceNote, RecordingBar, MicButton, CameraCapture, AttachmentPreview, GifPanel } from "./chatcomposer.jsx";
 import { usePermissionGate } from "./permissions.jsx";
+import { useCalls, callDuration } from "./calls.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Conversación: mensajes, archivos, voz, stickers y acciones            */
@@ -74,7 +80,8 @@ MIME_BY_EXT.jpeg = "image/jpeg";
 MIME_BY_EXT.m4a = "audio/mp4";
 
 const KIND_LABEL = { image: "📷 Foto", video: "🎬 Video", file: "📄 Documento", voice: "🎤 Nota de voz", sticker: "Sticker" };
-export const previewText = (kind, body) => (kind && kind !== "text" ? `${KIND_LABEL[kind] ?? "Archivo"}${body ? `: ${body}` : ""}` : body);
+export const previewText = (kind, body) =>
+  kind === "call" ? `📞 ${body || "Llamada"}` : kind && kind !== "text" ? `${KIND_LABEL[kind] ?? "Archivo"}${body ? `: ${body}` : ""}` : body;
 
 const dayLabel = (iso) => {
   const date = new Date(iso);
@@ -190,6 +197,59 @@ function useLongPress(onLongPress, ms = 450) {
   };
 }
 
+/* ---------- Deslizar para responder ---------- */
+
+// En el teléfono, deslizar a la derecha un mensaje de la otra persona lo
+// deja listo para responder (como en WhatsApp).
+const SWIPE_REPLY_PX = 56;
+function useSwipeReply(onReply) {
+  const [dx, setDx] = useState(0);
+  const drag = useRef(null);
+  const reset = () => {
+    drag.current = null;
+    setDx(0);
+  };
+  if (!onReply) return { dx: 0, handlers: {} };
+  return {
+    dx,
+    handlers: {
+      onPointerDown: (e) => {
+        if (e.pointerType === "mouse") return;
+        drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, mode: null, ready: false };
+      },
+      onPointerMove: (e) => {
+        const d = drag.current;
+        if (!d || d.id !== e.pointerId) return;
+        const mx = e.clientX - d.x;
+        const my = e.clientY - d.y;
+        if (!d.mode) {
+          if (Math.abs(my) > 10 && Math.abs(my) >= Math.abs(mx)) d.mode = "scroll";
+          else if (mx > 10 && mx > Math.abs(my) * 1.3) d.mode = "swipe";
+          else return;
+        }
+        if (d.mode !== "swipe") return;
+        const pulled = Math.max(0, Math.min(mx, 110));
+        const ready = pulled >= SWIPE_REPLY_PX;
+        if (ready && !d.ready) {
+          try {
+            navigator.vibrate?.(12);
+          } catch {
+            // Sin vibración.
+          }
+        }
+        d.ready = ready;
+        setDx(ready ? SWIPE_REPLY_PX + (pulled - SWIPE_REPLY_PX) * 0.3 : pulled);
+      },
+      onPointerUp: () => {
+        const d = drag.current;
+        reset();
+        if (d?.mode === "swipe" && d.ready) onReply();
+      },
+      onPointerCancel: reset,
+    },
+  };
+}
+
 /* ---------- Piezas de un mensaje ---------- */
 
 function Ticks({ message, receipts }) {
@@ -269,8 +329,9 @@ function ReplyQuote({ reply, mine, onJump }) {
   );
 }
 
-function Bubble({ message, mine, showSender, reply, reactions, starred, receipts, translation, highlighted, onMenu, onJump, onOpenImage, onToggleReaction, userId }) {
+function Bubble({ message, mine, showSender, reply, reactions, starred, receipts, translation, highlighted, onMenu, onJump, onOpenImage, onToggleReaction, onSwipeReply, userId }) {
   const press = useLongPress(() => onMenu(message));
+  const swipe = useSwipeReply(message.deletedAt ? null : onSwipeReply);
   const attachment = message.attachment;
   const isSticker = message.kind === "sticker";
   const grouped = useMemo(() => {
@@ -304,13 +365,22 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
   );
 
   return (
-    <div id={`msg-${message.id}`} className={`group flex items-end gap-1 ${mine ? "justify-end" : "justify-start"}`}>
+    <div id={`msg-${message.id}`} {...swipe.handlers} className={`group relative flex items-end gap-1 ${onSwipeReply ? "touch-pan-y" : ""} ${mine ? "justify-end" : "justify-start"}`}>
+      {onSwipeReply && swipe.dx > 0 && (
+        <span
+          className="pointer-events-none absolute left-0 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full bg-slate-200 text-slate-600"
+          style={{ opacity: Math.min(1, swipe.dx / SWIPE_REPLY_PX), transform: `translateY(-50%) scale(${0.6 + 0.4 * Math.min(1, swipe.dx / SWIPE_REPLY_PX)})` }}
+          aria-hidden="true"
+        >
+          <CornerUpLeft size={14} />
+        </span>
+      )}
       {mine && (
         <button type="button" onClick={() => onMenu(message)} aria-label="Opciones del mensaje" className="mb-2 hidden rounded-full p-1 text-slate-300 hover:bg-slate-100 hover:text-slate-500 group-hover:block focus:block">
           <Smile size={14} />
         </button>
       )}
-      <div className="min-w-0 max-w-[80%]">
+      <div className="min-w-0 max-w-[80%]" style={swipe.dx ? { transform: `translateX(${swipe.dx}px)` } : { transition: "transform 160ms ease-out" }}>
         <div
           {...press}
           className={`select-none [-webkit-touch-callout:none] ${
@@ -360,6 +430,54 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
           <Smile size={14} />
         </button>
       )}
+    </div>
+  );
+}
+
+// Una llamada en la conversación: entrante, saliente o perdida, con su
+// duración y un botón para volver a llamar.
+function CallLogBubble({ message, mine, onCallBack }) {
+  const info = message.attachment ?? {};
+  const video = info.call === "video";
+  const answered = info.duration != null;
+  const Icon = mine ? PhoneOutgoing : answered ? PhoneIncoming : PhoneMissed;
+  const title = video
+    ? answered
+      ? "Videollamada"
+      : mine
+      ? "Videollamada sin respuesta"
+      : "Videollamada perdida"
+    : answered
+    ? "Llamada de voz"
+    : mine
+    ? "Llamada sin respuesta"
+    : "Llamada perdida";
+  const missed = !answered && !mine;
+  return (
+    <div id={`msg-${message.id}`} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
+      <div className={`flex min-w-[190px] max-w-[80%] items-center gap-2.5 rounded-2xl px-2.5 py-2 ${mine ? "rounded-br-md bg-blue-600 text-white" : "rounded-bl-md bg-white text-slate-700 shadow-sm"}`}>
+        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${mine ? "bg-[rgb(255_255_255/0.16)]" : missed ? "bg-amber-50 text-amber-600" : "bg-slate-100 text-slate-600"}`}>
+          <Icon size={15} />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-xs font-semibold">{title}</span>
+          <span className={`block text-[10px] ${mine ? "text-blue-100" : "text-slate-400"}`}>
+            {hourLabel(message.createdAt)}
+            {answered ? ` · ${callDuration(info.duration)}` : ""}
+          </span>
+        </span>
+        {onCallBack && (
+          <button
+            type="button"
+            onClick={() => onCallBack(video ? "video" : "audio")}
+            aria-label="Volver a llamar"
+            title="Volver a llamar"
+            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${mine ? "hover:bg-[rgb(255_255_255/0.16)]" : "text-blue-600 hover:bg-blue-50"}`}
+          >
+            {video ? <Video size={15} /> : <Phone size={15} />}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -734,6 +852,8 @@ function StickerPanel({ onSend, onClose }) {
 export function ChatConversation({ channel, isAdmin, onBack, header }) {
   const { user, profile } = useAuth();
   const inbox = useInbox();
+  const calls = useCalls();
+  const composerRef = useRef(null);
   const { showToast } = useToast();
   const [messages, setMessages] = useState(null);
   const [hasMore, setHasMore] = useState(false);
@@ -798,6 +918,13 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
   const loadReceipts = useCallback(async () => {
     const { data, error } = await supabase.rpc("channel_receipts", { target_channel: channelId });
     if (!error) setReceipts(Array.isArray(data) ? data[0] : data);
+  }, [channelId]);
+
+  // Mientras esta conversación está abierta, sus mensajes no salen como aviso.
+  useEffect(() => {
+    inbox.setOpenChannel?.(channelId);
+    return () => inbox.setOpenChannel?.(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channelId]);
 
   useEffect(() => {
@@ -1118,6 +1245,9 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
           return (
             <div key={m.id}>
               {showDay && <p className="py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-400">{day}</p>}
+              {m.kind === "call" ? (
+                <CallLogBubble message={m} mine={mine} onCallBack={calls.available && channel.kind === "direct" ? (kind) => calls.start(channel, kind) : null} />
+              ) : (
               <Bubble
                 message={m}
                 mine={mine}
@@ -1132,8 +1262,18 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
                 onJump={jumpTo}
                 onOpenImage={setViewer}
                 onToggleReaction={toggleReaction}
+                onSwipeReply={
+                  !mine && !m.pending
+                    ? () => {
+                        setEditing(null);
+                        setReplyTo(m);
+                        composerRef.current?.focus();
+                      }
+                    : null
+                }
                 userId={user?.id}
               />
+              )}
             </div>
           );
         })}
@@ -1258,6 +1398,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
                 </button>
               )}
               <textarea
+                ref={composerRef}
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={(e) => {

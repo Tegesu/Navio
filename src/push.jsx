@@ -33,6 +33,35 @@ export const pushSupported = () => !!nativePlugin() || webSupported();
 const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent);
 const isStandalone = () => window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true;
 const NATIVE_KEY = "navio.push.nativeToken";
+const AUTO_ASKED_KEY = "navio.push.autoAsked";
+const readKey = (key) => {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+};
+const writeKey = (key, value) => {
+  try {
+    if (value == null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // Solo es comodidad.
+  }
+};
+// Avisa a las tarjetas de ajustes que cambió el estado.
+const announce = () => window.dispatchEvent(new Event("navio:push-changed"));
+
+// Canales de Android: con importancia alta los avisos salen arriba de la
+// pantalla (y las llamadas, con más insistencia).
+async function ensureChannels(plugin) {
+  try {
+    await plugin.createChannel({ id: "navio_mensajes", name: "Mensajes y avisos", description: "Mensajes, tareas y alertas de Navio", importance: 4, visibility: 0, vibration: true });
+    await plugin.createChannel({ id: "navio_llamadas", name: "Llamadas", description: "Llamadas y videollamadas de Navio", importance: 5, visibility: 1, vibration: true });
+  } catch {
+    // Versiones de Android sin canales: no hace falta.
+  }
+}
 
 function keyBytes(base64) {
   const padded = (base64 + "===".slice((base64.length + 3) % 4)).replace(/-/g, "+").replace(/_/g, "/");
@@ -75,6 +104,7 @@ async function enableNativePush() {
   let perm = await plugin.checkPermissions();
   if (perm.receive !== "granted") perm = await plugin.requestPermissions();
   if (perm.receive !== "granted") return false;
+  await ensureChannels(plugin);
   const handles = [];
   const token = await new Promise((resolve, reject) => {
     (async () => {
@@ -90,11 +120,8 @@ async function enableNativePush() {
   }).finally(() => handles.forEach((h) => h?.remove?.()));
   const { error } = await supabase.rpc("save_push_device", { device_token: token, device_platform: "android" });
   if (error) throw error;
-  try {
-    window.localStorage.setItem(NATIVE_KEY, token);
-  } catch {
-    // Solo es para saber que ya está activo.
-  }
+  writeKey(NATIVE_KEY, token);
+  announce();
   return true;
 }
 
@@ -112,6 +139,7 @@ async function disableNativePush() {
   } catch {
     // Ya no estaba registrado.
   }
+  announce();
 }
 
 /* ---------- Comunes ---------- */
@@ -156,6 +184,8 @@ export function usePushStatus() {
   }, [webPermission]);
   useEffect(() => {
     refresh();
+    window.addEventListener("navio:push-changed", refresh);
+    return () => window.removeEventListener("navio:push-changed", refresh);
   }, [refresh]);
   return { permission, subscribed, refresh };
 }
@@ -176,17 +206,26 @@ export function PushKeeper() {
             const url = action?.notification?.data?.url;
             if (url) window.postMessage({ type: "navio:open", url }, window.location.origin);
           });
-          if (stopped) h?.remove?.();
-          else handle = h;
-          let enabled = false;
-          try {
-            enabled = !!window.localStorage.getItem(NATIVE_KEY);
-          } catch {
-            enabled = false;
-          }
+          // Con la app abierta Android no muestra el aviso: los mensajes ya
+          // se ven en Navio; aquí solo se confirma la prueba.
+          const received = await plugin.addListener("pushNotificationReceived", (notification) => {
+            window.dispatchEvent(new CustomEvent("navio:push-received", { detail: notification }));
+          });
+          if (stopped) {
+            h?.remove?.();
+            received?.remove?.();
+          } else handle = { remove: () => [h, received].forEach((x) => x?.remove?.()) };
+          await ensureChannels(plugin);
+          const enabled = !!readKey(NATIVE_KEY);
           if (enabled) {
             const perm = await plugin.checkPermissions();
             if (perm.receive === "granted") await enableNativePush();
+          } else if (!readKey(AUTO_ASKED_KEY)) {
+            // Con la app instalada, la primera vez se piden los avisos solos
+            // (Android muestra su ventana de "Permitir").
+            writeKey(AUTO_ASKED_KEY, String(Date.now()));
+            await new Promise((resolve) => window.setTimeout(resolve, 1500));
+            if (!stopped) await enableNativePush();
           }
         } catch {
           // Si el teléfono no deja, Navio sigue funcionando sin avisos.
@@ -341,10 +380,14 @@ export function PushSettingsCard() {
   return (
     <div className={card}>
       <h2 className="mb-1 text-sm font-bold text-slate-800">Notificaciones</h2>
-      <p className="mb-3 text-xs text-slate-500">Avisos de mensajes, tareas y alertas nuevas aunque Navio esté cerrado. Se activan en cada navegador o teléfono.</p>
-      <button type="button" onClick={toggle} className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold ${subscribed ? "border border-slate-200 text-slate-600 hover:bg-slate-50" : "bg-blue-600 text-white hover:bg-blue-700"}`}>
-        {subscribed ? <BellOff size={13} /> : <Bell size={13} />} {subscribed ? "Desactivar aquí" : "Activar aquí"}
-      </button>
+      <p className="mb-3 text-xs text-slate-500">Avisos de mensajes, llamadas, tareas y alertas nuevas aunque Navio esté cerrado. Se activan en cada navegador o teléfono.</p>
+      {subscribed && <p className="mb-2 text-[11px] font-semibold text-emerald-700">✓ Activas {nativePlugin() ? "en este teléfono" : "en este navegador"}.</p>}
+      <div className="flex flex-wrap gap-2">
+        <button type="button" onClick={toggle} className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold ${subscribed ? "border border-slate-200 text-slate-600 hover:bg-slate-50" : "bg-blue-600 text-white hover:bg-blue-700"}`}>
+          {subscribed ? <BellOff size={13} /> : <Bell size={13} />} {subscribed ? "Desactivar aquí" : "Activar aquí"}
+        </button>
+        {subscribed && <PushTestButton />}
+      </div>
       {asking && (
         <PermissionSheet
           name="notifications"
@@ -362,5 +405,86 @@ export function PushSettingsCard() {
         />
       )}
     </div>
+  );
+}
+
+/* ---------- Aviso de prueba ---------- */
+
+// Qué quiere decir lo que contestó la función "push".
+function explainTest(data, native) {
+  const report = native ? data?.android : data?.web;
+  if (native && !data?.keys?.firebase) return { ok: false, text: "Falta la llave de Firebase en Supabase (secreto FIREBASE_SERVICE_ACCOUNT de la función push)." };
+  if (!native && !data?.keys?.web) return { ok: false, text: "Faltan las llaves VAPID en Supabase (secretos de la función push)." };
+  if (!report?.total) return { ok: false, text: `${native ? "Este teléfono" : "Este navegador"} no quedó registrado. Toca "Desactivar aquí" y luego "Activar aquí".` };
+  if (report.sent > 0) {
+    return {
+      ok: true,
+      text: native
+        ? "Aviso enviado. Con Navio abierto no aparece arriba: sal de la app y manda otra prueba para verlo. Si no llega, revisa Ajustes del teléfono → Apps → Navio → Notificaciones."
+        : "Aviso enviado: debe aparecer en unos segundos. Si no llega, revisa que el navegador tenga permitidas las notificaciones.",
+    };
+  }
+  const code = String(report.errors?.[0] ?? "");
+  const reasons = {
+    SENDER_ID_MISMATCH: "La llave de Firebase de Supabase es de otro proyecto que la app. Las dos deben ser del mismo proyecto de Firebase.",
+    UNREGISTERED: 'El registro de este teléfono venció. Toca "Desactivar aquí" y luego "Activar aquí".',
+    INVALID_ARGUMENT: 'Firebase no reconoció este teléfono. Toca "Desactivar aquí" y luego "Activar aquí".',
+    THIRD_PARTY_AUTH_ERROR: "Firebase no aceptó la llave. Revisa el secreto FIREBASE_SERVICE_ACCOUNT.",
+    PERMISSION_DENIED: 'La cuenta de servicio no tiene permiso. En Google Cloud activa "Firebase Cloud Messaging API (V1)".',
+    LOGIN_FIREBASE: "Supabase no pudo entrar a Firebase. Revisa el secreto FIREBASE_SERVICE_ACCOUNT (el .json completo).",
+    QUOTA_EXCEEDED: "Firebase está frenando los avisos por ahora. Intenta más tarde.",
+    403: "Las llaves VAPID de Supabase no coinciden con las de la página.",
+  };
+  return { ok: false, text: reasons[code] ?? `No se pudo entregar (motivo: ${code || "desconocido"}).` };
+}
+
+function PushTestButton() {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const native = !!nativePlugin();
+
+  // En la app abierta, el aviso llega a Navio en lugar de la barra.
+  useEffect(() => {
+    const onReceived = (event) => {
+      if (event.detail?.data?.test) setResult({ ok: true, text: "✓ Este teléfono recibió el aviso de prueba. Con Navio cerrado o en segundo plano sale como notificación." });
+    };
+    window.addEventListener("navio:push-received", onReceived);
+    return () => window.removeEventListener("navio:push-received", onReceived);
+  }, []);
+
+  async function send() {
+    setBusy(true);
+    setResult(null);
+    try {
+      const body = { test: true };
+      if (native) body.device = readKey(NATIVE_KEY) ?? undefined;
+      else {
+        const sub = await (await navigator.serviceWorker.getRegistration())?.pushManager.getSubscription();
+        if (sub) body.endpoint = sub.endpoint;
+      }
+      const { data, error } = await supabase.functions.invoke("push", { body });
+      if (error) {
+        let message = "No se pudo mandar la prueba. Intenta de nuevo.";
+        try {
+          message = (await error.context?.json?.())?.error ?? message;
+        } catch {
+          // Sin detalle.
+        }
+        if (error.context?.status === 404) message = "La función push no está publicada en Supabase.";
+        setResult({ ok: false, text: message });
+      } else setResult((prev) => (prev?.text?.startsWith("✓") ? prev : explainTest(data, native)));
+    } catch {
+      setResult({ ok: false, text: "No se pudo mandar la prueba. Revisa tu conexión." });
+    }
+    setBusy(false);
+  }
+
+  return (
+    <>
+      <button type="button" onClick={send} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60">
+        <Bell size={13} /> {busy ? "Enviando…" : "Enviar aviso de prueba"}
+      </button>
+      {result && <p className={`w-full text-[11px] leading-relaxed ${result.ok ? "text-emerald-700" : "text-amber-700"}`}>{result.text}</p>}
+    </>
   );
 }

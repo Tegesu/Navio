@@ -64,6 +64,7 @@ const db = {
   chat_stars: [],
   chat_stickers: [],
   gps_devices: [],
+  calls: [],
   task_comments: [
     { id: 1, taskId: 1, companyId: COMPANY, authorId: "u1", authorName: "Johana Viras", kind: "event", body: "Johana Viras creó la tarea y se la asignó a Vania Usuario.", createdAt: ago(4) },
     { id: 2, taskId: 1, companyId: COMPANY, authorId: "u2", authorName: "Vania Usuario", kind: "comment", body: "Ya pedí los comprobantes al proveedor.", createdAt: ago(3) },
@@ -225,7 +226,163 @@ const km = (a, b) => {
   return 2 * R * Math.asin(Math.sqrt(h));
 };
 const myName = () => db.profiles.find((p) => p.id === ME).fullName;
+
+// ---- Llamadas: la "otra persona" es otra conexión dentro de esta misma página ----
+// ?fakemedia: micrófono y cámara de mentira (tono y un cuadro de colores).
+async function fakeMedia(kind, who = "yo") {
+  const tracks = [];
+  try {
+    const ac = new AudioContext();
+    const osc = ac.createOscillator();
+    osc.frequency.value = who === "yo" ? 550 : 330;
+    const gain = ac.createGain();
+    gain.gain.value = 0.01;
+    const dest = ac.createMediaStreamDestination();
+    osc.connect(gain).connect(dest);
+    osc.start();
+    tracks.push(...dest.stream.getAudioTracks());
+  } catch {
+    // sin audio
+  }
+  if (kind === "video") {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 240;
+    const ctx = canvas.getContext("2d");
+    let n = 0;
+    const draw = () => {
+      ctx.fillStyle = who === "yo" ? "#7c3aed" : "#0e7490";
+      ctx.fillRect(0, 0, 320, 240);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 26px sans-serif";
+      ctx.fillText(who === "yo" ? "Yo" : "Otra persona", 70, 110);
+      ctx.fillText(String(n++), 145, 160);
+    };
+    draw();
+    window.setInterval(draw, 200);
+    tracks.push(...canvas.captureStream(10).getVideoTracks());
+  }
+  return new MediaStream(tracks);
+}
+window.__fakeMedia = fakeMedia;
+window.__mediaDenied = false;
+if (params.has("fakemedia") && navigator.mediaDevices) {
+  navigator.mediaDevices.getUserMedia = async (c) => {
+    window.__gumCalls = (window.__gumCalls ?? 0) + 1;
+    if (window.__mediaDenied) throw new DOMException("Permiso negado", "NotAllowedError");
+    return fakeMedia(c?.video ? "video" : "audio", "yo");
+  };
+}
+const waitIce = (pc) => new Promise((resolve) => {
+  if (pc.iceGatheringState === "complete") return resolve();
+  pc.addEventListener("icegatheringstatechange", () => pc.iceGatheringState === "complete" && resolve());
+  setTimeout(resolve, 1500);
+});
+const otherOf = (channelId) => db.chat_members.find((m) => m.channelId === channelId && m.userId !== ME)?.userId;
+const nameOf = (id) => db.profiles.find((p) => p.id === id)?.fullName ?? "Alguien";
+function finishCall(row, by, reason) {
+  if (!row || !["ringing", "accepted"].includes(row.status)) return;
+  let status;
+  if (row.status === "ringing") status = by === row.callerId ? (["missed", "failed"].includes(reason) ? reason : "cancelled") : ["busy", "failed"].includes(reason) ? reason : "declined";
+  else status = reason === "failed" ? "failed" : "ended";
+  const seconds = row.answeredAt ? Math.max(0, Math.round((Date.now() - Date.parse(row.answeredAt)) / 1000)) : null;
+  Object.assign(row, { status, endedAt: new Date().toISOString(), endedBy: by });
+  emit("calls", "UPDATE", { ...row });
+  const label = row.kind === "video" ? "Videollamada" : "Llamada de voz";
+  const msg = {
+    id: nextId++, channelId: row.channelId, companyId: COMPANY, senderId: row.callerId, senderName: row.callerName, kind: "call",
+    body: seconds != null ? `${label} · ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}` : `${label} perdida`,
+    attachment: { call: row.kind, status, ...(seconds != null ? { duration: seconds } : {}), callId: row.id },
+    replyToId: null, forwarded: false, editedAt: null, pinnedAt: null, createdAt: new Date().toISOString(), deletedAt: null,
+  };
+  db.chat_messages.push(msg);
+  const ch = db.chat_channels.find((c) => c.id === row.channelId);
+  if (ch) ch.lastMessageAt = msg.createdAt;
+  emit("chat_messages", "INSERT", msg);
+}
+const peer = { autoAnswer: true, answerDelay: 1200, pc: null, row: null };
+window.__peer = peer;
+peer.reset = () => {
+  try {
+    peer.pc?.close();
+  } catch {
+    // ya cerrada
+  }
+  peer.pc = null;
+};
+// La otra persona contesta mi llamada.
+peer.accept = async () => {
+  const row = db.calls.find((c) => c.id === peer.row?.id);
+  if (!row || row.status !== "ringing") return false;
+  peer.reset();
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  peer.pc = pc;
+  const media = await fakeMedia(row.kind, "otra");
+  media.getTracks().forEach((t) => pc.addTrack(t, media));
+  await pc.setRemoteDescription(row.offer);
+  await pc.setLocalDescription(await pc.createAnswer());
+  await waitIce(pc);
+  Object.assign(row, { status: "accepted", answer: { type: "answer", sdp: pc.localDescription.sdp }, answeredAt: new Date().toISOString() });
+  emit("calls", "UPDATE", { ...row });
+  return true;
+};
+// La otra persona me llama.
+peer.call = async (kind = "audio", channelId = 2) => {
+  const other = otherOf(channelId);
+  peer.reset();
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  peer.pc = pc;
+  const media = await fakeMedia(kind, "otra");
+  media.getTracks().forEach((t) => pc.addTrack(t, media));
+  await pc.setLocalDescription(await pc.createOffer());
+  await waitIce(pc);
+  const row = {
+    id: nextId++, companyId: COMPANY, channelId, callerId: other, callerName: nameOf(other), calleeId: ME, calleeName: myName(), kind, status: "ringing",
+    offer: { type: "offer", sdp: pc.localDescription.sdp }, answer: null, createdAt: new Date().toISOString(), answeredAt: null, endedAt: null, endedBy: null,
+  };
+  db.calls.unshift(row);
+  peer.row = row;
+  emit("calls", "INSERT", { ...row });
+  return row.id;
+};
+peer.hangUp = (reason = "ended") => {
+  const row = db.calls.find((c) => c.id === peer.row?.id);
+  finishCall(row, row?.callerId === ME ? row?.calleeId : row?.callerId, reason);
+  peer.reset();
+};
+
 const rpcs = {
+  start_call({ target_channel, call_kind, call_offer }) {
+    const ch = db.chat_channels.find((c) => c.id === target_channel && c.kind === "direct");
+    if (!ch) throw new Error("Solo se puede llamar desde una conversación directa.");
+    for (const old of db.calls.filter((c) => c.callerId === ME && c.status === "ringing")) Object.assign(old, { status: "cancelled", endedAt: new Date().toISOString(), endedBy: ME });
+    const other = otherOf(ch.id);
+    const row = {
+      id: nextId++, companyId: COMPANY, channelId: ch.id, callerId: ME, callerName: myName(), calleeId: other, calleeName: nameOf(other), kind: call_kind, status: "ringing",
+      offer: call_offer, answer: null, createdAt: new Date().toISOString(), answeredAt: null, endedAt: null, endedBy: null,
+    };
+    db.calls.unshift(row);
+    peer.row = row;
+    emit("calls", "INSERT", { ...row });
+    if (peer.autoAnswer) setTimeout(() => peer.accept(), peer.answerDelay);
+    return row;
+  },
+  answer_call({ target_call, call_answer }) {
+    const row = db.calls.find((c) => c.id === target_call && c.calleeId === ME);
+    if (!row) throw new Error("La llamada ya no existe.");
+    if (row.status !== "ringing") throw new Error("La llamada ya terminó.");
+    Object.assign(row, { status: "accepted", answer: call_answer, answeredAt: new Date().toISOString() });
+    emit("calls", "UPDATE", { ...row });
+    if (peer.pc && peer.row?.id === row.id) peer.pc.setRemoteDescription(call_answer);
+    return null;
+  },
+  end_call({ target_call, end_reason }) {
+    const row = db.calls.find((c) => c.id === target_call && (c.callerId === ME || c.calleeId === ME));
+    if (!row) throw new Error("La llamada ya no existe.");
+    finishCall(row, ME, end_reason);
+    if (peer.row?.id === row.id) peer.reset();
+    return null;
+  },
   start_route({ target_vehicle, target_trip, route_source = "phone" }) {
     if (route_source === "tracker" && !db.tracker_devices.some((d) => d.userId === ME)) throw new Error("Primero vincula tu app de rastreo en Cuenta → Rastreo.");
     const route = { id: nextId++, companyId: COMPANY, vehicleId: target_vehicle, driverName: myName(), status: "active", distanceKm: 0, startedAt: new Date().toISOString(), endedAt: null, createdBy: ME, tripId: target_trip, pointCount: 0, maxSpeed: 0, source: route_source, lastPointAt: null };
@@ -493,6 +650,13 @@ Object.defineProperty(supabase, "functions", {
     invoke: async (name, { body } = {}) => {
       window.__invokes.push({ name, body });
       if (name === "translate") return { data: { translation: `[EN] ${body?.text ?? ""}` }, error: null };
+      // Aviso de prueba: __pushTest = { firebase, total, sent, errors } para simular respuestas.
+      if (name === "push" && body?.test) {
+        const t = { firebase: true, web: true, total: 1, sent: 1, errors: [], ...(window.__pushTest ?? {}) };
+        const report = { total: t.total, sent: t.sent, errors: t.errors };
+        if (body.device && t.sent && window.__native) setTimeout(() => window.__native.receivePush({ test: "1", url: "/" }), 300);
+        return { data: { keys: { web: t.web, firebase: t.firebase }, web: body.device ? { total: 0, sent: 0, errors: [] } : report, android: body.device ? report : { total: 0, sent: 0, errors: [] } }, error: null };
+      }
       // Como Supabase cuando la función no está publicada.
       return { data: null, error: { name: "FunctionsHttpError", message: "Function not found", context: { status: 404, json: async () => ({}) } } };
     },
@@ -521,7 +685,12 @@ window.__geo = geo;
 // El permiso de ubicación lo decide la simulación, no el navegador de pruebas.
 if (navigator.permissions?.query) {
   const realQuery = navigator.permissions.query.bind(navigator.permissions);
-  navigator.permissions.query = (desc) => (desc?.name === "geolocation" ? Promise.resolve({ state: geo.denied ? "denied" : "prompt", onchange: null }) : realQuery(desc));
+  navigator.permissions.query = (desc) =>
+    desc?.name === "geolocation"
+      ? Promise.resolve({ state: geo.denied ? "denied" : "prompt", onchange: null })
+      : params.has("fakemedia") && (desc?.name === "microphone" || desc?.name === "camera")
+      ? Promise.resolve({ state: window.__mediaDenied ? "denied" : "granted", onchange: null })
+      : realQuery(desc);
 }
 // ?ios: el navegador se presenta como Safari de iPhone.
 if (params.has("ios")) {
