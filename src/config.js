@@ -21,4 +21,4 @@ export const CAPTCHA_SITE_KEY = "0x4AAAAAAGBuPt13hXJQVLnz";
 //      si el portal lo permite, y activa un aviso de consumo.
 //   3. Pega la llave aquí abajo. Es pública por naturaleza (la ve el
 //      navegador), no es una contraseña.
-export const TOMTOM_KEY = "";
+export const TOMTOM_KEY = "7L2WxUWmAj04PAArzB9kXpZz58cSdxQB";
