@@ -87,6 +87,10 @@ const MAX_PREVIEW_BYTES = 1_000_000;
 const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 const firstName = (name: string | null) => String(name ?? "Alguien").trim().split(/\s+/)[0] || "Alguien";
 
+type Member = { userId: string; lastReadAt: string | null; mutedAt?: string | null; canPost?: boolean; isAdmin?: boolean };
+type Channel = { id: number; kind: string; name: string | null; companyId: number; postingMode?: string };
+type Device = { id: number; userId: string; token: string; rich?: boolean };
+
 type Message = { id: number; senderId: string | null; senderName: string | null; body: string | null; kind: string | null; attachment: Record<string, unknown> | null; createdAt: string };
 
 // Cómo se lee un mensaje en la notificación: con emoji si es un archivo.
@@ -139,13 +143,15 @@ async function forMessage(id: number): Promise<Target[]> {
   const message = await claim("chat_messages", id);
   if (!message || message.deletedAt || !message.senderId) return [];
   // Si todavía no se aplica la v28, se piden solo las columnas de antes.
-  let { data: channel, error: channelError } = await supabase.from("chat_channels").select("id, kind, name, companyId, postingMode").eq("id", message.channelId).maybeSingle();
-  if (channelError) ({ data: channel } = await supabase.from("chat_channels").select("id, kind, name, companyId").eq("id", message.channelId).maybeSingle());
+  const withMode = await supabase.from("chat_channels").select("id, kind, name, companyId, postingMode").eq("id", message.channelId).maybeSingle();
+  const channel = (withMode.error
+    ? (await supabase.from("chat_channels").select("id, kind, name, companyId").eq("id", message.channelId).maybeSingle()).data
+    : withMode.data) as Channel | null;
   if (!channel) return [];
 
-  let { data: members, error: membersError } = await supabase.from("chat_members").select("userId, lastReadAt, mutedAt, canPost, isAdmin").eq("channelId", channel.id);
-  if (membersError) ({ data: members } = await supabase.from("chat_members").select("userId, lastReadAt").eq("channelId", channel.id));
-  const memberOf = new Map((members ?? []).map((m: { userId: string }) => [m.userId, m as { userId: string; lastReadAt: string | null; mutedAt: string | null; canPost: boolean; isAdmin: boolean }]));
+  const fullMembers = await supabase.from("chat_members").select("userId, lastReadAt, mutedAt, canPost, isAdmin").eq("channelId", channel.id);
+  const members = ((fullMembers.error ? (await supabase.from("chat_members").select("userId, lastReadAt").eq("channelId", channel.id)).data : fullMembers.data) ?? []) as Member[];
+  const memberOf = new Map<string, Member>(members.map((m) => [m.userId, m] as [string, Member]));
   let users: string[];
   if (channel.kind === "general") {
     const { data } = await supabase.from("profiles").select("id").eq("companyId", channel.companyId);
@@ -434,17 +440,18 @@ async function deliver(targets: Target[], only: { device?: string; endpoint?: st
   if (FIREBASE && !only.endpoint) {
     let query = supabase.from("push_devices").select("id, userId, token, rich").in("userId", users);
     if (only.device) query = query.eq("token", only.device);
-    let { data: devices, error } = await query;
-    if (error) {
+    const first = await query;
+    let devices = (first.data ?? []) as Device[];
+    if (first.error) {
       // Antes de la v28 no existe la columna "rich".
       let fallback = supabase.from("push_devices").select("id, userId, token").in("userId", users);
       if (only.device) fallback = fallback.eq("token", only.device);
-      ({ data: devices } = await fallback);
+      devices = ((await fallback).data ?? []) as Device[];
     }
     const gone: number[] = [];
-    android.total = devices?.length ?? 0;
+    android.total = devices.length;
     await Promise.all(
-      (devices ?? []).map(async (d: { id: number; userId: string; token: string; rich?: boolean }) => {
+      devices.map(async (d) => {
         const payload = byUser.get(d.userId);
         if (!payload) return;
         try {
