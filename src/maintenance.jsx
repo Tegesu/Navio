@@ -24,6 +24,8 @@ import {
 
 const inputClass = "h-9 w-full min-w-0 rounded-lg border border-slate-200 px-2.5 text-xs focus:border-blue-400 focus:outline-none";
 const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
+// Buscador: campos compactos para que quepan más por renglón.
+const searchInputClass = "h-7 w-full min-w-0 rounded-md border border-slate-200 px-2 text-[11px] focus:border-blue-400 focus:outline-none";
 const card = "rounded-2xl border border-slate-200 bg-white p-4 shadow-sm";
 
 export const SERVICE_CATEGORIES = [
@@ -102,7 +104,7 @@ function Chip({ className, children }) {
 function SearchField({ field, value, onChange, onSearch, onClear, options }) {
   const id = `ms-${field.id}`;
   const control = field.options ? (
-    <select id={id} value={value} onChange={(e) => onChange(e.target.value)} className={inputClass}>
+    <select id={id} value={value} onChange={(e) => onChange(e.target.value)} className={searchInputClass}>
       <option value="">Cualquiera</option>
       {field.options.map((o) => (
         <option key={o.id} value={o.id}>
@@ -124,32 +126,33 @@ function SearchField({ field, value, onChange, onSearch, onClear, options }) {
         }
       }}
       maxLength={120}
-      className={inputClass}
+      className={searchInputClass}
     />
   );
   return (
     <div className="min-w-0">
-      <label htmlFor={id} className={labelClass}>
+      <label htmlFor={id} className="mb-0.5 block truncate text-[10px] font-semibold text-slate-500">
         {field.label}
       </label>
-      <div className="flex items-stretch gap-1.5">
+      <div className="flex items-stretch gap-1">
         {control}
         <button
           type="button"
           onClick={onSearch}
           title={`Buscar por ${field.label.toLowerCase()}`}
-          className="flex h-9 shrink-0 items-center justify-center gap-1 rounded-lg border border-blue-200 bg-blue-50 px-2.5 text-[11px] font-semibold text-blue-700 hover:bg-blue-100"
+          className="flex h-7 shrink-0 items-center justify-center gap-1 rounded-md border border-blue-200 bg-blue-50 px-2 text-[10px] font-semibold text-blue-700 hover:bg-blue-100"
         >
-          <Search size={12} /> Buscar
+          <Search size={11} /> Buscar
         </button>
         <button
           type="button"
           onClick={onClear}
           disabled={!value}
+          aria-label={`Borrar ${field.label.toLowerCase()}`}
           title={`Borrar ${field.label.toLowerCase()}`}
-          className="flex h-9 shrink-0 items-center justify-center gap-1 rounded-lg border border-slate-200 px-2.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50 disabled:opacity-40"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-40"
         >
-          <Eraser size={12} /> Borrar
+          <Eraser size={11} />
         </button>
       </div>
       {options && (
@@ -234,8 +237,8 @@ export function MaintenanceSearchPage({ records, vehicles, campaigns = [], onOpe
         </button>
       </div>
 
-      <div className={card}>
-        <div className="grid grid-cols-1 gap-x-4 gap-y-3 md:grid-cols-2 2xl:grid-cols-3">
+      <div className={`${card} p-3`}>
+        <div className="grid grid-cols-1 gap-x-3 gap-y-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
           {SEARCH_FIELDS.map((field) => (
             <SearchField
               key={field.id}
@@ -248,7 +251,7 @@ export function MaintenanceSearchPage({ records, vehicles, campaigns = [], onOpe
             />
           ))}
         </div>
-        <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-3">
+        <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-2.5">
           <button onClick={clearAll} className="rounded-lg px-3 py-1.5 text-xs font-semibold text-slate-500 hover:bg-slate-100">
             Borrar todo
           </button>
