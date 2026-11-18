@@ -998,7 +998,7 @@ export function WarrantiesPanel({ vehicle = null }) {
 export function WarrantiesPage() {
   return (
     <div className="space-y-5">
-      <div>
+      <div className="page-intro">
         <h1 className="flex items-center gap-2 text-xl font-bold text-slate-900">
           <ShieldCheck size={20} className="text-blue-600" /> Garantías
         </h1>

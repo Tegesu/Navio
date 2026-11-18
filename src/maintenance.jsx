@@ -225,7 +225,7 @@ export function MaintenanceSearchPage({ records, vehicles, campaigns = [], onOpe
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Mantenimiento</h1>
           <p className="mt-1 text-sm text-slate-500">Busca servicios por cualquiera de estos datos. Escribe en un campo y presiona "Buscar"; los resultados aparecen abajo.</p>
         </div>
@@ -770,7 +770,7 @@ export function CampaignsPage({ campaigns, records, isAdmin, missing, onChanged,
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="flex items-center gap-2 text-xl font-bold text-slate-900">
             <Megaphone size={20} className="text-violet-600" /> Campañas de servicio
           </h1>

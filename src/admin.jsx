@@ -330,7 +330,7 @@ export function AdminCompaniesPage() {
   const [tab, setTab] = useState("companies");
   return (
     <div className="space-y-5">
-      <div>
+      <div className="page-intro">
         <h1 className="text-xl font-bold text-slate-900">Administración de Navio</h1>
         <p className="mt-1 text-sm text-slate-500">Altas de empresas, suspensiones y solicitudes de privacidad.</p>
       </div>

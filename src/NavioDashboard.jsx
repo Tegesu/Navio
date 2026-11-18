@@ -2587,7 +2587,7 @@ function FleetPage({ vehicles, onSelectVehicle, onAddClick, isCompanyAdmin, onEd
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-900">Gestión de Flota</h1>
+          <h1 className="page-intro text-xl font-bold text-slate-900">Gestión de Flota</h1>
           <p className="mt-1 text-sm text-slate-500">
             <FleetStatusSummary vehicles={vehicles} />
           </p>
@@ -3339,7 +3339,7 @@ function MaintenanceOrdersTable({ records, vehicles, onAddClick, onConfirm, onEd
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Servicios</h1>
           <p className="mt-1 text-sm text-slate-500">
             Servicios registrados a mano o recibidos por el bot de Telegram, con el origen y la revisión de cada dato.
@@ -3574,7 +3574,7 @@ function CompliancePage({ records, onAddClick, onConfirm, onEditClick, onDeleteC
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Trámites</h1>
           <p className="mt-1 text-sm text-slate-500">Control normativo y legal de la flotilla: tenencias, pólizas, verificaciones y licencias.</p>
         </div>
@@ -6823,7 +6823,7 @@ function FuelPage({
       {breadcrumb && <InvoiceBreadcrumb items={breadcrumb} />}
 
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
+        <div className={`min-w-0 ${!inProjects ? "page-intro" : ""}`}>
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="min-w-0 break-words text-xl font-bold text-slate-900">{!inProjects ? "Facturas y Gastos" : projectLabel || "Proyectos"}</h1>
             {currentProject?.name && (
@@ -6832,7 +6832,7 @@ function FuelPage({
               </span>
             )}
           </div>
-          <p className="mt-1 text-sm text-slate-500">
+          <p className="page-intro mt-1 text-sm text-slate-500">
             {!inProjects
               ? "Integra consumo de combustible, consumibles, refrigerante, refacciones y casetas de la flotilla."
               : currentProject
@@ -7292,7 +7292,7 @@ function IncidentsPage({ vehicles, incidents, insertIncident, updateIncident, ki
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">{kindMeta ? kindMeta.plural : "Incidencias"}</h1>
           <p className="mt-1 text-sm text-slate-500">
             {kindFilter === "accident" ? "Choques, golpes y emergencias en ruta." : kindFilter === "failure" ? "Fallas mecánicas o eléctricas de las unidades." : "Accidentes y fallas reportados en ruta."}
@@ -7672,7 +7672,7 @@ function CommunityPage({ posts, insertCommunityPost, updateCommunityPost, refres
 
   return (
     <div className="space-y-5">
-      <div>
+      <div className="page-intro">
         <h1 className="text-xl font-bold text-slate-900">Comunidad</h1>
         <p className="mt-1 text-sm text-slate-500">Comparte ideas, reporta errores y sigue el avance del equipo de Navio.</p>
       </div>
@@ -8835,7 +8835,7 @@ function NavioApp() {
               />
             </div>
 
-            <main className="flex-1 px-6 py-6">
+            <main className="flex-1 px-6 py-6 [&_.messages-panel]:h-[calc(100vh-7.5rem)] [&_.page-intro+*]:!mt-0 [&_.page-intro+*]:ml-auto [&_.page-intro]:hidden">
               {dataLoading && !vehiclesError && (
                 <div className="flex min-h-[60vh] items-center justify-center">
                   <div className="flex items-center gap-2 text-sm font-semibold text-slate-400">

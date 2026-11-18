@@ -1392,7 +1392,7 @@ export function LiveMapPage({ vehicles, trips = [], isAdmin, onSelectVehicle }) 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Mapa en vivo</h1>
           <p className="mt-1 text-sm text-slate-500">Dónde está cada unidad y el recorrido de sus viajes, en tiempo real.</p>
         </div>

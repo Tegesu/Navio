@@ -672,13 +672,13 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
   return (
     <div className={compact ? "flex h-[calc(100vh-7.5rem)] flex-col" : "space-y-4"}>
       {!compact && (
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">{meta.title}</h1>
           <p className="mt-1 text-sm text-slate-500">{meta.hint}</p>
         </div>
       )}
       {!open && <PushInvite compact={compact} />}
-      <div className={`grid min-h-0 flex-1 overflow-hidden border-slate-200 bg-white lg:grid-cols-[300px_minmax(0,1fr)] ${compact ? "" : "h-[calc(100vh-14rem)] min-h-[420px] rounded-2xl border shadow-sm"}`}>
+      <div className={`grid min-h-0 flex-1 overflow-hidden border-slate-200 bg-white lg:grid-cols-[300px_minmax(0,1fr)] ${compact ? "" : "messages-panel h-[calc(100vh-14rem)] min-h-[420px] rounded-2xl border shadow-sm"}`}>
         <div className={`min-h-0 flex-col border-slate-100 lg:flex lg:border-r ${open ? "hidden" : "flex"}`}>
           <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2.5">
             <p className="text-xs font-bold text-slate-700">{viewKey === "all" ? "Conversaciones" : meta.title}</p>
@@ -1183,7 +1183,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
   return (
     <div className={compact ? "space-y-4 p-4 pb-24" : "space-y-5"}>
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">{resolved ? "Tareas resueltas" : "Tareas asignadas"}</h1>
           {!compact && (
             <p className="mt-1 text-sm text-slate-500">

@@ -367,7 +367,7 @@ export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeT
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Traslados</h1>
           <p className="mt-1 text-sm text-slate-500">Programa los viajes, asígnalos y consulta el recorrido real de cada uno.</p>
         </div>

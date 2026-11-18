@@ -329,7 +329,29 @@ function ReplyQuote({ reply, mine, onJump }) {
   );
 }
 
-function Bubble({ message, mine, showSender, reply, reactions, starred, receipts, translation, highlighted, onMenu, onJump, onOpenImage, onToggleReaction, onSwipeReply, userId }) {
+// En la PC, al pasar el mouse junto al mensaje: responder, reenviar y más.
+function HoverActions({ onReply, onForward, onMore }) {
+  const button = (label, Icon, onClick) => (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      className="flex h-7 w-7 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+    >
+      <Icon size={14} />
+    </button>
+  );
+  return (
+    <div className="mb-1.5 hidden shrink-0 items-center rounded-full border border-slate-100 bg-white shadow-sm group-hover:flex group-focus-within:flex">
+      {onReply && button("Responder", CornerUpLeft, onReply)}
+      {onForward && button("Reenviar", Forward, onForward)}
+      {button("Más opciones", Smile, onMore)}
+    </div>
+  );
+}
+
+function Bubble({ message, mine, showSender, reply, reactions, starred, receipts, translation, highlighted, onMenu, onJump, onOpenImage, onToggleReaction, onSwipeReply, onReply, onForward, userId }) {
   const press = useLongPress(() => onMenu(message));
   const swipe = useSwipeReply(message.deletedAt ? null : onSwipeReply);
   const attachment = message.attachment;
@@ -375,11 +397,7 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
           <CornerUpLeft size={14} />
         </span>
       )}
-      {mine && (
-        <button type="button" onClick={() => onMenu(message)} aria-label="Opciones del mensaje" className="mb-2 hidden rounded-full p-1 text-slate-300 hover:bg-slate-100 hover:text-slate-500 group-hover:block focus:block">
-          <Smile size={14} />
-        </button>
-      )}
+      {mine && <HoverActions onReply={onReply && (() => onReply(message))} onForward={onForward && (() => onForward(message))} onMore={() => onMenu(message)} />}
       <div className="min-w-0 max-w-[80%]" style={swipe.dx ? { transform: `translateX(${swipe.dx}px)` } : { transition: "transform 160ms ease-out" }}>
         <div
           {...press}
@@ -425,11 +443,7 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
           </div>
         )}
       </div>
-      {!mine && (
-        <button type="button" onClick={() => onMenu(message)} aria-label="Opciones del mensaje" className="mb-2 hidden rounded-full p-1 text-slate-300 hover:bg-slate-100 hover:text-slate-500 group-hover:block focus:block">
-          <Smile size={14} />
-        </button>
-      )}
+      {!mine && <HoverActions onReply={onReply && (() => onReply(message))} onForward={onForward && (() => onForward(message))} onMore={() => onMenu(message)} />}
     </div>
   );
 }
@@ -1130,6 +1144,12 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
     if (error) showToast(`No se pudo reaccionar: ${error.message}`);
   }
 
+  function startReply(message) {
+    setEditing(null);
+    setReplyTo(message);
+    composerRef.current?.focus();
+  }
+
   async function onAction(action) {
     const message = menuFor;
     setMenuFor(null);
@@ -1262,15 +1282,9 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
                 onJump={jumpTo}
                 onOpenImage={setViewer}
                 onToggleReaction={toggleReaction}
-                onSwipeReply={
-                  !mine && !m.pending
-                    ? () => {
-                        setEditing(null);
-                        setReplyTo(m);
-                        composerRef.current?.focus();
-                      }
-                    : null
-                }
+                onSwipeReply={!mine && !m.pending ? () => startReply(m) : null}
+                onReply={advanced && !m.pending ? startReply : null}
+                onForward={advanced && !m.pending ? setForwardFor : null}
                 userId={user?.id}
               />
               )}

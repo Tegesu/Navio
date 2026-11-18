@@ -914,7 +914,7 @@ export function SettingsPage() {
   const [tab, setTab] = useState("company");
   return (
     <div className="max-w-3xl space-y-5">
-      <div>
+      <div className="page-intro">
         <h1 className="text-xl font-bold text-slate-900">Configuración</h1>
         <p className="mt-1 text-sm text-slate-500">Tu empresa, tu equipo y cómo se protege la información.</p>
       </div>
@@ -1273,7 +1273,7 @@ export function AccountPage({ userName, userEmail, userAvatar, onSignOut, compan
   return (
     <div className="max-w-3xl space-y-5">
       {!compact && (
-        <div>
+        <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Cuenta</h1>
           <p className="mt-1 text-sm text-slate-500">Tu perfil, tu seguridad y tus datos.</p>
         </div>

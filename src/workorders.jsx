@@ -233,7 +233,7 @@ export function WorkOrdersPage({ orders, onChanged, onOpenInvoice, focusId = nul
 
   return (
     <div className="space-y-5">
-      <div>
+      <div className="page-intro">
         <h1 className="text-xl font-bold text-slate-900">Órdenes de trabajo</h1>
         <p className="mt-1 text-sm text-slate-500">El proceso de cada orden para garantías: carga de facturas, verificación y análisis.</p>
       </div>
