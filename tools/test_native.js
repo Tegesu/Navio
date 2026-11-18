@@ -13,6 +13,12 @@ if (new URLSearchParams(window.location.search).has("native")) {
     calls: [],
     http: [],
     denied: false,
+    pushPermission: "prompt",
+    pushListeners: new Map(),
+    // Simula tocar una notificación con la app abierta.
+    tapPush(url) {
+      for (const l of native.pushListeners.values()) if (l.event === "pushNotificationActionPerformed") l.callback({ notification: { data: { url } } });
+    },
     fix(lat, lng, kmh = 60) {
       for (const watcher of watchers.values()) watcher.callback({ latitude: lat, longitude: lng, accuracy: 8, bearing: 90, speed: kmh / 3.6, time: Date.now() });
     },
@@ -23,9 +29,18 @@ if (new URLSearchParams(window.location.search).has("native")) {
     PluginHeaders: [
       { name: "BackgroundGeolocation", methods: [{ name: "addWatcher", rtype: "callback" }, { name: "removeWatcher", rtype: "promise" }, { name: "openSettings", rtype: "promise" }] },
       { name: "CapacitorHttp", methods: [{ name: "request", rtype: "promise" }] },
+      {
+        name: "PushNotifications",
+        methods: ["checkPermissions", "requestPermissions", "register", "unregister", "removeAllListeners"].map((n) => ({ name: n, rtype: "promise" })).concat([{ name: "addListener", rtype: "callback" }, { name: "removeListener", rtype: "promise" }]),
+      },
     ],
     nativeCallback(plugin, method, options, callback) {
       native.calls.push({ plugin, method, options });
+      if (plugin === "PushNotifications") {
+        const id = String(seq++);
+        native.pushListeners.set(id, { event: options.eventName, callback });
+        return id;
+      }
       const id = String(seq++);
       if (native.denied) window.setTimeout(() => callback(null, { code: "NOT_AUTHORIZED" }), 10);
       else {
@@ -37,6 +52,21 @@ if (new URLSearchParams(window.location.search).has("native")) {
     },
     nativePromise(plugin, method, options) {
       native.calls.push({ plugin, method, options });
+      if (plugin === "PushNotifications") {
+        if (method === "checkPermissions") return Promise.resolve({ receive: native.pushPermission });
+        if (method === "requestPermissions") {
+          native.pushPermission = "granted";
+          return Promise.resolve({ receive: "granted" });
+        }
+        if (method === "register") {
+          window.setTimeout(() => {
+            for (const l of native.pushListeners.values()) if (l.event === "registration") l.callback({ value: "token-fcm-de-prueba-0123456789" });
+          }, 30);
+          return Promise.resolve();
+        }
+        if (method === "removeListener") native.pushListeners.delete(options.callbackId);
+        return Promise.resolve();
+      }
       if (plugin === "BackgroundGeolocation" && method === "removeWatcher") watchers.delete(options.id);
       if (plugin === "CapacitorHttp") {
         native.http.push(options);

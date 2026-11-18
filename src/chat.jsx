@@ -30,6 +30,7 @@ import {
 import { supabase, useAuth, useToast, Modal } from "./NavioDashboard.jsx";
 import { useInbox } from "./inbox.jsx";
 import { isNativeApp } from "./tracking.jsx";
+import { Capacitor, registerPlugin } from "@capacitor/core";
 import { useVoiceNote, RecordingBar, MicButton, CameraCapture, AttachmentPreview, GifPanel } from "./chatcomposer.jsx";
 import { usePermissionGate } from "./permissions.jsx";
 
@@ -643,7 +644,12 @@ function StickerPanel({ onSend, onClose }) {
 
   // App Android: el paquete pasa directo a WhatsApp.
   async function exportToWhatsApp() {
-    const plugin = window.Capacitor?.Plugins?.WhatsAppStickers;
+    let plugin = null;
+    try {
+      plugin = isNativeApp() && Capacitor.isPluginAvailable("WhatsAppStickers") ? registerPlugin("WhatsAppStickers") : null;
+    } catch {
+      plugin = null;
+    }
     if (!plugin) {
       showToast("Para mandarlos a WhatsApp, abre Navio desde la app de Android (versión 1.0.5 o más nueva).");
       return;

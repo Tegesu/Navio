@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Capacitor, registerPlugin } from "@capacitor/core";
 import { Bell, BellOff, X } from "lucide-react";
 import { supabase, useAuth, useToast } from "./NavioDashboard.jsx";
 import { PUSH_PUBLIC_KEY } from "./config.js";
@@ -12,7 +13,19 @@ import { usePermission, PermissionSheet } from "./permissions.jsx";
 // En el navegador: notificaciones web (service worker). En la app de Android
 // (1.0.6 o más nueva): Firebase, con el plugin de notificaciones de Capacitor.
 
-const nativePlugin = () => (isNativeApp() ? window.Capacitor?.Plugins?.PushNotifications ?? null : null);
+// El plugin de la app se pide con la forma oficial de Capacitor; si la app es
+// de una versión sin notificaciones, no hay plugin y no se intenta nada.
+let pushPlugin = null;
+function nativePlugin() {
+  if (!isNativeApp()) return null;
+  try {
+    if (!Capacitor.isPluginAvailable("PushNotifications")) return null;
+    pushPlugin = pushPlugin ?? registerPlugin("PushNotifications");
+    return pushPlugin;
+  } catch {
+    return null;
+  }
+}
 const webSupported = () =>
   typeof window !== "undefined" && !isNativeApp() && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window && !!PUSH_PUBLIC_KEY;
 export const pushSupported = () => !!nativePlugin() || webSupported();
@@ -62,19 +75,19 @@ async function enableNativePush() {
   let perm = await plugin.checkPermissions();
   if (perm.receive !== "granted") perm = await plugin.requestPermissions();
   if (perm.receive !== "granted") return false;
+  const handles = [];
   const token = await new Promise((resolve, reject) => {
-    const handles = [];
-    const done = (fn) => (value) => {
-      handles.forEach((h) => h?.remove?.());
-      fn(value);
-    };
-    Promise.all([
-      plugin.addListener("registration", done(({ value }) => resolve(value))),
-      plugin.addListener("registrationError", done((e) => reject(new Error(e?.error ?? "registro")))),
-    ]).then((list) => handles.push(...list));
-    plugin.register().catch(done(reject));
-    window.setTimeout(done(() => reject(new Error("tiempo"))), 20000);
-  });
+    (async () => {
+      try {
+        handles.push(await plugin.addListener("registration", ({ value }) => resolve(value)));
+        handles.push(await plugin.addListener("registrationError", (e) => reject(new Error(e?.error ?? "registro"))));
+        await plugin.register();
+      } catch (err) {
+        reject(err);
+      }
+    })();
+    window.setTimeout(() => reject(new Error("tiempo")), 20000);
+  }).finally(() => handles.forEach((h) => h?.remove?.()));
   const { error } = await supabase.rpc("save_push_device", { device_token: token, device_platform: "android" });
   if (error) throw error;
   try {
@@ -94,7 +107,11 @@ async function disableNativePush() {
     // Sin almacenamiento.
   }
   if (token) await supabase.rpc("remove_push_device", { device_token: token });
-  await nativePlugin()?.unregister?.().catch(() => {});
+  try {
+    await nativePlugin()?.unregister?.();
+  } catch {
+    // Ya no estaba registrado.
+  }
 }
 
 /* ---------- Comunes ---------- */
@@ -151,19 +168,30 @@ export function PushKeeper() {
     if (!user) return undefined;
     const plugin = nativePlugin();
     let handle = null;
+    let stopped = false;
     if (plugin) {
-      plugin
-        .addListener("pushNotificationActionPerformed", (action) => {
-          const url = action?.notification?.data?.url;
-          if (url) window.postMessage({ type: "navio:open", url }, window.location.origin);
-        })
-        .then((h) => {
-          handle = h;
-        });
-      plugin
-        .checkPermissions()
-        .then((perm) => perm.receive === "granted" && enableNativePush())
-        .catch(() => {});
+      (async () => {
+        try {
+          const h = await plugin.addListener("pushNotificationActionPerformed", (action) => {
+            const url = action?.notification?.data?.url;
+            if (url) window.postMessage({ type: "navio:open", url }, window.location.origin);
+          });
+          if (stopped) h?.remove?.();
+          else handle = h;
+          let enabled = false;
+          try {
+            enabled = !!window.localStorage.getItem(NATIVE_KEY);
+          } catch {
+            enabled = false;
+          }
+          if (enabled) {
+            const perm = await plugin.checkPermissions();
+            if (perm.receive === "granted") await enableNativePush();
+          }
+        } catch {
+          // Si el teléfono no deja, Navio sigue funcionando sin avisos.
+        }
+      })();
     } else if (webSupported() && Notification.permission === "granted") {
       (async () => {
         try {
@@ -176,7 +204,10 @@ export function PushKeeper() {
         }
       })();
     }
-    return () => handle?.remove?.();
+    return () => {
+      stopped = true;
+      handle?.remove?.();
+    };
   }, [user]);
   return null;
 }

@@ -299,6 +299,13 @@ const rpcs = {
       .filter((m) => m.channelId === msg?.channelId && m.userId !== msg?.senderId)
       .map((m) => ({ userId: m.userId, name: db.profiles.find((p) => p.id === m.userId)?.fullName ?? "Alguien", deliveredAt: m.lastDeliveredAt ?? m.lastReadAt ?? null, readAt: m.lastReadAt ?? null }));
   },
+  save_push_device({ device_token }) {
+    window.__pushDevices = [...(window.__pushDevices ?? []), device_token];
+    return null;
+  },
+  remove_push_device() {
+    return null;
+  },
   edit_chat_message({ target_message, new_body }) {
     const msg = db.chat_messages.find((m) => m.id === target_message);
     if (!msg || msg.senderId !== ME) throw new Error("Solo quien escribió el mensaje puede editarlo.");

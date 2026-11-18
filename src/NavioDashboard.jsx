@@ -8879,6 +8879,42 @@ function NavioApp() {
 /*  Auth gate — decide qué pantalla mostrar                               */
 /* ---------------------------------------------------------------------- */
 
+// Si algo falla al dibujar Navio, se muestra qué pasó y cómo seguir, en lugar
+// de dejar la pantalla vacía.
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error("Navio:", error, info?.componentStack);
+  }
+  render() {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+    const detail = `${error?.name ?? "Error"}: ${error?.message ?? error}`;
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-page px-5">
+        <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-5 text-center shadow-sm">
+          <p className="text-base font-bold text-slate-800">Algo salió mal al abrir Navio</p>
+          <p className="mt-2 text-xs text-slate-500">Recarga para intentarlo de nuevo. Si vuelve a pasar, manda una captura de esta pantalla.</p>
+          <p className="mt-3 break-words rounded-lg bg-slate-50 px-3 py-2 text-left font-mono text-[10px] text-slate-500">{detail.slice(0, 400)}</p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="mt-4 w-full rounded-xl bg-blue-600 py-2.5 text-sm font-semibold text-white hover:bg-blue-700"
+          >
+            Recargar
+          </button>
+        </div>
+      </div>
+    );
+  }
+}
+
 function AuthGate() {
   const { user, loading, passwordRecovery, mfaRequired, profile, profileLoading, profileError, refreshProfile } = useAuth();
   const waiting = loading || (!!user && !passwordRecovery && !mfaRequired && profileLoading);
@@ -8902,9 +8938,11 @@ function AuthGate() {
 
 export default function NavioDashboard() {
   return (
-    <AuthProvider>
-      <AuthGate />
-    </AuthProvider>
+    <AppErrorBoundary>
+      <AuthProvider>
+        <AuthGate />
+      </AuthProvider>
+    </AppErrorBoundary>
   );
 }
 
