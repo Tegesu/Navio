@@ -60,6 +60,19 @@ jobs:
         working-directory: android-app
         run: npm ci
 
+      - name: Configuración de Firebase (notificaciones)
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          # Desde la 1.0.6 la app recibe notificaciones con Firebase: sin este
+          # archivo, la app no podría registrarse para recibir avisos.
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "Falta el secreto GOOGLE_SERVICES_JSON en el entorno android-release." >&2
+            exit 1
+          fi
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android-app/android/app/google-services.json
+          node -e 'const j=require("./android-app/android/app/google-services.json"); if(!j.client?.some(c=>c.client_info?.android_client_info?.package_name==="mx.navio.app")) { console.error("google-services.json no es de mx.navio.app"); process.exit(1); }'
+
       - name: Preparar el proyecto Android
         working-directory: android-app
         run: npx cap sync android

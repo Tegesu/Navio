@@ -1,7 +1,7 @@
-// Navio — service worker mínimo: solo habilita la instalación como app
-// (icono en pantalla de inicio, modo standalone). A propósito NO cachea
-// nada — este proyecto ya se topó una vez con bugs por páginas viejas
-// quedándose cacheadas, así que todo pasa directo a la red.
+// Navio — service worker: permite instalar Navio como app y recibe las
+// notificaciones (mensajes y tareas nuevas) aunque Navio esté cerrado.
+// A propósito NO cachea nada — este proyecto ya se topó una vez con bugs por
+// páginas viejas quedándose cacheadas, así que todo pasa directo a la red.
 self.addEventListener("install", () => {
   self.skipWaiting();
 });
@@ -12,4 +12,45 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", () => {
   // no-op: deja pasar todo a la red.
+});
+
+// Llega un aviso. Si Navio está abierto y a la vista, no se repite como
+// notificación del sistema (la persona ya lo ve en pantalla).
+self.addEventListener("push", (event) => {
+  let data = {};
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch (e) {
+    data = { title: "Navio", body: event.data ? event.data.text() : "" };
+  }
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+      const visible = clients.some((c) => c.visibilityState === "visible" && c.focused);
+      if (visible && data.skipIfVisible !== false) return undefined;
+      return self.registration.showNotification(data.title || "Navio", {
+        body: data.body || "",
+        icon: "/icons/icon-192.png",
+        badge: "/icons/icon-192.png",
+        tag: data.tag || undefined,
+        renotify: !!data.tag,
+        data: { url: data.url || "/" },
+      });
+    })
+  );
+});
+
+// Tocar la notificación abre Navio en la conversación o la sección del aviso.
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = new URL(event.notification.data?.url || "/", self.location.origin).href;
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+      const open = clients.find((c) => new URL(c.url).origin === self.location.origin);
+      if (open) {
+        open.postMessage({ type: "navio:open", url });
+        return open.focus();
+      }
+      return self.clients.openWindow(url);
+    })
+  );
 });

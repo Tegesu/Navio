@@ -308,3 +308,36 @@ html.dark .welcome-card {
 html.dark .tiles-native-dark .leaflet-tile-pane {
   filter: none;
 }
+
+/* Notas de voz: el candado con flechas que se iluminan una tras otra y las
+   barritas que se mueven mientras se graba. */
+.lock-chevron {
+  animation: lock-chevron 1.2s ease-in-out infinite;
+}
+@keyframes lock-chevron {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+.voice-bar {
+  animation: voice-bar 0.9s ease-in-out infinite alternate;
+  transform-origin: center;
+}
+@keyframes voice-bar {
+  from {
+    transform: scaleY(0.4);
+  }
+  to {
+    transform: scaleY(1.3);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lock-chevron,
+  .voice-bar {
+    animation: none;
+  }
+}

@@ -486,7 +486,8 @@ Object.defineProperty(supabase, "functions", {
     invoke: async (name, { body } = {}) => {
       window.__invokes.push({ name, body });
       if (name === "translate") return { data: { translation: `[EN] ${body?.text ?? ""}` }, error: null };
-      return { data: null, error: { message: "función sin simular" } };
+      // Como Supabase cuando la función no está publicada.
+      return { data: null, error: { name: "FunctionsHttpError", message: "Function not found", context: { status: 404, json: async () => ({}) } } };
     },
   }),
 });

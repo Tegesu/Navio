@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import L from "leaflet";
-import { Car, Crosshair, LocateFixed, MapPin, Search, TrafficCone, Truck, X } from "lucide-react";
+import { Car, Crosshair, LocateFixed, Lock, MapPin, Search, TrafficCone, Truck, X } from "lucide-react";
+import { usePermissionGate } from "./permissions.jsx";
 import { addBaseLayer, trafficLayer, hasTomTom, searchPlaces, placeName, planRoutes, durationText } from "./maps.js";
 
 /* ---------------------------------------------------------------------- */
@@ -121,7 +122,7 @@ function PlannerMap({ from, to, routes, selected, traffic, picking, onPick, onSe
   );
 }
 
-function PlaceField({ label, value, onChange, onPickOnMap, picking, near, extra }) {
+function PlaceField({ label, value, onChange, onPickOnMap, picking, near, extra, locked = null }) {
   const [text, setText] = useState("");
   const [results, setResults] = useState([]);
   const timer = useRef(null);
@@ -141,7 +142,13 @@ function PlaceField({ label, value, onChange, onPickOnMap, picking, near, extra 
   return (
     <div className="relative">
       <p className="mb-1 text-[11px] font-semibold text-slate-500">{label}</p>
-      {value ? (
+      {locked && !value ? (
+        <button type="button" onClick={locked.onClick} className="flex w-full items-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-2 text-left">
+          <Lock size={14} className="shrink-0 text-slate-400" />
+          <span className="min-w-0 flex-1 truncate text-xs text-slate-400">{locked.text}</span>
+          <span className="shrink-0 text-[11px] font-semibold text-blue-600">Permitir</span>
+        </button>
+      ) : value ? (
         <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2">
           <MapPin size={14} className="shrink-0 text-blue-600" />
           <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-700">{value.label}</span>
@@ -204,11 +211,12 @@ export function RoutePlanner({ onChange, initialTo = null }) {
   const [mode, setMode] = useState("car");
   const [routes, setRoutes] = useState([]);
   const [selected, setSelected] = useState(0);
-  const [traffic, setTraffic] = useState(true);
+  const [traffic, setTraffic] = useState(false);
   const [state, setState] = useState("idle"); // idle | locating | loading | error
   const [error, setError] = useState("");
+  const geo = usePermissionGate("geolocation");
 
-  function useMyLocation() {
+  function readLocation() {
     if (!navigator.geolocation) return;
     setState("locating");
     navigator.geolocation.getCurrentPosition(
@@ -216,19 +224,17 @@ export function RoutePlanner({ onChange, initialTo = null }) {
         setFrom({ label: "Mi ubicación", lat: pos.coords.latitude, lng: pos.coords.longitude });
         setState("idle");
       },
-      () => {
-        setState("idle");
-        setError("No se pudo leer tu ubicación. Elige la salida en el mapa.");
-      },
+      () => setState("idle"),
       { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 }
     );
   }
+  const useMyLocation = () => geo.run(readLocation);
 
-  // Al abrir, la salida es la ubicación actual.
+  // Al abrir, si ya hay permiso, la salida es la ubicación actual.
   useEffect(() => {
-    useMyLocation();
+    if (geo.state === "granted" && !from) readLocation();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [geo.state]);
 
   useEffect(() => {
     let alive = true;
@@ -236,10 +242,7 @@ export function RoutePlanner({ onChange, initialTo = null }) {
     setSelected(0);
     setError("");
     if (!from || !to) return undefined;
-    if (!hasTomTom()) {
-      setError("Para ver rutas, tiempo estimado y tráfico, falta activar TomTom (Configuración de Navio).");
-      return undefined;
-    }
+    if (!hasTomTom()) return undefined;
     setState("loading");
     planRoutes(from, to, mode)
       .then((list) => {
@@ -280,6 +283,7 @@ export function RoutePlanner({ onChange, initialTo = null }) {
         <PlaceField
           label="Salida"
           value={from}
+          locked={geo.state !== "granted" ? { text: "Toca para usar tu ubicación", onClick: useMyLocation } : null}
           onChange={setFrom}
           picking={picking === "from"}
           onPickOnMap={() => setPicking((p) => (p === "from" ? null : "from"))}
@@ -315,7 +319,8 @@ export function RoutePlanner({ onChange, initialTo = null }) {
       <PlannerMap from={from} to={to} routes={routes} selected={selected} traffic={traffic} picking={picking} onPick={pick} onSelectRoute={setSelected} />
 
       {state === "loading" && <p className="text-center text-xs text-slate-500">Calculando rutas con el tráfico de ahora…</p>}
-      {error && <p className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] font-medium text-amber-800">{error}</p>}
+      {error && <p className="px-1 text-[11px] text-slate-500">{error}</p>}
+      {geo.sheet}
       {routes.length > 0 && (
         <div className="space-y-1.5">
           {routes.map((r, i) => (

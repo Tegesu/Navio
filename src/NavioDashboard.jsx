@@ -11,6 +11,7 @@ import { MobileAppShell } from "./mobile.jsx";
 import { AndroidAppDownload, AppsPage } from "./background.jsx";
 import { Sidebar as NavSidebar, UserMenu, resolveRoute, DEFAULT_SUB } from "./navigation.jsx";
 import { useHistorySync, useBackLayer } from "./history.js";
+import { PushKeeper } from "./push.jsx";
 import {
   MaintenanceSearchPage,
   ServiceDetailModal,
@@ -7989,6 +7990,7 @@ function AppProviders({ fleet, children }) {
         <TrackingProvider>
           <FleetDataProvider value={fleet}>{children}</FleetDataProvider>
           <IdleGuard />
+          <PushKeeper />
           <LegalAcceptanceGate />
           <CookieNotice />
         </TrackingProvider>
@@ -8411,6 +8413,42 @@ function NavioApp() {
     const nextSub = sub ?? DEFAULT_SUB[tab];
     if (nextSub !== undefined) setStoredSubs((prev) => ({ ...(prev ?? {}), [tab]: nextSub }));
   }
+
+  // Al tocar una notificación: Navio abre la sección del aviso
+  // (?open=messages&sub=channel:12). Si ya estaba abierto, llega un mensaje
+  // del service worker con la misma dirección.
+  useEffect(() => {
+    const openFrom = (href) => {
+      try {
+        const url = new URL(href, window.location.origin);
+        const tab = url.searchParams.get("open");
+        if (!tab) return;
+        const sub = url.searchParams.get("sub") || undefined;
+        if (isMobileViewport) {
+          setMobileTab(tab === "messages" && (!sub || sub === "all") ? "messages" : "menu");
+          setMobileScreen(tab === "messages" && (!sub || sub === "all") ? null : "page");
+        }
+        goToTab(tab, sub);
+      } catch {
+        // Dirección no válida: se ignora.
+      }
+    };
+    if (window.location.search.includes("open=")) {
+      openFrom(window.location.href);
+      window.history.replaceState(window.history.state, "", window.location.pathname);
+    }
+    const onMessage = (event) => event.data?.type === "navio:open" && openFrom(event.data.url);
+    // En la app de Android el aviso tocado llega por la propia página.
+    const onWindowMessage = (event) => event.origin === window.location.origin && onMessage(event);
+    navigator.serviceWorker?.addEventListener("message", onMessage);
+    window.addEventListener("message", onWindowMessage);
+    return () => {
+      navigator.serviceWorker?.removeEventListener("message", onMessage);
+      window.removeEventListener("message", onWindowMessage);
+    };
+    // Solo al entrar.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Abre el buscador de Mantenimiento ya filtrado (por ejemplo, una campaña).
   function searchServices(applied) {

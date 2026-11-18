@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import L from "leaflet";
 import { addBaseLayer, trafficLayer, durationText, hasTomTom } from "./maps.js";
 import { RoutePlanner, savePlan, readPlan, thinPoints } from "./routeplanner.jsx";
+import { PermissionSheet, usePermissionGate } from "./permissions.jsx";
 import { Capacitor, CapacitorHttp, registerPlugin } from "@capacitor/core";
 import { AlertTriangle, Clock, Gauge, LocateFixed, MapPin, Navigation, Route, Truck, User, WifiOff, X } from "lucide-react";
 import {
@@ -634,7 +635,20 @@ export function TrackingLiveCard({ big = false }) {
 
 function TrackingError() {
   const { error } = useTracking();
+  const [asking, setAsking] = useState(false);
   if (!error) return null;
+  if (/permiso/i.test(error)) {
+    return (
+      <>
+        <button type="button" onClick={() => setAsking(true)} className="flex w-full items-center gap-2.5 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-2.5 text-left">
+          <MapPin size={16} className="shrink-0 text-slate-400" />
+          <span className="min-w-0 flex-1 text-xs text-slate-500">Para registrar el recorrido, Navio necesita tu ubicación.</span>
+          <span className="shrink-0 text-[11px] font-semibold text-blue-600">Permitir</span>
+        </button>
+        {asking && <PermissionSheet name="geolocation" onGranted={() => setAsking(false)} onClose={() => setAsking(false)} />}
+      </>
+    );
+  }
   return (
     <p className="flex items-start gap-1.5 rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] font-medium text-amber-800">
       {error.startsWith("Sin conexión") ? <WifiOff size={13} className="mt-0.5 shrink-0" /> : <AlertTriangle size={13} className="mt-0.5 shrink-0" />}
@@ -721,7 +735,11 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
   const fieldClass = `w-full rounded-lg border border-slate-200 bg-white focus:border-blue-400 focus:outline-none ${big ? "px-3 py-2.5 text-sm" : "px-2.5 py-1.5 text-xs"}`;
   const buttonClass = `w-full rounded-2xl font-bold text-white shadow-sm disabled:opacity-60 ${big ? "py-4 text-base" : "py-2.5 text-xs"}`;
 
-  async function handleStart(withRoute = false) {
+  const geoGate = usePermissionGate("geolocation");
+  function handleStart(withRoute = false) {
+    geoGate.run(() => startTrip(withRoute));
+  }
+  async function startTrip(withRoute) {
     if (!vehicle) return;
     const route = withRoute ? plan?.route : null;
     savePlan(
@@ -873,6 +891,7 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
         </button>
       )}
       {vehicles.length === 0 && <p className="text-center text-[11px] text-slate-400">Primero registra una unidad en Gestión de flota.</p>}
+      {geoGate.sheet}
     </div>
   );
 }

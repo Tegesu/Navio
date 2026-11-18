@@ -24,3 +24,6 @@ llave-android/
 *.p12
 *.jks
 *.keystore
+
+# Configuración de Firebase de la app: llega desde un secreto de GitHub.
+android-app/android/app/google-services.json

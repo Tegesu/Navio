@@ -30,6 +30,8 @@ import {
 import { supabase, useAuth, useToast, Modal } from "./NavioDashboard.jsx";
 import { useInbox } from "./inbox.jsx";
 import { isNativeApp } from "./tracking.jsx";
+import { useVoiceNote, RecordingBar, MicButton, CameraCapture, AttachmentPreview, GifPanel } from "./chatcomposer.jsx";
+import { usePermissionGate } from "./permissions.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Conversación: mensajes, archivos, voz, stickers y acciones            */
@@ -205,7 +207,7 @@ function ImageAttachment({ attachment, sticker = false, onOpen }) {
     return url ? <img src={url} alt="Sticker" className="h-32 w-32 object-contain" draggable={false} /> : <div className="h-32 w-32 animate-pulse rounded-xl bg-slate-100" />;
   }
   return (
-    <button type="button" onClick={() => url && onOpen(url)} className="block overflow-hidden rounded-xl" style={{ width: 220, height: Math.min(300, Math.round(220 * ratio)) }}>
+    <button type="button" onClick={() => url && onOpen(url)} className="block max-w-full overflow-hidden rounded-xl" style={{ width: 220, aspectRatio: `1 / ${Math.min(1.4, ratio)}` }}>
       {url ? <img src={url} alt={attachment.name || "Foto"} className="h-full w-full object-cover" draggable={false} /> : <span className="block h-full w-full animate-pulse bg-slate-200" />}
     </button>
   );
@@ -214,15 +216,15 @@ function ImageAttachment({ attachment, sticker = false, onOpen }) {
 function VideoAttachment({ attachment }) {
   const url = useMediaUrl(attachment.path);
   if (url === false) return <p className="text-[11px] italic opacity-70">No se pudo cargar el video.</p>;
-  return url ? <video src={url} controls playsInline preload="metadata" className="max-h-72 w-60 rounded-xl bg-black" /> : <div className="h-40 w-60 animate-pulse rounded-xl bg-slate-200" />;
+  return url ? <video src={url} controls playsInline preload="metadata" className="max-h-72 w-60 max-w-full rounded-xl bg-black" /> : <div className="h-40 w-60 max-w-full animate-pulse rounded-xl bg-slate-200" />;
 }
 
 function VoiceAttachment({ attachment, mine }) {
   const url = useMediaUrl(attachment.path);
   return (
-    <div className="flex min-w-[220px] items-center gap-2">
+    <div className="flex w-64 max-w-full min-w-0 items-center gap-2">
       <Mic size={16} className={mine ? "text-blue-100" : "text-blue-600"} />
-      {url ? <audio src={url} controls preload="metadata" className="h-9 w-52" /> : <span className="text-[11px] opacity-70">{url === false ? "No se pudo cargar" : "Cargando…"}</span>}
+      {url ? <audio src={url} controls preload="metadata" className="h-9 min-w-0 flex-1" /> : <span className="text-[11px] opacity-70">{url === false ? "No se pudo cargar" : "Cargando…"}</span>}
       {attachment.duration ? <span className="text-[10px] opacity-70">{durationLabel(attachment.duration)}</span> : null}
     </div>
   );
@@ -245,7 +247,7 @@ function FileAttachment({ attachment, mine }) {
     }
   }
   return (
-    <button type="button" onClick={download} className={`flex min-w-[200px] items-center gap-2.5 rounded-xl px-2.5 py-2 text-left ${mine ? "bg-[rgb(255_255_255/0.14)]" : "bg-slate-100"}`}>
+    <button type="button" onClick={download} className={`flex w-60 max-w-full min-w-0 items-center gap-2.5 rounded-xl px-2.5 py-2 text-left ${mine ? "bg-[rgb(255_255_255/0.14)]" : "bg-slate-100"}`}>
       <FileText size={22} className="shrink-0" />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-xs font-semibold">{attachment.name || "Documento"}</span>
@@ -307,7 +309,7 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
           <Smile size={14} />
         </button>
       )}
-      <div className="max-w-[80%]">
+      <div className="min-w-0 max-w-[80%]">
         <div
           {...press}
           className={`select-none [-webkit-touch-callout:none] ${
@@ -721,90 +723,6 @@ function StickerPanel({ onSend, onClose }) {
   );
 }
 
-/* ---------- Notas de voz ---------- */
-
-function VoiceRecorder({ onDone, onCancel }) {
-  const [seconds, setSeconds] = useState(0);
-  const [error, setError] = useState("");
-  const recorder = useRef(null);
-  const chunks = useRef([]);
-  const started = useRef(0);
-  const cancelled = useRef(false);
-
-  useEffect(() => {
-    let stream;
-    let timer;
-    (async () => {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const type = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"].find((t) => window.MediaRecorder?.isTypeSupported?.(t)) ?? "";
-        const rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
-        recorder.current = rec;
-        rec.ondataavailable = (e) => e.data.size && chunks.current.push(e.data);
-        rec.onstop = () => {
-          stream.getTracks().forEach((t) => t.stop());
-          if (cancelled.current) return;
-          const mime = (rec.mimeType || type || "audio/webm").split(";")[0];
-          onDone(new Blob(chunks.current, { type: mime }), (Date.now() - started.current) / 1000);
-        };
-        started.current = Date.now();
-        rec.start(250);
-        timer = window.setInterval(() => setSeconds(Math.floor((Date.now() - started.current) / 1000)), 250);
-      } catch {
-        setError("Navio no tiene permiso de usar el micrófono. Actívalo en los ajustes del navegador o del teléfono.");
-      }
-    })();
-    return () => {
-      window.clearInterval(timer);
-      if (recorder.current?.state === "recording") {
-        cancelled.current = true;
-        recorder.current.stop();
-      }
-      stream?.getTracks().forEach((t) => t.stop());
-    };
-    // Solo al abrir.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Más de 5 minutos: se envía sola.
-  useEffect(() => {
-    if (seconds >= 300 && recorder.current?.state === "recording") recorder.current.stop();
-  }, [seconds]);
-
-  if (error) {
-    return (
-      <div className="flex flex-1 items-center gap-2 text-[11px] text-rose-600">
-        <span className="flex-1">{error}</span>
-        <button type="button" onClick={onCancel} className="rounded-lg px-2 py-1 font-semibold text-slate-500 hover:bg-slate-100">
-          Cerrar
-        </button>
-      </div>
-    );
-  }
-  return (
-    <div className="flex flex-1 items-center gap-2">
-      <button
-        type="button"
-        onClick={() => {
-          cancelled.current = true;
-          recorder.current?.stop();
-          onCancel();
-        }}
-        aria-label="Cancelar nota de voz"
-        className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl text-rose-500 hover:bg-rose-50"
-      >
-        <Trash2 size={17} />
-      </button>
-      <span className="flex flex-1 items-center gap-2 rounded-xl bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-600">
-        <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-500" /> Grabando {durationLabel(seconds)}
-      </span>
-      <button type="button" onClick={() => recorder.current?.stop()} aria-label="Enviar nota de voz" className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700">
-        <Send size={15} />
-      </button>
-    </div>
-  );
-}
-
 /* ---------- La conversación ---------- */
 
 export function ChatConversation({ channel, isAdmin, onBack, header }) {
@@ -829,14 +747,16 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
   const [translations, setTranslations] = useState({});
   const [attachOpen, setAttachOpen] = useState(false);
   const [stickersOpen, setStickersOpen] = useState(false);
-  const [recording, setRecording] = useState(false);
+  const [pending, setPending] = useState([]); // archivos por revisar antes de enviar
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [gifOpen, setGifOpen] = useState(false);
+  const camera = usePermissionGate("camera");
   const [uploading, setUploading] = useState("");
   const [onlyStarred, setOnlyStarred] = useState(false);
   const [highlight, setHighlight] = useState(null);
   const scrollRef = useRef(null);
   const stickRef = useRef(true);
   const galleryRef = useRef(null);
-  const cameraRef = useRef(null);
   const docRef = useRef(null);
   const channelId = channel.id;
 
@@ -914,9 +834,31 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
       if (payload.eventType === "INSERT" && row.senderId !== user?.id) inbox.markChannelRead(channelId);
     });
     const poll = window.setInterval(loadReceipts, 20000);
+    // Si el teléfono pausó Navio (otra app, pantalla apagada), al volver se
+    // traen los mensajes que llegaron mientras tanto.
+    const catchUp = async () => {
+      if (document.visibilityState !== "visible") return;
+      const { data } = await supabase.from("chat_messages").select("*").eq("channelId", channelId).order("id", { ascending: false }).limit(PAGE_SIZE);
+      if (data) {
+        setMessages((prev) => {
+          const byId = new Map((prev ?? []).filter((m) => !m.pending).map((m) => [m.id, m]));
+          for (const row of data) byId.set(row.id, row);
+          return [...byId.values()].sort((x, y) => x.id - y.id);
+        });
+      }
+      loadExtras();
+      loadReceipts();
+      inbox.markChannelRead(channelId);
+    };
+    document.addEventListener("visibilitychange", catchUp);
+    window.addEventListener("online", catchUp);
+    window.addEventListener("focus", catchUp);
     return () => {
       off();
       window.clearInterval(poll);
+      document.removeEventListener("visibilitychange", catchUp);
+      window.removeEventListener("online", catchUp);
+      window.removeEventListener("focus", catchUp);
     };
     // "inbox" cambia con cada mensaje; solo interesa la conversación abierta.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -985,7 +927,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
     if (!ok) setDraft(body);
   }
 
-  async function sendFile(file, kindOverride = null, extra = {}) {
+  async function sendFile(file, kindOverride = null, extra = {}, caption = "") {
     setAttachOpen(false);
     setUploading(`Enviando ${file.name || "archivo"}…`);
     try {
@@ -994,14 +936,42 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
       const dims = kind === "image" ? await imageSize(file) : {};
       const reply = replyTo;
       setReplyTo(null);
-      const caption = draft.trim();
-      if (caption && kind !== "voice") setDraft("");
       await insertMessage({ body: kind === "voice" ? "" : caption, kind, attachment: { path, name: file.name || null, mime, size: file.size, ...dims, ...extra }, ...(reply ? { replyToId: reply.id } : {}) });
     } catch (err) {
       showToast(/bucket|not found|policy|row-level/i.test(err.message) ? "Los archivos del chat se activan al aplicar la actualización v25 de la base de datos." : `No se pudo enviar: ${err.message}`);
     } finally {
       setUploading("");
     }
+  }
+
+  const voice = useVoiceNote({
+    onSend: (blob, seconds) => {
+      const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
+      sendFile(new File([blob], `nota-de-voz.${ext}`, { type: blob.type }), "voice", { duration: Math.round(seconds * 10) / 10 });
+    },
+    onError: () => showToast("No se pudo usar el micrófono. Revisa el permiso en los ajustes."),
+  });
+
+  // Fotos, videos y documentos esperan aquí a que se revisen y se comenten.
+  function addPending(fileList, kind, reset) {
+    const files = [...(fileList ?? [])].slice(0, 10);
+    reset?.();
+    if (!files.length) return;
+    setAttachOpen(false);
+    setPending((prev) => [
+      ...prev,
+      ...files.map((file) => {
+        const type = file.type || "";
+        const k = kind ?? (type.startsWith("image/") ? "image" : type.startsWith("video/") ? "video" : "file");
+        return { file, kind: k, url: URL.createObjectURL(file) };
+      }),
+    ].slice(0, 10));
+  }
+  function clearPending(revoke = true) {
+    setPending((prev) => {
+      if (revoke) prev.forEach((item) => URL.revokeObjectURL(item.url));
+      return [];
+    });
   }
 
   async function sendSticker(sticker) {
@@ -1117,7 +1087,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
           const box = e.currentTarget;
           stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
         }}
-        className="min-h-0 flex-1 space-y-1.5 overflow-y-auto bg-slate-50/60 px-3 py-3"
+        className="min-h-0 flex-1 space-y-1.5 overflow-y-auto overflow-x-hidden bg-slate-50/60 px-3 py-3"
       >
         {messages === null && <p className="py-8 text-center text-xs text-slate-400">Cargando mensajes…</p>}
         {hasMore && !onlyStarred && (
@@ -1185,11 +1155,28 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
       )}
       {uploading && <p className="border-t border-slate-100 bg-white px-3 py-1.5 text-[11px] text-slate-500">{uploading}</p>}
       {stickersOpen && <StickerPanel onSend={sendSticker} onClose={() => setStickersOpen(false)} />}
+      {gifOpen && (
+        <GifPanel
+          onClose={() => setGifOpen(false)}
+          onPick={async (file, dims) => {
+            setGifOpen(false);
+            await sendFile(file, "image", { ...dims, name: "GIF" }, "");
+          }}
+        />
+      )}
       {attachOpen && (
         <div className="grid grid-cols-4 gap-2 border-t border-slate-100 bg-white p-3">
           {[
             { label: "Galería", icon: ImageIcon, tone: "bg-violet-50 text-violet-600", go: () => galleryRef.current?.click() },
-            { label: "Cámara", icon: Camera, tone: "bg-rose-50 text-rose-600", go: () => cameraRef.current?.click() },
+            {
+              label: "Cámara",
+              icon: Camera,
+              tone: "bg-rose-50 text-rose-600",
+              go: () => {
+                setAttachOpen(false);
+                camera.run(() => setCameraOpen(true));
+              },
+            },
             { label: "Documento", icon: FileText, tone: "bg-blue-50 text-blue-600", go: () => docRef.current?.click() },
             {
               label: "Stickers",
@@ -1213,78 +1200,115 @@ export function ChatConversation({ channel, isAdmin, onBack, header }) {
           })}
         </div>
       )}
-      <input ref={galleryRef} type="file" accept="image/*,video/*" className="hidden" onChange={(e) => [...e.target.files].slice(0, 10).reduce((p, f) => p.then(() => sendFile(f)), Promise.resolve()).finally(() => (e.target.value = ""))} multiple />
-      <input ref={cameraRef} type="file" accept="image/*,video/*" capture="environment" className="hidden" onChange={(e) => e.target.files[0] && sendFile(e.target.files[0]).finally(() => (e.target.value = ""))} />
+      <input ref={galleryRef} type="file" accept="image/*,video/*" multiple className="hidden" onChange={(e) => addPending(e.target.files, null, () => (e.target.value = ""))} />
       <input
         ref={docRef}
         type="file"
         accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,application/pdf"
+        multiple
         className="hidden"
-        onChange={(e) => e.target.files[0] && sendFile(e.target.files[0], "file").finally(() => (e.target.value = ""))}
+        onChange={(e) => addPending(e.target.files, "file", () => (e.target.value = ""))}
       />
 
-      <div className="flex items-end gap-2 border-t border-slate-100 bg-white p-2.5">
-        {recording ? (
-          <VoiceRecorder
-            onCancel={() => setRecording(false)}
-            onDone={(blob, seconds) => {
-              setRecording(false);
-              const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
-              sendFile(new File([blob], `nota-de-voz.${ext}`, { type: blob.type }), "voice", { duration: Math.round(seconds * 10) / 10 });
-            }}
-          />
-        ) : (
-          <>
-            {advanced && !editing && (
-              <button
-                type="button"
-                onClick={() => {
-                  setStickersOpen(false);
-                  setAttachOpen((v) => !v);
+      {pending.length > 0 ? (
+        <AttachmentPreview
+          items={pending}
+          onRemove={(index) =>
+            setPending((prev) => {
+              const next = [...prev];
+              const [gone] = next.splice(index, 1);
+              if (gone) URL.revokeObjectURL(gone.url);
+              return next;
+            })
+          }
+          onCancel={clearPending}
+          onAddMore={pending.some((p) => p.kind === "file") ? () => docRef.current?.click() : () => galleryRef.current?.click()}
+          onSend={async (items, caption) => {
+            const list = [...items];
+            clearPending(false);
+            for (let i = 0; i < list.length; i += 1) await sendFile(list[i].file, list[i].kind, {}, i === 0 ? caption : "");
+            list.forEach((item) => URL.revokeObjectURL(item.url));
+          }}
+        />
+      ) : (
+        <div className="flex items-end gap-2 border-t border-slate-100 bg-white p-2.5">
+          {voice.mode ? (
+            <RecordingBar voice={voice} />
+          ) : (
+            <>
+              {advanced && !editing && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStickersOpen(false);
+                    setGifOpen(false);
+                    setAttachOpen((v) => !v);
+                  }}
+                  aria-label="Adjuntar"
+                  aria-expanded={attachOpen}
+                  className={`flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl transition ${attachOpen ? "rotate-45 bg-slate-100 text-slate-700" : "text-slate-500 hover:bg-slate-100"}`}
+                >
+                  <Plus size={19} />
+                </button>
+              )}
+              <textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    send();
+                  }
                 }}
-                aria-label="Adjuntar"
-                aria-expanded={attachOpen}
-                className={`flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl transition ${attachOpen ? "rotate-45 bg-slate-100 text-slate-700" : "text-slate-500 hover:bg-slate-100"}`}
-              >
-                <Plus size={19} />
-              </button>
-            )}
-            <textarea
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-              rows={1}
-              maxLength={4000}
-              placeholder={editing ? "Edita tu mensaje…" : "Escribe un mensaje…"}
-              aria-label="Mensaje"
-              className="max-h-32 min-h-[38px] flex-1 resize-none rounded-xl border border-slate-200 px-3 py-2 text-xs focus:border-blue-400 focus:outline-none"
-            />
-            {draft.trim() || editing || !advanced ? (
-              <button type="button" onClick={send} disabled={!draft.trim()} aria-label={editing ? "Guardar cambios" : "Enviar"} className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40">
-                {editing ? <Check size={16} /> : <Send size={15} />}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  setAttachOpen(false);
-                  setStickersOpen(false);
-                  setRecording(true);
-                }}
-                aria-label="Grabar nota de voz"
-                className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700"
-              >
-                <Mic size={16} />
-              </button>
-            )}
-          </>
-        )}
-      </div>
+                rows={1}
+                maxLength={4000}
+                placeholder={editing ? "Edita tu mensaje…" : "Escribe un mensaje…"}
+                aria-label="Mensaje"
+                className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-xl border border-slate-200 px-3 py-2 text-xs focus:border-blue-400 focus:outline-none"
+              />
+            </>
+          )}
+          {voice.mode === "locked" ? (
+            <button type="button" onClick={() => voice.finish(true)} aria-label="Enviar nota de voz" className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700">
+              <Send size={15} />
+            </button>
+          ) : draft.trim() || editing || !advanced ? (
+            <button type="button" onClick={send} disabled={!draft.trim()} aria-label={editing ? "Guardar cambios" : "Enviar"} className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40">
+              {editing ? <Check size={16} /> : <Send size={15} />}
+            </button>
+          ) : (
+            <>
+              {!voice.mode && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAttachOpen(false);
+                    setStickersOpen(false);
+                    setGifOpen((v) => !v);
+                  }}
+                  aria-label="GIFs"
+                  aria-expanded={gifOpen}
+                  className={`flex h-[38px] shrink-0 items-center justify-center rounded-xl border px-2 text-[11px] font-extrabold tracking-wide ${gifOpen ? "border-blue-600 bg-blue-50 text-blue-700" : "border-slate-200 text-slate-500 hover:bg-slate-50"}`}
+                >
+                  GIF
+                </button>
+              )}
+              <MicButton voice={voice} />
+            </>
+          )}
+        </div>
+      )}
+      {voice.sheet}
+      {camera.sheet}
+      {cameraOpen && (
+        <CameraCapture
+          onClose={() => setCameraOpen(false)}
+          onCapture={(file) => {
+            setCameraOpen(false);
+            addPending([file], "image");
+          }}
+        />
+      )}
 
       {menuMessage && (
         <ActionSheet

@@ -22,6 +22,7 @@ import { supabase, useAuth, useToast, useDateFormat, formatDate, Modal, avatarUr
 import { usePeople, personName } from "./people.jsx";
 import { useBackLayer, goBack } from "./history.js";
 import { ChatConversation, previewText } from "./chat.jsx";
+import { PushInvite } from "./push.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Bandeja: alertas, mensajes y tareas de la persona                     */
@@ -49,6 +50,8 @@ export function InboxProvider({ children }) {
   const overviewTimer = useRef(null);
   const userId = user?.id ?? null;
   const companyId = profile?.companyId ?? null;
+  // Sube cuando hay que volver a conectar el tiempo real (al regresar a Navio).
+  const [epoch, setEpoch] = useState(0);
 
   const loadNotifications = useCallback(async () => {
     const { data, error } = await supabase.from("notifications").select("*").order("createdAt", { ascending: false }).limit(60);
@@ -103,13 +106,30 @@ export function InboxProvider({ children }) {
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, loadTasks)
       .subscribe();
+    // El teléfono pausa las páginas en segundo plano y la conexión en tiempo
+    // real se pierde: al volver se traen avisos, conversaciones y tareas, y si
+    // la conexión se cayó se abre otra.
+    const resume = () => {
+      if (document.visibilityState !== "visible") return;
+      loadNotifications();
+      loadChannels();
+      loadTasks();
+      markDelivered();
+      if (channel.state !== "joined" && channel.state !== "joining") setEpoch((n) => n + 1);
+    };
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("online", resume);
+    window.addEventListener("focus", resume);
     return () => {
       window.clearTimeout(overviewTimer.current);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("online", resume);
+      window.removeEventListener("focus", resume);
       supabase.removeChannel(channel);
     };
     // showToast cambia en cada render de la app; no debe reiniciar la suscripción.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, companyId, loadNotifications, loadChannels, loadTasks]);
+  }, [userId, companyId, loadNotifications, loadChannels, loadTasks, epoch]);
 
   const markRead = useCallback(async (ids) => {
     const list = ids.filter(Boolean);
@@ -577,6 +597,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all", onOpenCha
           <p className="mt-1 text-sm text-slate-500">{meta.hint}</p>
         </div>
       )}
+      {!open && <PushInvite compact={compact} />}
       <div className={`grid min-h-0 flex-1 overflow-hidden border-slate-200 bg-white lg:grid-cols-[300px_minmax(0,1fr)] ${compact ? "" : "h-[calc(100vh-14rem)] min-h-[420px] rounded-2xl border shadow-sm"}`}>
         <div className={`min-h-0 flex-col border-slate-100 lg:flex lg:border-r ${open ? "hidden" : "flex"}`}>
           <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2.5">

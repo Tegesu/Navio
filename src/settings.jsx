@@ -19,6 +19,7 @@ import { PasswordChecklist, passwordProblem, setWeakPasswordFlag } from "./passw
 import { BackgroundTrackingPanel } from "./background.jsx";
 import { SETTINGS_SECTIONS, ThemeSwitch } from "./navigation.jsx";
 import { GpsDevicesPanel } from "./gpsdevices.jsx";
+import { PushSettingsCard } from "./push.jsx";
 
 const card = "rounded-2xl border border-slate-200 bg-white p-4 shadow-sm";
 const inputClass = "w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none disabled:bg-slate-50 disabled:text-slate-500";
@@ -698,6 +699,7 @@ function PreferencesPanel() {
           <ThemeSwitch />
         </div>
       </div>
+      <PushSettingsCard />
       <div className={card}>
         <h2 className="mb-1 text-sm font-bold text-slate-800">Formato de fecha</h2>
         <p className="mb-3 text-xs text-slate-500">Cómo se muestran las fechas en este navegador.</p>
