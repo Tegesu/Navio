@@ -71,59 +71,125 @@ export function usePermission(name) {
 
 // Pide el permiso: hace aparecer la ventana del sistema. true si quedó dado.
 export async function requestPermission(name) {
-  const ok = await askSystem(name);
-  remember(name, ok);
-  return ok;
+  return (await requestPermissionDetailed(name)).ok;
+}
+
+// Igual, pero dice por qué no: "denied" (se negó), "unavailable" (hay
+// permiso pero el teléfono no dio la ubicación), "timeout" o "unsupported".
+export async function requestPermissionDetailed(name) {
+  const result = await askSystem(name);
+  // Sin señal o tardanza no es una negativa: el permiso sigue dado.
+  if (result.ok || result.reason === "denied") remember(name, result.ok);
+  return result;
 }
 
 async function askSystem(name) {
   try {
     if (name === "microphone" || name === "camera") {
+      if (!navigator.mediaDevices?.getUserMedia) return { ok: false, reason: "unsupported" };
       const stream = await navigator.mediaDevices.getUserMedia(name === "microphone" ? { audio: true } : { video: true });
       stream.getTracks().forEach((t) => t.stop());
-      return true;
+      return { ok: true };
     }
     if (name === "geolocation") {
-      await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 15000 }));
-      return true;
+      if (!navigator.geolocation) return { ok: false, reason: "unsupported" };
+      // Se llama directo desde el toque: Safari solo muestra su ventana así.
+      await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: false, timeout: 20000, maximumAge: 60000 }));
+      return { ok: true };
     }
     if (name === "notifications") {
-      if (typeof Notification === "undefined") return false;
-      return (await Notification.requestPermission()) === "granted";
+      if (typeof Notification === "undefined") return { ok: false, reason: "unsupported" };
+      return (await Notification.requestPermission()) === "granted" ? { ok: true } : { ok: false, reason: "denied" };
     }
   } catch (err) {
-    // Ubicación: "no se encontró señal" no es una negativa.
-    if (name === "geolocation" && err?.code && err.code !== 1) return true;
-    return false;
+    if (name === "geolocation" && err?.code === 2) return { ok: false, reason: "unavailable" };
+    if (name === "geolocation" && err?.code === 3) return { ok: false, reason: "timeout" };
+    return { ok: false, reason: "denied" };
   }
-  return false;
+  return { ok: false, reason: "unsupported" };
 }
 
-function settingsSteps(name) {
-  if (isNativeApp()) return ["Abre los Ajustes del teléfono.", "Entra a Apps → Navio → Permisos.", `Activa "${INFO[name].title}" y vuelve a Navio.`];
-  return [
-    "Toca el candado (o el ícono de ajustes) junto a la dirección de la página, arriba.",
-    `Busca "${INFO[name].title}" y elige "Permitir".`,
-    "Vuelve a Navio; si no cambia, recarga la página.",
-  ];
+/* ---------- Cómo activarlo en cada teléfono ---------- */
+
+const ua = () => (typeof navigator === "undefined" ? "" : navigator.userAgent);
+export const isIOSDevice = () => /iphone|ipad|ipod/i.test(ua()) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isIOSChrome = () => isIOSDevice() && /CriOS/i.test(ua());
+const isIOSFirefox = () => isIOSDevice() && /FxiOS/i.test(ua());
+const isAndroid = () => /android/i.test(ua());
+const isStandalone = () => window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true;
+
+const SITE_SETTING = { geolocation: "Ubicación", microphone: "Micrófono", camera: "Cámara", notifications: "Notificaciones" };
+
+export function settingsSteps(name, reason = "denied") {
+  const what = SITE_SETTING[name];
+  if (isNativeApp()) {
+    const steps = ["Abre los Ajustes del teléfono.", `Entra a Apps → Navio → Permisos → ${what} y elige "Permitir".`];
+    if (name === "geolocation") steps.push("Revisa también que la Ubicación del teléfono esté encendida (en el panel de arriba de la pantalla).");
+    steps.push("Vuelve a Navio y toca \"Intentar de nuevo\".");
+    return steps;
+  }
+  if (isIOSDevice()) {
+    if (name === "notifications") {
+      return isStandalone()
+        ? ["Abre Ajustes del iPhone → Notificaciones → Navio.", "Activa \"Permitir notificaciones\".", "Vuelve a Navio y toca \"Intentar de nuevo\"."]
+        : ["En iPhone, los avisos solo funcionan con Navio en la pantalla de inicio.", "En Safari toca Compartir → \"Agregar a pantalla de inicio\".", "Abre Navio desde ese ícono y actívalas ahí."];
+    }
+    if (isIOSChrome() || isIOSFirefox()) {
+      const app = isIOSChrome() ? "Chrome" : "Firefox";
+      return name === "geolocation"
+        ? [
+            "Abre Ajustes del iPhone → Privacidad y seguridad → Localización y revisa que esté activada.",
+            `En esa misma lista entra a ${app} y elige "Al usar la app" (activa "Ubicación exacta").`,
+            `Vuelve a ${app}, recarga Navio y toca "Intentar de nuevo".`,
+          ]
+        : [`Abre Ajustes del iPhone → Apps → ${app} y activa ${what}.`, `Vuelve a ${app}, recarga Navio y toca "Intentar de nuevo".`];
+    }
+    if (name === "geolocation") {
+      return [
+        "Abre Ajustes del iPhone → Privacidad y seguridad → Localización y revisa que esté activada.",
+        "En esa misma lista entra a \"Sitios web de Safari\" y elige \"Al usar la app\" (activa \"Ubicación exacta\").",
+        "En Safari, toca el botón \"aA\" (o el de ajustes) junto a la dirección → \"Ajustes del sitio web\" → Ubicación → \"Permitir\".",
+        "Vuelve a Navio y toca \"Intentar de nuevo\".",
+      ];
+    }
+    return [
+      `En Safari, toca el botón "aA" (o el de ajustes) junto a la dirección → "Ajustes del sitio web" → ${what} → "Permitir".`,
+      `Si no aparece, abre Ajustes del iPhone → Apps → Safari → ${what} y elige "Preguntar" o "Permitir".`,
+      "Vuelve a Navio y toca \"Intentar de nuevo\".",
+    ];
+  }
+  if (isAndroid()) {
+    const steps = [`Toca el ícono de ajustes (o el candado) junto a la dirección de la página → Permisos → ${what} → "Permitir".`];
+    if (name === "geolocation") steps.push("Revisa que la Ubicación del teléfono esté encendida (en el panel de arriba de la pantalla).");
+    steps.push("Vuelve a Navio y toca \"Intentar de nuevo\".");
+    return steps;
+  }
+  return [`Haz clic en el candado (o el ícono de ajustes) junto a la dirección de la página → ${what} → "Permitir".`, "Si no cambia, recarga la página y toca \"Intentar de nuevo\"."];
 }
+
+const PROBLEM_TEXT = {
+  denied: "El permiso está desactivado. Para activarlo:",
+  unavailable: "Navio tiene permiso, pero el teléfono no dio tu ubicación. Revisa esto:",
+  timeout: "El teléfono tardó demasiado en dar tu ubicación. Revisa esto y vuelve a intentar:",
+  unsupported: "Este navegador no permite usarlo. Prueba con Safari o Chrome actualizados.",
+};
 
 // Ventana que explica para qué es el permiso y lo pide.
-export function PermissionSheet({ name, onGranted, onClose }) {
+export function PermissionSheet({ name, onGranted, onClose, initialProblem = null }) {
   const info = INFO[name];
   const Icon = info.icon;
   const [state, refresh] = usePermission(name);
   const [asking, setAsking] = useState(false);
-  const [denied, setDenied] = useState(false);
-  const blocked = denied || state === "denied";
+  const [problem, setProblem] = useState(initialProblem);
+  const shown = problem ?? (state === "denied" ? "denied" : null);
 
   async function ask() {
     setAsking(true);
-    const ok = await requestPermission(name);
+    const result = await requestPermissionDetailed(name);
     setAsking(false);
     await refresh();
-    if (ok) onGranted?.();
-    else setDenied(true);
+    if (result.ok) onGranted?.();
+    else setProblem(result.reason);
   }
 
   return (
@@ -135,18 +201,20 @@ export function PermissionSheet({ name, onGranted, onClose }) {
           </span>
           <p className="text-xs leading-relaxed text-slate-600">{info.why}</p>
         </div>
-        {blocked ? (
+        {shown ? (
           <div className="space-y-2 rounded-xl bg-slate-50 p-3">
-            <p className="text-xs font-semibold text-slate-700">El permiso está desactivado. Para activarlo:</p>
-            <ol className="list-decimal space-y-1 pl-4 text-[11px] text-slate-600">
-              {settingsSteps(name).map((step) => (
-                <li key={step}>{step}</li>
-              ))}
-            </ol>
+            <p className="text-xs font-semibold text-slate-700">{PROBLEM_TEXT[shown] ?? PROBLEM_TEXT.denied}</p>
+            {shown !== "unsupported" && (
+              <ol className="list-decimal space-y-1 pl-4 text-[11px] leading-relaxed text-slate-600">
+                {settingsSteps(name, shown).map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+            )}
           </div>
         ) : (
           <p className="flex items-center gap-1.5 text-[11px] text-slate-400">
-            <ShieldCheck size={12} /> Puedes quitar el permiso cuando quieras desde los ajustes.
+            <ShieldCheck size={12} /> {isIOSDevice() && name === "geolocation" ? "Al tocar Permitir, el iPhone te preguntará si Navio puede usar tu ubicación." : "Puedes quitar el permiso cuando quieras desde los ajustes."}
           </p>
         )}
         <div className="flex justify-end gap-2">
@@ -154,7 +222,7 @@ export function PermissionSheet({ name, onGranted, onClose }) {
             Ahora no
           </button>
           <button type="button" onClick={ask} disabled={asking} className="rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
-            {asking ? "Esperando…" : blocked ? "Intentar de nuevo" : "Permitir"}
+            {asking ? "Esperando…" : shown ? "Intentar de nuevo" : "Permitir"}
           </button>
         </div>
       </div>
@@ -166,22 +234,33 @@ export function PermissionSheet({ name, onGranted, onClose }) {
 // primero muestra la ventana del permiso.
 export function usePermissionGate(name) {
   const [state, refresh] = usePermission(name);
-  const [pending, setPending] = useState(null);
+  const [pending, setPending] = useState(null); // { action, problem }
   const run = (action) => {
     if (state === "granted") action();
-    else setPending(() => action);
+    else setPending({ action, problem: null });
+  };
+  // Cuando algo falló aunque parecía permitido: abre la ventana ya con la
+  // explicación y, al lograrlo, repite la acción.
+  const explain = (problem, action) => {
+    if (problem === "denied") remember(name, false);
+    refresh();
+    setPending({ action, problem });
   };
   const sheet = pending ? (
     <PermissionSheet
       name={name}
+      initialProblem={pending.problem}
       onClose={() => setPending(null)}
       onGranted={() => {
-        const action = pending;
+        const action = pending.action;
         setPending(null);
         refresh();
         action?.();
       }}
     />
   ) : null;
-  return { state, run, sheet, refresh };
+  return { state, run, explain, sheet, refresh };
 }
+
+// Traduce el error de ubicación del navegador al motivo que entiende la ventana.
+export const geoProblem = (err) => (err?.code === 1 ? "denied" : err?.code === 3 ? "timeout" : "unavailable");

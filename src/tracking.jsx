@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import L from "leaflet";
 import { addBaseLayer, trafficLayer, durationText, hasTomTom } from "./maps.js";
 import { RoutePlanner, savePlan, readPlan, thinPoints } from "./routeplanner.jsx";
-import { PermissionSheet, usePermissionGate } from "./permissions.jsx";
+import { PermissionSheet, usePermissionGate, forgetPermission } from "./permissions.jsx";
 import { Capacitor, CapacitorHttp, registerPlugin } from "@capacitor/core";
 import { AlertTriangle, Clock, Gauge, LocateFixed, MapPin, Navigation, Route, Truck, User, WifiOff, X } from "lucide-react";
 import {
@@ -261,6 +261,7 @@ export function TrackingProvider({ children }) {
 
   function handleGeoError(geoError) {
     if (geoError.code === 1) {
+      forgetPermission("geolocation");
       setError(
         isNativeApp()
           ? "Navio no tiene permiso para usar la ubicación. Actívalo en los ajustes del teléfono para la app Navio."
@@ -354,7 +355,7 @@ export function TrackingProvider({ children }) {
       navigator.geolocation.getCurrentPosition(
         () => resolve(false),
         (geoError) => resolve(geoError.code === 1),
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
+        { enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 }
       )
     );
   }
@@ -566,7 +567,8 @@ export function TrackingProvider({ children }) {
 
   useEffect(() => clearWatch, []);
 
-  const value = { active, status, stats, lastFix, pending, error, orphan, consent, mode, native, tracker, trackerSeenAt, pausedMs, start, stop, follow, finishOrphan, giveConsent, reloadTracker };
+  const clearError = () => setError("");
+  const value = { active, status, stats, lastFix, pending, error, clearError, orphan, consent, mode, native, tracker, trackerSeenAt, pausedMs, start, stop, follow, finishOrphan, giveConsent, reloadTracker };
   return <TrackingContext.Provider value={value}>{children}</TrackingContext.Provider>;
 }
 
@@ -634,7 +636,7 @@ export function TrackingLiveCard({ big = false }) {
 }
 
 function TrackingError() {
-  const { error } = useTracking();
+  const { error, clearError } = useTracking();
   const [asking, setAsking] = useState(false);
   if (!error) return null;
   if (/permiso/i.test(error)) {
@@ -645,7 +647,17 @@ function TrackingError() {
           <span className="min-w-0 flex-1 text-xs text-slate-500">Para registrar el recorrido, Navio necesita tu ubicación.</span>
           <span className="shrink-0 text-[11px] font-semibold text-blue-600">Permitir</span>
         </button>
-        {asking && <PermissionSheet name="geolocation" onGranted={() => setAsking(false)} onClose={() => setAsking(false)} />}
+        {asking && (
+          <PermissionSheet
+            name="geolocation"
+            initialProblem="denied"
+            onGranted={() => {
+              setAsking(false);
+              clearError?.();
+            }}
+            onClose={() => setAsking(false)}
+          />
+        )}
       </>
     );
   }

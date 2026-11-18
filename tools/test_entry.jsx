@@ -500,18 +500,36 @@ Object.defineProperty(supabase, "functions", {
 });
 
 // ---- GPS simulado: window.__geo.fix(lat, lng, kmh) ----
-const geo = { watchers: new Map(), seq: 1, denied: false, last: { lat: 18.14, lng: -94.45 } };
+// __geo.denied = true (se negó) o __geo.errorCode = 2 | 3 (sin señal / tardó).
+const geo = { watchers: new Map(), seq: 1, denied: false, errorCode: null, calls: 0, last: { lat: 18.14, lng: -94.45 } };
 const position = (lat, lng, kmh = 0) => ({ coords: { latitude: lat, longitude: lng, speed: kmh / 3.6, heading: 90, accuracy: 8 }, timestamp: Date.now() });
 Object.defineProperty(navigator, "geolocation", {
   configurable: true,
   value: {
-    getCurrentPosition: (ok, fail) => (geo.denied ? fail({ code: 1, message: "denied" }) : ok(position(geo.last.lat, geo.last.lng))),
+    getCurrentPosition: (ok, fail) => {
+      geo.calls += 1;
+      if (geo.denied) return fail({ code: 1, message: "denied" });
+      if (geo.errorCode) return fail({ code: geo.errorCode, message: "error" });
+      return ok(position(geo.last.lat, geo.last.lng));
+    },
     watchPosition: (ok) => { const id = geo.seq++; geo.watchers.set(id, ok); return id; },
     clearWatch: (id) => geo.watchers.delete(id),
   },
 });
 geo.fix = (lat, lng, kmh = 60) => { geo.last = { lat, lng }; geo.watchers.forEach((cb) => cb(position(lat, lng, kmh))); };
 window.__geo = geo;
+// El permiso de ubicación lo decide la simulación, no el navegador de pruebas.
+if (navigator.permissions?.query) {
+  const realQuery = navigator.permissions.query.bind(navigator.permissions);
+  navigator.permissions.query = (desc) => (desc?.name === "geolocation" ? Promise.resolve({ state: geo.denied ? "denied" : "prompt", onchange: null }) : realQuery(desc));
+}
+// ?ios: el navegador se presenta como Safari de iPhone.
+if (params.has("ios")) {
+  Object.defineProperty(navigator, "userAgent", {
+    configurable: true,
+    get: () => "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+  });
+}
 
 // ---- Ayudas para manejar la página desde las pruebas ----
 window.__clickText = (t, root = document) => { const el = [...root.querySelectorAll("button")].find((b) => b.textContent.trim() === t); if (!el) return false; el.click(); return true; };

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import L from "leaflet";
 import { Car, Crosshair, LocateFixed, Lock, MapPin, Search, TrafficCone, Truck, X } from "lucide-react";
-import { usePermissionGate } from "./permissions.jsx";
+import { usePermissionGate, geoProblem } from "./permissions.jsx";
 import { addBaseLayer, trafficLayer, hasTomTom, searchPlaces, placeName, planRoutes, durationText } from "./maps.js";
 
 /* ---------------------------------------------------------------------- */
@@ -124,6 +124,7 @@ function PlannerMap({ from, to, routes, selected, traffic, picking, onPick, onSe
 
 function PlaceField({ label, value, onChange, onPickOnMap, picking, near, extra, locked = null }) {
   const [text, setText] = useState("");
+  const [manual, setManual] = useState(false);
   const [results, setResults] = useState([]);
   const timer = useRef(null);
 
@@ -142,12 +143,17 @@ function PlaceField({ label, value, onChange, onPickOnMap, picking, near, extra,
   return (
     <div className="relative">
       <p className="mb-1 text-[11px] font-semibold text-slate-500">{label}</p>
-      {locked && !value ? (
-        <button type="button" onClick={locked.onClick} className="flex w-full items-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-2 text-left">
-          <Lock size={14} className="shrink-0 text-slate-400" />
-          <span className="min-w-0 flex-1 truncate text-xs text-slate-400">{locked.text}</span>
-          <span className="shrink-0 text-[11px] font-semibold text-blue-600">Permitir</span>
-        </button>
+      {locked && !value && !manual ? (
+        <div>
+          <button type="button" onClick={locked.onClick} className="flex w-full items-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-2 text-left">
+            <Lock size={14} className="shrink-0 text-slate-400" />
+            <span className="min-w-0 flex-1 truncate text-xs text-slate-400">{locked.text}</span>
+            <span className="shrink-0 text-[11px] font-semibold text-blue-600">{locked.busy ? "Buscando…" : "Permitir"}</span>
+          </button>
+          <button type="button" onClick={() => setManual(true)} className="mt-1 text-[11px] font-medium text-slate-500 underline-offset-2 hover:underline">
+            o escribe la dirección de salida
+          </button>
+        </div>
       ) : value ? (
         <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2">
           <MapPin size={14} className="shrink-0 text-blue-600" />
@@ -216,23 +222,35 @@ export function RoutePlanner({ onChange, initialTo = null }) {
   const [error, setError] = useState("");
   const geo = usePermissionGate("geolocation");
 
-  function readLocation() {
+  // quiet: al abrir la pantalla no se muestra ninguna ventana si falla.
+  function readLocation({ quiet = false } = {}) {
     if (!navigator.geolocation) return;
     setState("locating");
+    const done = (pos) => {
+      setFrom({ label: "Mi ubicación", lat: pos.coords.latitude, lng: pos.coords.longitude });
+      setState("idle");
+    };
+    const failed = (err) => {
+      setState("idle");
+      if (quiet && err?.code !== 1) return;
+      geo.explain(geoProblem(err), () => readLocation());
+    };
+    // Primero con GPS; si tarda o no hay señal (adentro de un edificio, por
+    // ejemplo), se acepta la ubicación aproximada.
     navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setFrom({ label: "Mi ubicación", lat: pos.coords.latitude, lng: pos.coords.longitude });
-        setState("idle");
+      done,
+      (err) => {
+        if (err?.code === 1) return failed(err);
+        navigator.geolocation.getCurrentPosition(done, failed, { enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 });
       },
-      () => setState("idle"),
-      { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 }
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
     );
   }
-  const useMyLocation = () => geo.run(readLocation);
+  const useMyLocation = () => geo.run(() => readLocation());
 
   // Al abrir, si ya hay permiso, la salida es la ubicación actual.
   useEffect(() => {
-    if (geo.state === "granted" && !from) readLocation();
+    if (geo.state === "granted" && !from) readLocation({ quiet: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geo.state]);
 
@@ -283,7 +301,7 @@ export function RoutePlanner({ onChange, initialTo = null }) {
         <PlaceField
           label="Salida"
           value={from}
-          locked={geo.state !== "granted" ? { text: "Toca para usar tu ubicación", onClick: useMyLocation } : null}
+          locked={geo.state !== "granted" ? { text: "Toca para usar tu ubicación", onClick: useMyLocation, busy: state === "locating" } : null}
           onChange={setFrom}
           picking={picking === "from"}
           onPickOnMap={() => setPicking((p) => (p === "from" ? null : "from"))}
