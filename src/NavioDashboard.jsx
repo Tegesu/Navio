@@ -9830,6 +9830,8 @@ function NavioApp() {
               className={`flex-1 [&_.page-intro+*]:!mt-0 [&_.page-intro+*]:ml-auto [&_.page-intro]:hidden ${
                 activeTab === "messages"
                   ? "p-0 [&_.messages-panel]:h-[calc(100vh-69px)] [&_.messages-panel]:rounded-none [&_.messages-panel]:border-0 [&_.messages-panel]:shadow-none"
+                  : activeTab === "map"
+                  ? "px-6 py-6 lg:p-0"
                   : "px-6 py-6"
               }`}
             >

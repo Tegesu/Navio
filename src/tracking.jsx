@@ -1389,14 +1389,16 @@ export function LiveMapPage({ vehicles, trips = [], isAdmin, onSelectVehicle }) 
   const follow = following && !pastRoute && selected?.position ? selected.position : null;
   const withSignal = fleet.filter((v) => v.position).length;
 
+  // PC: el mapa ocupa todo el espacio y a la derecha van los botones, los
+  // estados y la lista. Teléfono: uno debajo del otro.
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="page-intro">
-          <h1 className="text-xl font-bold text-slate-900">Mapa en vivo</h1>
-          <p className="mt-1 text-sm text-slate-500">Dónde está cada unidad y el recorrido de sus viajes, en tiempo real.</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
+    <div className="grid grid-cols-1 gap-3 lg:h-[calc(100vh-69px)] lg:grid-cols-[minmax(0,1fr)_340px] lg:grid-rows-[auto_auto_minmax(0,1fr)] lg:gap-0">
+      <div className="page-intro">
+        <h1 className="text-xl font-bold text-slate-900">Mapa en vivo</h1>
+        <p className="mt-1 text-sm text-slate-500">Dónde está cada unidad y el recorrido de sus viajes, en tiempo real.</p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 lg:col-start-2 lg:row-start-1 lg:!ml-0 lg:border-l lg:border-slate-200 lg:px-3 lg:pt-3">
+        <div className="flex w-full flex-wrap items-center gap-2">
           <span className="flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1.5 text-[11px] font-semibold text-emerald-700 ring-1 ring-emerald-200">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> Tiempo real
           </span>
@@ -1415,7 +1417,7 @@ export function LiveMapPage({ vehicles, trips = [], isAdmin, onSelectVehicle }) 
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-2 lg:col-start-2 lg:row-start-2 lg:border-l lg:border-slate-200 lg:px-3 lg:pt-3">
         {FLEET_STATUS_FILTERS.map((f) => (
           <button
             key={f.id}
@@ -1429,8 +1431,8 @@ export function LiveMapPage({ vehicles, trips = [], isAdmin, onSelectVehicle }) 
         ))}
       </div>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
-        <div className="relative h-[60vh] min-h-[420px] overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
+      <div className="contents">
+        <div className="relative h-[60vh] min-h-[420px] overflow-hidden rounded-2xl border border-slate-200 shadow-sm lg:col-start-1 lg:row-span-3 lg:row-start-1 lg:h-full lg:min-h-0 lg:rounded-none lg:border-0 lg:shadow-none">
           <MapView markers={markers} lines={lines} pins={pins} fitKey={withSignal > 0 ? fitKey : undefined} follow={follow} onSelectMarker={selectVehicle} traffic={showTraffic} />
           {hasTomTom() && (
             <button
@@ -1458,7 +1460,7 @@ export function LiveMapPage({ vehicles, trips = [], isAdmin, onSelectVehicle }) 
           </div>
         </div>
 
-        <div className="max-h-[60vh] min-h-0 space-y-2 overflow-y-auto lg:min-h-[420px]">
+        <div className="max-h-[60vh] min-h-0 space-y-2 overflow-y-auto overscroll-contain lg:col-start-2 lg:row-start-3 lg:max-h-none lg:border-l lg:border-slate-200 lg:p-3">
           {selected ? (
             <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
               <div className="flex items-start justify-between gap-2">
