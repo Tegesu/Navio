@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useLayoutEffect, useCallback, useContext, useRef, createContext } from "react";
+import { createPortal } from "react-dom";
 import { createClient } from "@supabase/supabase-js";
 import { PeopleProvider } from "./people.jsx";
 import { TrackingProvider, TrackingPill, DriverModeModal, LiveMapPage } from "./tracking.jsx";
@@ -5768,15 +5769,489 @@ function ReportTrend({ rows, period, currency }) {
   );
 }
 
+/* ---------- El documento PDF del reporte ---------- */
+//
+// Al tocar "Descargar PDF" se arma este documento aparte (siempre claro,
+// aunque Navio esté en modo oscuro) y el navegador lo guarda como PDF. Se
+// escribe con estilos propios para que se vea igual en cualquier equipo.
+
+const DOC = {
+  ink: "#0f172a",
+  text: "#334155",
+  muted: "#64748b",
+  faint: "#94a3b8",
+  line: "#e2e8f0",
+  soft: "#f8fafc",
+  head: "#f1f5f9",
+  accent: "#2563eb",
+  navy: "#0f172a",
+};
+const docFont = { fontFamily: '"Segoe UI", system-ui, -apple-system, Helvetica, Arial, sans-serif' };
+const docTh = { padding: "5px 6px", fontSize: "7pt", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", color: DOC.muted, background: DOC.head, textAlign: "left", borderBottom: `1px solid ${DOC.line}` };
+const docTd = { padding: "4.5px 6px", fontSize: "8.5pt", color: DOC.text, borderBottom: `1px solid ${DOC.line}`, verticalAlign: "middle" };
+const docRight = { textAlign: "right", whiteSpace: "nowrap" };
+
+function DocSection({ number, title, hint, children, keepTogether = true }) {
+  return (
+    <section style={{ marginTop: "16px", breakInside: keepTogether ? "avoid" : "auto", pageBreakInside: keepTogether ? "avoid" : "auto" }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: "8px", borderBottom: `2px solid ${DOC.accent}`, paddingBottom: "4px", marginBottom: "8px", breakAfter: "avoid", pageBreakAfter: "avoid" }}>
+        <span style={{ fontSize: "8pt", fontWeight: 800, color: DOC.accent }}>{String(number).padStart(2, "0")}</span>
+        <span style={{ fontSize: "12pt", fontWeight: 800, color: DOC.ink }}>{title}</span>
+      </div>
+      {hint && <p style={{ margin: "0 0 8px", fontSize: "8pt", color: DOC.muted }}>{hint}</p>}
+      {children}
+    </section>
+  );
+}
+
+function DocKpi({ label, value, sub, change, goodWhenDown = false, color = DOC.accent }) {
+  const up = change != null && change > 0.5;
+  const down = change != null && change < -0.5;
+  const good = (down && goodWhenDown) || (up && !goodWhenDown);
+  return (
+    <div style={{ border: `1px solid ${DOC.line}`, borderLeft: `4px solid ${color}`, borderRadius: "8px", padding: "8px 10px", background: "#fff" }}>
+      <div style={{ fontSize: "7pt", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: DOC.muted }}>{label}</div>
+      <div style={{ fontSize: "15pt", fontWeight: 800, color: DOC.ink, marginTop: "2px" }}>{value}</div>
+      <div style={{ fontSize: "7.5pt", color: DOC.muted, marginTop: "1px" }}>
+        {(up || down) && <b style={{ color: good ? "#059669" : "#d97706" }}>{up ? "▲" : "▼"} {Math.abs(change).toFixed(1)}% </b>}
+        {sub}
+      </div>
+    </div>
+  );
+}
+
+// Tabla con barra: proyectos, unidades, proveedores.
+function DocRanking({ items, total, currency, color, label }) {
+  if (items.length === 0) return <p style={{ fontSize: "8.5pt", color: DOC.muted }}>Sin datos en el periodo.</p>;
+  const max = Math.max(...items.map((i) => i.value), 1);
+  return (
+    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+      <thead>
+        <tr>
+          <th style={{ ...docTh, width: "22px" }}>#</th>
+          <th style={docTh}>{label}</th>
+          <th style={{ ...docTh, ...docRight }}>Facturas</th>
+          <th style={{ ...docTh, ...docRight }}>Monto</th>
+          <th style={{ ...docTh, ...docRight }}>%</th>
+          <th style={{ ...docTh, width: "28%" }} />
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((item, i) => (
+          <tr key={item.key || `n-${i}`} style={{ breakInside: "avoid", background: i % 2 ? DOC.soft : "#fff" }}>
+            <td style={{ ...docTd, color: DOC.faint }}>{i + 1}</td>
+            <td style={{ ...docTd, fontWeight: 600, color: DOC.ink }}>{item.label}</td>
+            <td style={{ ...docTd, ...docRight }}>{item.count}</td>
+            <td style={{ ...docTd, ...docRight, fontWeight: 700, color: DOC.ink }}>{formatCurrency(item.value, currency)}</td>
+            <td style={{ ...docTd, ...docRight }}>{percent(item.value, total)}%</td>
+            <td style={docTd}>
+              <div style={{ height: "7px", borderRadius: "4px", background: "#eef2f7" }}>
+                <div style={{ height: "7px", borderRadius: "4px", width: `${Math.max(2, (item.value / max) * 100)}%`, background: item.color ?? color }} />
+              </div>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function DocTrend({ rows, period, currency }) {
+  const { group, buckets } = timeBuckets(rows, period);
+  const values = buckets.map((b) => sumOf(b.rows, amountOf));
+  const max = Math.max(...values, 1);
+  if (!buckets.length || !values.some((v) => v > 0)) return <p style={{ fontSize: "8.5pt", color: DOC.muted }}>Sin gasto en el periodo.</p>;
+  const avg = values.reduce((a, b) => a + b, 0) / values.length;
+  const W = 700;
+  const H = 170;
+  const pad = { l: 46, r: 8, t: 8, b: 22 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+  const step = plotW / buckets.length;
+  const barW = Math.max(2, Math.min(28, step * 0.7));
+  const y = (v) => pad.t + plotH - (v / max) * plotH;
+  const ticks = [0, 0.5, 1].map((f) => max * f);
+  const labelEvery = Math.ceil(buckets.length / 8);
+  const peak = values.indexOf(Math.max(...values));
+  return (
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: "block" }}>
+        {ticks.map((t) => (
+          <g key={t}>
+            <line x1={pad.l} x2={W - pad.r} y1={y(t)} y2={y(t)} stroke={DOC.line} strokeWidth="1" />
+            <text x={pad.l - 6} y={y(t) + 3} fontSize="9" textAnchor="end" fill={DOC.faint}>
+              {compactMoney(t, currency)}
+            </text>
+          </g>
+        ))}
+        {values.map((v, i) => (
+          <rect key={buckets[i].key} x={pad.l + i * step + (step - barW) / 2} y={y(v)} width={barW} height={Math.max(0, pad.t + plotH - y(v))} rx="2" fill={i === peak ? "#1d4ed8" : DOC.accent} />
+        ))}
+        <line x1={pad.l} x2={W - pad.r} y1={y(avg)} y2={y(avg)} stroke="#d97706" strokeWidth="1.2" strokeDasharray="5 4" />
+        <text x={W - pad.r} y={y(avg) - 4} fontSize="9" textAnchor="end" fill="#b45309">
+          Promedio {compactMoney(avg, currency)}
+        </text>
+        {buckets.map((b, i) =>
+          i % labelEvery === 0 ? (
+            <text key={b.key} x={pad.l + i * step + step / 2} y={H - 6} fontSize="9" textAnchor="middle" fill={DOC.muted}>
+              {b.short}
+            </text>
+          ) : null
+        )}
+      </svg>
+      <p style={{ margin: "4px 0 0", fontSize: "8pt", color: DOC.muted }}>
+        Agrupado {group === "month" ? "por mes" : group === "week" ? "por semana" : "por día"}. El punto más alto fue {buckets[peak].label}, con {formatCurrency(values[peak], currency)}.
+      </p>
+    </div>
+  );
+}
+
+function DocDonut({ segments, currency }) {
+  const total = segments.reduce((s, x) => s + x.value, 0);
+  if (total <= 0) return <p style={{ fontSize: "8.5pt", color: DOC.muted }}>Sin gasto en el periodo.</p>;
+  const r = 52;
+  const c = 2 * Math.PI * r;
+  let offset = 0;
+  return (
+    <div style={{ display: "flex", gap: "18px", alignItems: "center" }}>
+      <svg viewBox="0 0 140 140" width="130" height="130" style={{ flexShrink: 0 }}>
+        <circle cx="70" cy="70" r={r} fill="none" stroke="#eef2f7" strokeWidth="22" />
+        {segments.map((s) => {
+          const len = (s.value / total) * c;
+          const el = <circle key={s.key} cx="70" cy="70" r={r} fill="none" stroke={s.color} strokeWidth="22" strokeDasharray={`${len} ${c - len}`} strokeDashoffset={-offset} transform="rotate(-90 70 70)" />;
+          offset += len;
+          return el;
+        })}
+        <text x="70" y="66" fontSize="9" textAnchor="middle" fill={DOC.muted}>
+          Total
+        </text>
+        <text x="70" y="81" fontSize="13" fontWeight="800" textAnchor="middle" fill={DOC.ink}>
+          {compactMoney(total, currency)}
+        </text>
+      </svg>
+      <table style={{ flex: 1, borderCollapse: "collapse" }}>
+        <thead>
+          <tr>
+            <th style={docTh}>Concepto</th>
+            <th style={{ ...docTh, ...docRight }}>Facturas</th>
+            <th style={{ ...docTh, ...docRight }}>Monto</th>
+            <th style={{ ...docTh, ...docRight }}>%</th>
+          </tr>
+        </thead>
+        <tbody>
+          {segments.map((s) => (
+            <tr key={s.key}>
+              <td style={docTd}>
+                <span style={{ display: "inline-block", width: "8px", height: "8px", borderRadius: "50%", background: s.color, marginRight: "6px" }} />
+                {s.label}
+              </td>
+              <td style={{ ...docTd, ...docRight }}>{s.count}</td>
+              <td style={{ ...docTd, ...docRight, fontWeight: 700, color: DOC.ink }}>{formatCurrency(s.value, currency)}</td>
+              <td style={{ ...docTd, ...docRight }}>{percent(s.value, total)}%</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ReportDocument({ data, report, sections, period, currency, companyName, userName, format }) {
+  const d = data;
+  const list = REPORT_SECTIONS.filter((s) => sections.has(s.id));
+  let n = 0;
+  const next = () => (n += 1);
+  const filterText = d.activeFilters.length ? d.activeFilters.map((f) => f.label).join(" · ") : "Sin filtros";
+
+  return (
+    <div className="report-print-root" style={{ ...docFont, color: DOC.ink, background: "#fff", printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        {/* Encabezado y pie: el navegador los repite en cada página. */}
+        <thead>
+          <tr>
+            <td style={{ padding: "0 0 8px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "7.5pt", color: DOC.muted, borderBottom: `1px solid ${DOC.line}`, paddingBottom: "5px" }}>
+                <span>
+                  <b style={{ color: DOC.accent }}>NAVIO</b> · {companyName || "Tu empresa"}
+                </span>
+                <span>
+                  {report.title} · {d.rangeText}
+                </span>
+              </div>
+            </td>
+          </tr>
+        </thead>
+        <tfoot>
+          <tr>
+            <td style={{ padding: "8px 0 0" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "7pt", color: DOC.faint, borderTop: `1px solid ${DOC.line}`, paddingTop: "5px" }}>
+                <span>Generado el {d.generatedAt} por {userName}</span>
+                <span>Documento confidencial · uso interno de {companyName || "la empresa"}</span>
+              </div>
+            </td>
+          </tr>
+        </tfoot>
+        <tbody>
+          <tr>
+            <td>
+              {/* Portada */}
+              <div style={{ background: DOC.navy, color: "#fff", borderRadius: "10px", padding: "18px 20px", breakInside: "avoid" }}>
+                <div style={{ fontSize: "7.5pt", letterSpacing: "0.14em", textTransform: "uppercase", color: "#a5b4fc", fontWeight: 700 }}>Reporte de gastos · {companyName || "Navio"}</div>
+                <div style={{ fontSize: "21pt", fontWeight: 800, marginTop: "4px", lineHeight: 1.15 }}>{report.title}</div>
+                <div style={{ fontSize: "9.5pt", color: "#cbd5e1", marginTop: "6px" }}>
+                  {d.scopeLabel} · {d.rangeText}
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 18px", marginTop: "12px", fontSize: "7.5pt", color: "#94a3b8" }}>
+                  <span>
+                    Periodo: <b style={{ color: "#e2e8f0" }}>{typeof period === "string" ? summaryPeriod(period).label : "Fechas elegidas"}</b>
+                  </span>
+                  <span>
+                    Filtros: <b style={{ color: "#e2e8f0" }}>{filterText}</b>
+                  </span>
+                  {d.vsText && (
+                    <span>
+                      Comparado contra: <b style={{ color: "#e2e8f0" }}>{d.vsText.replace(/^vs\. /, "")}</b>
+                    </span>
+                  )}
+                  <span>
+                    Moneda: <b style={{ color: "#e2e8f0" }}>{currency}</b>
+                  </span>
+                </div>
+              </div>
+
+              {/* Indicadores */}
+              {sections.has("kpis") && (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px", marginTop: "12px", breakInside: "avoid" }}>
+                  <DocKpi label="Gasto total" value={formatCurrency(d.total, currency)} change={changeOf(d.total, d.prevTotal)} goodWhenDown sub={d.prevTotal ? `antes ${formatCurrency(d.prevTotal, currency)}` : ""} />
+                  <DocKpi label="Facturas" value={d.rows.length.toLocaleString("es-MX")} change={changeOf(d.rows.length, d.prevRows.length)} sub={`${d.byVendor.filter((g) => g.key).length} proveedores`} color="#7c3aed" />
+                  <DocKpi label="Ticket promedio" value={formatCurrency(d.avgTicket, currency)} change={changeOf(d.avgTicket, d.prevAvg)} goodWhenDown sub="por factura" color="#7c3aed" />
+                  <DocKpi label="Combustible" value={`${Math.round(d.liters).toLocaleString("es-MX")} L`} change={changeOf(d.liters, d.prevLiters)} goodWhenDown sub={d.pricePerLiter ? `${formatMoney(d.pricePerLiter, currency)} por litro` : "sin cargas"} color="#0891b2" />
+                  <DocKpi label="Por verificar" value={d.toVerify.length.toLocaleString("es-MX")} sub={formatCurrency(sumOf(d.toVerify, amountOf), currency)} color="#d97706" />
+                  <DocKpi label="Por aprobar" value={d.toApprove.length.toLocaleString("es-MX")} sub={`${formatCurrency(sumOf(d.toApprove, amountOf), currency)} · ${percent(d.approved.length, d.rows.length)}% aprobadas`} color="#059669" />
+                </div>
+              )}
+
+              {/* Resumen ejecutivo */}
+              {sections.has("summary") && (
+                <DocSection number={next()} title="Resumen ejecutivo" hint="Lo más importante del periodo, calculado con el alcance y los filtros del reporte.">
+                  <div style={{ display: "grid", gridTemplateColumns: "3fr 2fr", gap: "12px" }}>
+                    <ul style={{ margin: 0, paddingLeft: "16px", listStyleType: "disc", color: DOC.accent }}>
+                      {d.insights.map((text) => (
+                        <li key={text} style={{ fontSize: "9pt", lineHeight: 1.5, color: DOC.text, marginBottom: "3px" }}>
+                          {text}
+                        </li>
+                      ))}
+                    </ul>
+                    <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: "8px", padding: "9px 11px" }}>
+                      <div style={{ fontSize: "7.5pt", fontWeight: 800, letterSpacing: "0.06em", textTransform: "uppercase", color: "#b45309", marginBottom: "4px" }}>Recomendaciones</div>
+                      {d.recommendations.length === 0 ? (
+                        <p style={{ margin: 0, fontSize: "8.5pt", color: "#78350f" }}>Todo en orden: no hay pendientes ni señales de alerta en este periodo.</p>
+                      ) : (
+                        d.recommendations.map((text) => (
+                          <p key={text} style={{ margin: "0 0 4px", fontSize: "8.5pt", lineHeight: 1.45, color: "#78350f" }}>
+                            • {text}
+                          </p>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </DocSection>
+              )}
+
+              {sections.has("trend") && (
+                <DocSection number={next()} title="Gasto en el tiempo" hint="Cada barra es el gasto del día, la semana o el mes. La línea punteada es el promedio; la barra más oscura, el punto más alto.">
+                  <DocTrend rows={d.rows} period={period} currency={currency} />
+                </DocSection>
+              )}
+
+              {sections.has("concepts") && (
+                <DocSection number={next()} title="Gasto por concepto" hint="En qué se va el dinero.">
+                  <DocDonut segments={d.byConcept} currency={currency} />
+                </DocSection>
+              )}
+
+              {sections.has("status") && (
+                <DocSection number={next()} title="Estado de las facturas" hint="Avance de la revisión: cargadas, verificadas y aprobadas.">
+                  {d.rows.length === 0 ? (
+                    <p style={{ fontSize: "8.5pt", color: DOC.muted }}>Sin facturas en el periodo.</p>
+                  ) : (
+                    <>
+                      <div style={{ display: "flex", height: "12px", borderRadius: "6px", overflow: "hidden", background: "#eef2f7" }}>
+                        {d.statusSegments.map((s) => (
+                          <div key={s.key} style={{ width: `${percent(s.count, d.rows.length)}%`, background: s.color }} />
+                        ))}
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px", marginTop: "8px" }}>
+                        {d.statusSegments.map((s) => (
+                          <div key={s.key} style={{ border: `1px solid ${DOC.line}`, borderRadius: "8px", padding: "7px 9px" }}>
+                            <div style={{ fontSize: "7.5pt", color: DOC.muted }}>
+                              <span style={{ display: "inline-block", width: "8px", height: "8px", borderRadius: "50%", background: s.color, marginRight: "5px" }} />
+                              {s.label}
+                            </div>
+                            <div style={{ fontSize: "13pt", fontWeight: 800, color: DOC.ink }}>{s.count}</div>
+                            <div style={{ fontSize: "7.5pt", color: DOC.muted }}>{formatCurrency(s.value, currency)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </DocSection>
+              )}
+
+              {sections.has("projects") && (
+                <DocSection number={next()} title="Gasto por proyecto" hint="Los proyectos que concentran el gasto." keepTogether={false}>
+                  <DocRanking items={d.topN(d.byProject, 12)} total={d.total} currency={currency} color="#7c3aed" label="Proyecto" />
+                </DocSection>
+              )}
+              {sections.has("units") && (
+                <DocSection number={next()} title="Gasto por unidad" hint="Las unidades con más gasto." keepTogether={false}>
+                  <DocRanking items={d.topN(d.byUnit, 12)} total={d.total} currency={currency} color="#0891b2" label="Unidad" />
+                </DocSection>
+              )}
+              {sections.has("vendors") && (
+                <DocSection number={next()} title="Gasto por proveedor" hint="A quién se le compra más; útil para negociar precios." keepTogether={false}>
+                  <DocRanking items={d.topN(d.byVendor, 12)} total={d.total} currency={currency} color="#d97706" label="Proveedor" />
+                </DocSection>
+              )}
+
+              {sections.has("fuel") && (
+                <DocSection number={next()} title="Combustible" hint="Litros, gasto, precio por litro y rendimiento promedio de cada unidad.">
+                  {d.fuelByUnit.length === 0 ? (
+                    <p style={{ fontSize: "8.5pt", color: DOC.muted }}>Sin cargas de combustible en el periodo.</p>
+                  ) : (
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr>
+                          <th style={docTh}>Unidad</th>
+                          <th style={{ ...docTh, ...docRight }}>Litros</th>
+                          <th style={{ ...docTh, ...docRight }}>Gasto</th>
+                          <th style={{ ...docTh, ...docRight }}>$ por litro</th>
+                          <th style={{ ...docTh, ...docRight }}>Rendimiento (km/L)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {d.fuelByUnit.map((u, i) => (
+                          <tr key={u.key || `n-${i}`} style={{ background: i % 2 ? DOC.soft : "#fff" }}>
+                            <td style={{ ...docTd, fontWeight: 600, color: DOC.ink }}>{u.label}</td>
+                            <td style={{ ...docTd, ...docRight }}>{Math.round(u.liters).toLocaleString("es-MX")}</td>
+                            <td style={{ ...docTd, ...docRight, fontWeight: 700, color: DOC.ink }}>{formatCurrency(u.value, currency)}</td>
+                            <td style={{ ...docTd, ...docRight }}>{u.price ? formatMoney(u.price, currency) : "—"}</td>
+                            <td style={{ ...docTd, ...docRight }}>{u.efficiency ? u.efficiency.toFixed(2) : "—"}</td>
+                          </tr>
+                        ))}
+                        <tr>
+                          <td style={{ ...docTd, fontWeight: 800, color: DOC.ink }}>Total</td>
+                          <td style={{ ...docTd, ...docRight, fontWeight: 800 }}>{Math.round(d.liters).toLocaleString("es-MX")}</td>
+                          <td style={{ ...docTd, ...docRight, fontWeight: 800, color: DOC.ink }}>{formatCurrency(sumOf(d.fuelRows, amountOf), currency)}</td>
+                          <td style={{ ...docTd, ...docRight, fontWeight: 800 }}>{d.pricePerLiter ? formatMoney(d.pricePerLiter, currency) : "—"}</td>
+                          <td style={docTd} />
+                        </tr>
+                      </tbody>
+                    </table>
+                  )}
+                </DocSection>
+              )}
+
+              {sections.has("matrix") && (
+                <DocSection number={next()} title="Proyecto por concepto" hint="Gasto de cada proyecto en cada concepto. Entre más intenso el color, mayor el gasto." keepTogether={false}>
+                  {d.matrixProjects.length === 0 ? (
+                    <p style={{ fontSize: "8.5pt", color: DOC.muted }}>Sin datos en el periodo.</p>
+                  ) : (
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr>
+                          <th style={docTh}>Proyecto</th>
+                          {d.matrixConcepts.map((c) => (
+                            <th key={c} style={{ ...docTh, ...docRight }}>
+                              {conceptName(c)}
+                            </th>
+                          ))}
+                          <th style={{ ...docTh, ...docRight, color: DOC.ink }}>Total</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {d.matrixProjects.map((p, i) => (
+                          <tr key={p.key || `n-${i}`} style={{ breakInside: "avoid" }}>
+                            <td style={{ ...docTd, fontWeight: 600, color: DOC.ink }}>{p.label}</td>
+                            {d.matrixConcepts.map((c) => {
+                              const value = d.cell(p.key, c);
+                              return (
+                                <td key={c} style={{ ...docTd, ...docRight, background: value ? `rgba(37, 99, 235, ${0.06 + (value / d.maxCell) * 0.3})` : "transparent" }}>
+                                  {value ? formatCurrency(value, currency) : "—"}
+                                </td>
+                              );
+                            })}
+                            <td style={{ ...docTd, ...docRight, fontWeight: 800, color: DOC.ink }}>{formatCurrency(p.value, currency)}</td>
+                          </tr>
+                        ))}
+                        <tr>
+                          <td style={{ ...docTd, fontWeight: 800, color: DOC.ink, borderTop: `2px solid ${DOC.ink}` }}>Total</td>
+                          {d.matrixConcepts.map((c) => (
+                            <td key={c} style={{ ...docTd, ...docRight, fontWeight: 800, borderTop: `2px solid ${DOC.ink}` }}>
+                              {formatCurrency(sumOf(d.rows.filter((i) => conceptOf(i) === c), amountOf), currency)}
+                            </td>
+                          ))}
+                          <td style={{ ...docTd, ...docRight, fontWeight: 800, color: DOC.ink, borderTop: `2px solid ${DOC.ink}` }}>{formatCurrency(d.total, currency)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  )}
+                </DocSection>
+              )}
+
+              {sections.has("top") && (
+                <DocSection number={next()} title="Facturas más altas" hint="Las 10 facturas de mayor monto del periodo." keepTogether={false}>
+                  {d.rows.length === 0 ? (
+                    <p style={{ fontSize: "8.5pt", color: DOC.muted }}>Sin facturas en el periodo.</p>
+                  ) : (
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr>
+                          {["Fecha", "Concepto", "Proveedor", "Proyecto", "Unidad", "Estado"].map((h) => (
+                            <th key={h} style={docTh}>
+                              {h}
+                            </th>
+                          ))}
+                          <th style={{ ...docTh, ...docRight }}>Monto</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...d.rows]
+                          .sort((a, b) => b.amount - a.amount)
+                          .slice(0, 10)
+                          .map((inv, i) => (
+                            <tr key={inv.key} style={{ breakInside: "avoid", background: i % 2 ? DOC.soft : "#fff" }}>
+                              <td style={{ ...docTd, whiteSpace: "nowrap" }}>{formatDate(String(inv.date).slice(0, 10), format)}</td>
+                              <td style={docTd}>{expenseTypeLabel(inv.expenseType)}</td>
+                              <td style={docTd}>{inv.vendor || "—"}</td>
+                              <td style={docTd}>{inv.project || "—"}</td>
+                              <td style={docTd}>{inv.unit || "—"}</td>
+                              <td style={docTd}>{inv.approved ? "Aprobada" : STATUS_BADGE_STYLES[inv.status]?.label ?? inv.status}</td>
+                              <td style={{ ...docTd, ...docRight, fontWeight: 700, color: DOC.ink }}>{formatMoney(inv.amount, currency)}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  )}
+                </DocSection>
+              )}
+
+              <p style={{ marginTop: "18px", fontSize: "7.5pt", color: DOC.faint, lineHeight: 1.5, breakInside: "avoid" }}>
+                Notas: los montos están en {currency}. Las facturas rechazadas y anuladas no cuentan en los totales. Las comparaciones son contra el periodo anterior del mismo
+                tamaño. Secciones incluidas: {list.map((s) => s.label).join(", ")}.
+              </p>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 /* ---------- El reporte ---------- */
 
-function InvoiceReport({ report, invoices, orders, projects, currency, userName, onEdit, onBack }) {
-  const { format } = useDateFormat();
-  const sections = new Set(Array.isArray(report.sections) && report.sections.length ? report.sections : ALL_REPORT_SECTIONS);
-  const [period, setPeriod] = useState(reportPeriodValue(report));
-  const [filters, setFilters] = useState({ concept: "", project: "", unit: "", vendor: "" });
-  useEffect(() => setPeriod(reportPeriodValue(report)), [report.period, report.from, report.to]);
-  const setFilter = (key, value) => setFilters((prev) => ({ ...prev, [key]: prev[key] === value ? "" : value }));
+// Todo lo que se calcula para el reporte (en pantalla y en el PDF).
+function buildReportData({ report, invoices, orders, projects, currency, period, filters, format }) {
   const scope = reportScopeData(report.scope, invoices, orders, projects);
   const scopeLabel = reportScopeOptions(projects).find((o) => o.id === report.scope)?.label ?? "Todas las facturas";
 
@@ -5882,7 +6357,6 @@ function InvoiceReport({ report, invoices, orders, projects, currency, userName,
     filters.unit && { key: "unit", label: `Unidad: ${filters.unit}` },
     filters.vendor && { key: "vendor", label: `Proveedor: ${filters.vendor}` },
   ].filter(Boolean);
-  const selectClass = "rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
   const periodId = typeof period === "string" ? period : "custom";
   const statusSegments = [
     { key: "pending", label: "Por verificar", value: sumOf(toVerify, amountOf), count: toVerify.length, color: "#d97706" },
@@ -5890,6 +6364,43 @@ function InvoiceReport({ report, invoices, orders, projects, currency, userName,
     { key: "approved", label: "Aprobadas", value: sumOf(approved, amountOf), count: approved.length, color: "#059669" },
   ];
 
+  return { scope, scopeLabel, counted, rows, prev, prevRows, closedInPeriod, total, prevTotal, avgTicket, prevAvg, fuelRows, liters, pricePerLiter, prevLiters, prevPrice, toVerify, toApprove, approved, withoutDocument, byConcept, byProject, byUnit, byVendor, topN, from, to, rangeText, generatedAt, vsText, insights, recommendations, matrixConcepts, matrixProjects, cell, maxCell, fuelByUnit, activeFilters, periodId, statusSegments };
+}
+
+
+
+function InvoiceReport({ report, invoices, orders, projects, currency, userName, onEdit, onBack }) {
+  const { format } = useDateFormat();
+  const { profile } = useAuth();
+  const [printing, setPrinting] = useState(false);
+  const sections = new Set(Array.isArray(report.sections) && report.sections.length ? report.sections : ALL_REPORT_SECTIONS);
+  const [period, setPeriod] = useState(reportPeriodValue(report));
+  const [filters, setFilters] = useState({ concept: "", project: "", unit: "", vendor: "" });
+  useEffect(() => setPeriod(reportPeriodValue(report)), [report.period, report.from, report.to]);
+  const setFilter = (key, value) => setFilters((prev) => ({ ...prev, [key]: prev[key] === value ? "" : value }));
+  const data = buildReportData({ report, invoices, orders, projects, currency, period, filters, format });
+  const { scope, scopeLabel, counted, rows, prev, prevRows, closedInPeriod, total, prevTotal, avgTicket, prevAvg, fuelRows, liters, pricePerLiter, prevLiters, prevPrice, toVerify, toApprove, approved, withoutDocument, byConcept, byProject, byUnit, byVendor, topN, from, to, rangeText, generatedAt, vsText, insights, recommendations, matrixConcepts, matrixProjects, cell, maxCell, fuelByUnit, activeFilters, periodId, statusSegments } = data;
+  const selectClass = "rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
+
+  // "Descargar PDF": se arma el documento aparte y el navegador lo guarda.
+  // El nombre sugerido del archivo sale del título de la página.
+  useEffect(() => {
+    if (!printing) return undefined;
+    const html = document.documentElement;
+    const previousTitle = document.title;
+    html.classList.add("printing-report");
+    document.title = `${report.title} - ${rangeText}`.replace(/[\/:*?"<>|]/g, "-");
+    const done = () => setPrinting(false);
+    window.addEventListener("afterprint", done);
+    const timer = window.setTimeout(() => window.print(), 400);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("afterprint", done);
+      html.classList.remove("printing-report");
+      document.title = previousTitle;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [printing]);
   return (
     // Sin "print-color-adjust", el navegador no imprime el color de las barras.
     <div className="space-y-4" style={{ printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }}>
@@ -5912,8 +6423,8 @@ function InvoiceReport({ report, invoices, orders, projects, currency, userName,
           <button onClick={onEdit} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">
             Editar reporte
           </button>
-          <button onClick={() => window.print()} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700">
-            <Printer size={14} /> Imprimir o guardar PDF
+          <button onClick={() => setPrinting(true)} disabled={printing} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
+            <Download size={14} /> {printing ? "Preparando…" : "Descargar PDF"}
           </button>
         </div>
       </div>
@@ -6152,6 +6663,11 @@ function InvoiceReport({ report, invoices, orders, projects, currency, userName,
         </ReportCard>
       )}
 
+      {printing &&
+        createPortal(
+          <ReportDocument data={data} report={report} sections={sections} period={period} currency={currency} companyName={profile?.company?.name} userName={userName} format={format} />,
+          document.body
+        )}
       {sections.has("top") && (
         <ReportCard title="Facturas más altas" hint="Las 10 de mayor monto en el periodo, para revisarlas con cuidado.">
           {rows.length === 0 ? (
