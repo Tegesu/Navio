@@ -1531,12 +1531,115 @@ function DeliverModal({ task, onClose, onDelivered }) {
   );
 }
 
+// Resolver una tarea: pide cómo quedó resuelta, confirmar que se revisó y,
+// si se quiere, la evidencia. approve: se aprueba una entrega.
+function ResolveModal({ task, approve = false, onClose, onResolved }) {
+  const { showToast } = useToast();
+  const [note, setNote] = useState("");
+  const [files, setFiles] = useState([]);
+  const [checked, setChecked] = useState(false);
+  const [busy, setBusy] = useState("");
+  const pickRef = useRef(null);
+  const noteOk = approve ? true : note.trim().length >= 10;
+  const ready = noteOk && checked && !busy;
+
+  async function resolve() {
+    setBusy("Guardando…");
+    try {
+      if (note.trim()) {
+        const { error } = await supabase.from("task_comments").insert({ taskId: task.id, body: `${approve ? "✅ Entrega aprobada" : "✅ Resolución"}: ${note.trim()}`.slice(0, 2000) });
+        if (error) throw error;
+      }
+      for (let i = 0; i < files.length; i += 1) {
+        setBusy(`Subiendo ${i + 1} de ${files.length}…`);
+        const attachment = await uploadTaskFile(task, files[i]);
+        const { error } = await supabase.from("task_comments").insert({ taskId: task.id, body: "", attachment });
+        if (error) throw error;
+      }
+      const { error } = await supabase.from("tasks").update({ status: "done" }).eq("id", task.id);
+      if (error) throw error;
+      showToast(approve ? "Entrega aprobada: la tarea quedó resuelta." : "Tarea resuelta. Sigue en la lista, en \"Resueltas\".");
+      onResolved?.();
+      onClose();
+    } catch (err) {
+      setBusy("");
+      showToast(err?.message ?? "No se pudo resolver la tarea.");
+    }
+  }
+
+  return (
+    <Modal title={approve ? "Aprobar y resolver" : "Marcar como resuelta"} width="max-w-md" onClose={busy ? () => {} : onClose}>
+      <div className="space-y-3">
+        <p className="text-xs text-slate-500">
+          <b className="text-slate-700">{task.title}</b>
+          <br />
+          {approve ? "Revisa lo que entregaron antes de aprobar." : "Para cerrar la tarea, deja constancia de cómo quedó resuelta."}
+        </p>
+        <div>
+          <label className="mb-1 block text-[11px] font-semibold text-slate-500">
+            {approve ? "Comentario (opcional)" : "¿Cómo quedó resuelta?"} {!approve && <span className="text-rose-500">*</span>}
+          </label>
+          <textarea
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            rows={3}
+            maxLength={1800}
+            placeholder={approve ? "Ej. Todo en orden." : "Ej. Se revisó la factura con el proveedor y coincide con la orden."}
+            className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none"
+          />
+          {!approve && note.trim().length > 0 && note.trim().length < 10 && <p className="mt-0.5 text-[10px] text-slate-400">Escribe un poco más (al menos 10 letras).</p>}
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-[11px] font-semibold text-slate-500">Evidencia (opcional)</p>
+          {files.map((f, i) => (
+            <div key={`${f.name}-${i}`} className="flex items-center gap-2 rounded-lg border border-slate-200 px-2.5 py-1.5">
+              <FileText size={14} className="shrink-0 text-blue-600" />
+              <span className="min-w-0 flex-1 truncate text-xs text-slate-700">{f.name}</span>
+              <span className="shrink-0 text-[10px] text-slate-400">{fileSize(f.size)}</span>
+              <button type="button" onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))} aria-label={`Quitar ${f.name}`} className="rounded p-0.5 text-slate-400 hover:bg-slate-100">
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+          <button type="button" onClick={() => pickRef.current?.click()} className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-slate-300 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+            <Paperclip size={13} /> Adjuntar fotos o documentos
+          </button>
+          <input
+            ref={pickRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const picked = Array.from(e.target.files ?? []);
+              setFiles((prev) => [...prev, ...picked].slice(0, 10));
+              e.target.value = "";
+            }}
+          />
+        </div>
+        <label className="flex cursor-pointer items-start gap-2 rounded-xl bg-slate-50 px-3 py-2">
+          <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} className="mt-0.5 h-4 w-4 accent-emerald-600" />
+          <span className="text-[11px] text-slate-600">{approve ? "Revisé la entrega y está completa." : "Confirmo que revisé el resultado y la tarea quedó resuelta."}</span>
+        </label>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} disabled={!!busy} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100 disabled:opacity-50">
+            Cancelar
+          </button>
+          <button type="button" onClick={resolve} disabled={!ready} className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">
+            <CheckCircle2 size={13} /> {busy || (approve ? "Aprobar y resolver" : "Marcar como resuelta")}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // Detalle de una tarea con su avance, sus acciones y su conversación.
 function TaskDetail({ task, isAdmin, onEdit, onSetStatus, onClose }) {
   const { user } = useAuth();
   const { format } = useDateFormat();
   const inbox = useInbox();
   const [delivering, setDelivering] = useState(false);
+  const [resolving, setResolving] = useState(null); // "resolve" | "approve"
   const mine = task.assignedTo === user?.id;
   const isCreator = task.createdBy === user?.id;
   const canReview = isAdmin || isCreator;
@@ -1578,7 +1681,7 @@ function TaskDetail({ task, isAdmin, onEdit, onSetStatus, onClose }) {
           )}
         </div>
       )}
-      <div className="flex flex-wrap gap-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
         {task.status === "open" && mine && (
           <button onClick={() => onSetStatus(task, "in_progress")} className={`${button} border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100`}>
             Empezar
@@ -1589,20 +1692,10 @@ function TaskDetail({ task, isAdmin, onEdit, onSetStatus, onClose }) {
             <Upload size={12} /> Entregar
           </button>
         )}
-        {working && (canReview || selfTask) && (
-          <button onClick={() => onSetStatus(task, "done")} className={`${button} flex items-center gap-1 border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100`}>
-            <CheckCircle2 size={12} /> Marcar como resuelta
-          </button>
-        )}
         {task.status === "review" && canReview && (
-          <>
-            <button onClick={() => onSetStatus(task, "done")} className={`${button} flex items-center gap-1 border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100`}>
-              <CheckCircle2 size={12} /> Aprobar y resolver
-            </button>
-            <button onClick={() => onSetStatus(task, "in_progress")} className={`${button} border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100`}>
-              Pedir cambios
-            </button>
-          </>
+          <button onClick={() => onSetStatus(task, "in_progress")} className={`${button} border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100`}>
+            Pedir cambios
+          </button>
         )}
         {task.status === "review" && mine && !canReview && <span className="rounded-lg bg-violet-50 px-2.5 py-1.5 text-[11px] font-medium text-violet-700">Entregada: falta que {task.createdByName || "quien la asignó"} la revise.</span>}
         {!pending && (canReview || mine) && (
@@ -1620,12 +1713,24 @@ function TaskDetail({ task, isAdmin, onEdit, onSetStatus, onClose }) {
             Cancelar tarea
           </button>
         )}
+        {/* Resolver va al final, a la derecha, y pide sus requisitos. */}
+        {working && (canReview || selfTask) && (
+          <button onClick={() => setResolving("resolve")} className={`${button} ml-auto flex items-center gap-1 border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100`}>
+            <CheckCircle2 size={12} /> Marcar como resuelta
+          </button>
+        )}
+        {task.status === "review" && canReview && (
+          <button onClick={() => setResolving("approve")} className={`${button} ml-auto flex items-center gap-1 border-emerald-600 bg-emerald-600 text-white hover:bg-emerald-700`}>
+            <CheckCircle2 size={12} /> Aprobar y resolver
+          </button>
+        )}
       </div>
       <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">
         <MessageSquare size={12} /> {pending ? "Seguimiento" : "Historial hasta su resolución"}
       </p>
       <TaskChat task={task} />
       {delivering && <DeliverModal task={task} onClose={() => setDelivering(false)} onDelivered={() => inbox.reloadTasks()} />}
+      {resolving && <ResolveModal task={task} approve={resolving === "approve"} onClose={() => setResolving(null)} onResolved={() => inbox.reloadTasks()} />}
     </div>
   );
 }
@@ -1642,6 +1747,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
   const [form, setForm] = useState(null);
   const [selectedId, setSelectedId] = useState(focusId);
   const [showClosed, setShowClosed] = useState(true);
+  const [resolving, setResolving] = useState(null); // tarea por resolver desde la lista
   const tasks = inbox?.tasks ?? [];
   const today = localISODate();
 
@@ -1713,7 +1819,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
         className={`flex items-start gap-3 rounded-2xl border bg-white p-3.5 shadow-sm transition ${active ? "border-blue-300 ring-2 ring-blue-100" : overdue ? "border-rose-200" : "border-slate-200"}`}
       >
         <button
-          onClick={() => setStatus(t, t.status === "done" ? "open" : "done")}
+          onClick={() => (t.status === "done" || t.status === "cancelled" ? setStatus(t, "open") : setResolving(t))}
           disabled={!canEdit && !(mine && t.createdBy === user?.id)}
           aria-label={t.status === "done" ? "Reabrir tarea" : "Marcar como resuelta"}
           title={canEdit ? (t.status === "done" ? "Reabrir" : "Marcar como resuelta") : "Solo quien asignó la tarea la marca como resuelta"}
@@ -1817,6 +1923,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
           </div>
         </div>
         {form && <TaskFormModal initial={form} isAdmin={isAdmin} onClose={() => setForm(null)} />}
+        {resolving && <ResolveModal task={resolving} approve={resolving.status === "review"} onClose={() => setResolving(null)} onResolved={() => inbox.reloadTasks()} />}
       </div>
     );
   }
@@ -1834,6 +1941,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
         </Modal>
       )}
       {form && <TaskFormModal initial={form} isAdmin={isAdmin} onClose={() => setForm(null)} />}
+      {resolving && <ResolveModal task={resolving} approve={resolving.status === "review"} onClose={() => setResolving(null)} onResolved={() => inbox.reloadTasks()} />}
     </div>
   );
 }
