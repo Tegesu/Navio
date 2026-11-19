@@ -227,20 +227,15 @@ export function MaintenanceSearchPage({ records, vehicles, campaigns = [], onOpe
   }, [records, JSON.stringify(applied)]);
 
   return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="page-intro">
-          <h1 className="text-xl font-bold text-slate-900">Mantenimiento</h1>
-          <p className="mt-1 text-sm text-slate-500">Busca servicios por cualquiera de estos datos. Escribe en un campo y presiona "Buscar"; los resultados aparecen abajo.</p>
-        </div>
-        <button onClick={onAdd} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700">
-          <Plus size={15} /> Registrar servicio
-        </button>
+    <div className="space-y-4">
+      <div className="page-intro">
+        <h1 className="text-xl font-bold text-slate-900">Mantenimiento</h1>
+        <p className="mt-1 text-sm text-slate-500">Busca servicios por cualquiera de estos datos. Escribe en un campo y presiona "Buscar"; los resultados aparecen abajo.</p>
       </div>
 
-      <div className={`${card} p-2.5`}>
+      <div className={`${card} flex flex-col gap-3 p-2.5 lg:flex-row`}>
         {/* Cada campo mide lo justo (unos 190 px); caben los que quepan por renglón. */}
-        <div className="grid grid-cols-1 gap-x-3 gap-y-1.5 sm:grid-cols-[repeat(auto-fill,minmax(176px,196px))]">
+        <div className="grid min-w-0 flex-1 grid-cols-1 content-start gap-x-3 gap-y-1.5 sm:grid-cols-[repeat(auto-fill,minmax(172px,192px))]">
           {SEARCH_FIELDS.map((field) => (
             <SearchField
               key={field.id}
@@ -253,12 +248,16 @@ export function MaintenanceSearchPage({ records, vehicles, campaigns = [], onOpe
             />
           ))}
         </div>
-        <div className="mt-2 flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-2">
-          <button onClick={clearAll} className="rounded-md px-2.5 py-1 text-[11px] font-semibold text-slate-500 hover:bg-slate-100">
-            Borrar todo
+        {/* Los botones van junto a los campos, en el espacio que sobra a la derecha. */}
+        <div className="flex shrink-0 flex-wrap gap-1.5 border-t border-slate-100 pt-2 lg:w-48 lg:flex-col lg:justify-between lg:border-l lg:border-t-0 lg:pl-3 lg:pt-[15px]">
+          <button onClick={onAdd} className="flex h-7 items-center justify-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-3 text-[11px] font-semibold text-white shadow-sm hover:bg-blue-700">
+            <Plus size={13} /> Registrar servicio
           </button>
-          <button onClick={searchAll} className="flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-blue-700">
-            <Search size={12} /> Buscar con todos los campos
+          <button onClick={searchAll} title="Buscar con todos los campos" className="flex h-7 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-blue-200 bg-blue-50 px-3 text-[11px] font-semibold text-blue-700 hover:bg-blue-100">
+            <Search size={12} /> Buscar con todos
+          </button>
+          <button onClick={clearAll} className="flex h-7 items-center justify-center rounded-md border border-slate-200 px-3 text-[11px] font-semibold text-slate-500 hover:bg-slate-100">
+            Borrar todo
           </button>
         </div>
       </div>

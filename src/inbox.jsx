@@ -1311,7 +1311,7 @@ function TaskChat({ task }) {
             onClick={() => fileRef.current?.click()}
             disabled={!!uploading}
             aria-label="Adjuntar archivo"
-            title={uploading || "Adjuntar archivo (fotos, PDF, documentos)"}
+            title={uploading || `Adjuntar archivo (${TASK_TYPES_TEXT})`}
             className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 disabled:animate-pulse"
           >
             <Paperclip size={17} />
@@ -1320,6 +1320,7 @@ function TaskChat({ task }) {
             ref={fileRef}
             type="file"
             multiple
+            accept={TASK_ACCEPT}
             className="hidden"
             onChange={(e) => {
               attach(e.target.files);
@@ -1364,19 +1365,31 @@ function useWide(query = "(min-width: 1024px)") {
 }
 
 // Archivos de las tareas (almacén "tasks", migración v29).
-const TASK_EXT = ["jpg", "png", "webp", "gif", "heic", "mp4", "webm", "mov", "m4a", "mp3", "ogg", "aac", "wav", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "zip", "xml"];
+// Solo formatos de oficina: PDF, Word, Excel, CSV, PowerPoint, texto,
+// imágenes JPG/PNG y XML (facturas CFDI).
+const TASK_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx", "txt", "jpg", "png", "xml"];
+const TASK_ACCEPT = ".pdf,.doc,.docx,.xls,.xlsx,.csv,.ppt,.pptx,.txt,.jpg,.jpeg,.png,.xml";
+const TASK_TYPES_TEXT = "PDF, Word, Excel, CSV, PowerPoint, TXT, JPG, PNG o XML";
 const TASK_FILE_MB = 25;
 const fileSize = (bytes) => (bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round((bytes || 0) / 1024))} KB`);
 async function uploadTaskFile(task, file) {
   let ext = (file.name.split(".").pop() || "").toLowerCase();
   if (ext === "jpeg") ext = "jpg";
-  if (!TASK_EXT.includes(ext)) throw new Error(`"${file.name}" no es un tipo de archivo permitido.`);
+  if (!TASK_EXT.includes(ext)) throw new Error(`"${file.name}" no se puede adjuntar. Solo ${TASK_TYPES_TEXT}.`);
   if (file.size > TASK_FILE_MB * 1048576) throw new Error(`"${file.name}" pesa más de ${TASK_FILE_MB} MB.`);
   const path = `${task.companyId}/${task.id}/${crypto.randomUUID()}.${ext}`;
   const { error } = await supabase.storage.from("tasks").upload(path, file, { contentType: file.type || undefined });
   if (error) throw new Error(/bucket|not found/i.test(error.message) ? "Los archivos de tareas se activan con la actualización v29 de la base de datos." : `No se pudo subir "${file.name}".`);
   return { path, name: file.name.slice(0, 200), mime: file.type || null, size: file.size };
 }
+// Deja solo los archivos permitidos y avisa de los que no.
+function keepTaskFiles(fileList, showToast) {
+  const all = Array.from(fileList ?? []);
+  const ok = all.filter((f) => TASK_EXT.includes(((f.name.split(".").pop() || "").toLowerCase()).replace("jpeg", "jpg")));
+  if (ok.length < all.length) showToast(`Solo se pueden adjuntar archivos ${TASK_TYPES_TEXT}.`);
+  return ok;
+}
+
 async function openTaskFile(attachment) {
   const { data, error } = await supabase.storage.from("tasks").createSignedUrl(attachment.path, 3600, { download: attachment.name || true });
   if (!error && data?.signedUrl) window.open(data.signedUrl, "_blank", "noopener");
@@ -1500,14 +1513,16 @@ function DeliverModal({ task, onClose, onDelivered }) {
           <button type="button" onClick={() => pickRef.current?.click()} className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-slate-300 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">
             <Paperclip size={13} /> Adjuntar archivos
           </button>
+          <p className="text-center text-[10px] text-slate-400">{TASK_TYPES_TEXT} · hasta {TASK_FILE_MB} MB cada uno</p>
           <input
             ref={pickRef}
             type="file"
             multiple
+            accept={TASK_ACCEPT}
             className="hidden"
             onChange={(e) => {
               // Se copian antes de limpiar el campo (si no, la lista queda vacía).
-              const picked = Array.from(e.target.files ?? []);
+              const picked = keepTaskFiles(e.target.files, showToast);
               setFiles((prev) => [...prev, ...picked].slice(0, 10));
               e.target.value = "";
             }}
@@ -1608,9 +1623,10 @@ function ResolveModal({ task, approve = false, onClose, onResolved }) {
             ref={pickRef}
             type="file"
             multiple
+            accept={TASK_ACCEPT}
             className="hidden"
             onChange={(e) => {
-              const picked = Array.from(e.target.files ?? []);
+              const picked = keepTaskFiles(e.target.files, showToast);
               setFiles((prev) => [...prev, ...picked].slice(0, 10));
               e.target.value = "";
             }}

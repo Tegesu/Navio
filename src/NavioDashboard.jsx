@@ -91,6 +91,10 @@ import {
   Hash,
   BarChart3,
   Printer,
+  TrendingUp,
+  TrendingDown,
+  Lightbulb,
+  Filter,
   ClipboardList,
 } from "lucide-react";
 
@@ -5448,23 +5452,30 @@ function ConceptBreakdown({ invoices, period, group, currency, widgetPrefs, onWi
 /*  Reportes — los datos que la persona elige, como número o gráfica      */
 /* ---------------------------------------------------------------------- */
 
-const REPORT_CONCEPTS = [{ id: "all", label: "Todos los conceptos" }, ...CONCEPT_CATEGORIES];
 const REPORT_PERIODS = [...SUMMARY_PERIODS, { id: "custom", label: "Elegir fechas" }];
-const reportCatalog = (concept) => SUMMARY_CATALOGS[concept === "all" ? "projects" : concept];
+
+// Las partes del reporte (como las páginas de un tablero de Power BI).
+const REPORT_SECTIONS = [
+  { id: "summary", label: "Resumen ejecutivo", hint: "Lo más importante del periodo, escrito en palabras, con recomendaciones." },
+  { id: "kpis", label: "Indicadores clave", hint: "Gasto, facturas, ticket promedio, combustible y pendientes, comparados con el periodo anterior." },
+  { id: "trend", label: "Gasto en el tiempo", hint: "Cómo se movió el gasto día a día, por semana o por mes." },
+  { id: "concepts", label: "Por concepto", hint: "Cuánto se fue a combustible, viáticos, casetas, refacciones…" },
+  { id: "projects", label: "Por proyecto", hint: "Qué proyectos concentran el gasto." },
+  { id: "units", label: "Por unidad", hint: "Qué unidades gastan más." },
+  { id: "vendors", label: "Por proveedor", hint: "A quién se le compra más." },
+  { id: "status", label: "Estado de las facturas", hint: "Cuántas faltan por verificar o aprobar." },
+  { id: "fuel", label: "Combustible", hint: "Litros, precio promedio por litro y rendimiento." },
+  { id: "matrix", label: "Proyecto por concepto", hint: "Tabla cruzada con el gasto de cada proyecto en cada concepto." },
+  { id: "top", label: "Facturas más altas", hint: "Las 10 facturas de mayor monto del periodo." },
+];
+const ALL_REPORT_SECTIONS = REPORT_SECTIONS.map((s) => s.id);
 
 const DEFAULT_REPORT = {
-  title: "Reporte de facturas",
+  title: "Reporte de gastos",
   period: "month",
   from: "",
   to: "",
-  items: [
-    { concept: "all", widget: "total", chart: true, group: "auto" },
-    { concept: "all", widget: "toVerify", chart: false, group: "auto" },
-    { concept: "all", widget: "toApprove", chart: false, group: "auto" },
-    { concept: "all", widget: "topConcept", chart: true, group: "auto" },
-    { concept: "fuel", widget: "liters", chart: false, group: "auto" },
-    { concept: "travel", widget: "total", chart: false, group: "auto" },
-  ],
+  sections: ALL_REPORT_SECTIONS,
 };
 
 function reportScopeOptions(projects) {
@@ -5490,19 +5501,13 @@ function reportScopeData(scope, invoices, orders, projects) {
 const reportPeriodValue = (report) => (report.period === "custom" ? { from: report.from, to: report.to } : report.period);
 
 function ReportBuilderModal({ initial, projects, onGenerate, onClose }) {
-  const [draft, setDraft] = useState(initial);
+  const [draft, setDraft] = useState({ ...initial, sections: Array.isArray(initial.sections) && initial.sections.length ? initial.sections : ALL_REPORT_SECTIONS });
   const set = (patch) => setDraft((prev) => ({ ...prev, ...patch }));
-  const setItem = (index, patch) => set({ items: draft.items.map((item, i) => (i === index ? { ...item, ...patch } : item)) });
-  const moveItem = (index, delta) => {
-    const items = [...draft.items];
-    [items[index], items[index + delta]] = [items[index + delta], items[index]];
-    set({ items });
-  };
+  const toggle = (id) => set({ sections: draft.sections.includes(id) ? draft.sections.filter((s) => s !== id) : [...draft.sections, id] });
   const badRange = draft.period === "custom" && draft.from && draft.to && draft.from > draft.to;
-  const canGenerate = draft.items.length > 0 && !badRange;
+  const canGenerate = draft.sections.length > 0 && !badRange;
   const inputClass = "rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
   const labelClass = "mb-1 block text-[11px] font-semibold text-slate-500";
-  const arrow = "flex h-7 w-7 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-30 disabled:hover:bg-transparent";
 
   return (
     <Modal title="Crear reporte" width="max-w-3xl" onClose={onClose}>
@@ -5546,87 +5551,25 @@ function ReportBuilderModal({ initial, projects, onGenerate, onClose }) {
             </>
           )}
         </div>
-
         <div>
-          <p className="mb-1 text-[11px] font-semibold text-slate-500">Qué incluir</p>
-          <p className="mb-2 text-[11px] text-slate-400">
-            Elige el concepto y el dato. Cada uno puede salir como número o como gráfica; en las gráficas eliges cómo se reparte en el tiempo.
-          </p>
-          <div className="space-y-1.5">
-            {draft.items.map((item, index) => {
-              const catalog = reportCatalog(item.concept);
-              const widget = catalog.widgets.find((w) => w.id === item.widget) ?? catalog.widgets[0];
-              return (
-                <div key={index} className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-100 px-2.5 py-2">
-                  <select
-                    aria-label="Concepto"
-                    value={item.concept}
-                    onChange={(e) => {
-                      const next = reportCatalog(e.target.value);
-                      setItem(index, { concept: e.target.value, widget: next.widgets.some((w) => w.id === item.widget) ? item.widget : "total" });
-                    }}
-                    className={inputClass}
-                  >
-                    {REPORT_CONCEPTS.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.label}
-                      </option>
-                    ))}
-                  </select>
-                  <select aria-label="Dato" value={widget.id} onChange={(e) => setItem(index, { widget: e.target.value })} className={`min-w-0 flex-1 ${inputClass}`}>
-                    {catalog.widgets.map((w) => (
-                      <option key={w.id} value={w.id}>
-                        {w.label}
-                      </option>
-                    ))}
-                  </select>
-                  {canChartWidget(widget) ? (
-                    <SegmentedControl
-                      label="Mostrar como"
-                      options={DISPLAY_OPTIONS}
-                      value={item.chart ? "chart" : "number"}
-                      onChange={(mode) => setItem(index, { chart: mode === "chart" })}
-                    />
-                  ) : (
-                    <span className="text-[10px] text-slate-400">Solo número</span>
-                  )}
-                  {item.chart && widget.value && (
-                    <select aria-label="Reparto en el tiempo" value={item.group} onChange={(e) => setItem(index, { group: e.target.value })} className={inputClass}>
-                      {TIME_GROUPS.map((g) => (
-                        <option key={g.id} value={g.id}>
-                          {g.label}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                  <div className="ml-auto flex shrink-0 gap-0.5">
-                    <button type="button" onClick={() => moveItem(index, -1)} disabled={index === 0} className={arrow} aria-label="Subir">
-                      <ChevronUp size={14} />
-                    </button>
-                    <button type="button" onClick={() => moveItem(index, 1)} disabled={index === draft.items.length - 1} className={arrow} aria-label="Bajar">
-                      <ChevronDown size={14} />
-                    </button>
-                    <button type="button" onClick={() => set({ items: draft.items.filter((_, i) => i !== index) })} className={`${arrow} hover:text-rose-600`} aria-label="Quitar">
-                      <X size={14} />
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-            {draft.items.length === 0 && <p className="py-2 text-center text-xs text-slate-400">Agrega al menos un dato.</p>}
-          </div>
-          <div className="mt-2 flex flex-wrap gap-3">
-            <button
-              type="button"
-              onClick={() => set({ items: [...draft.items, { concept: "all", widget: "total", chart: false, group: "auto" }] })}
-              className="flex items-center gap-1 text-[11px] font-semibold text-blue-600 hover:text-blue-700"
-            >
-              <Plus size={13} /> Agregar dato
-            </button>
-            <button type="button" onClick={() => set({ items: DEFAULT_REPORT.items })} className="text-[11px] font-semibold text-slate-500 hover:text-slate-700">
-              Restablecer datos
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="text-[11px] font-semibold text-slate-500">Qué incluir en el reporte</p>
+            <button type="button" onClick={() => set({ sections: draft.sections.length === ALL_REPORT_SECTIONS.length ? [] : ALL_REPORT_SECTIONS })} className="text-[11px] font-semibold text-blue-600 hover:text-blue-700">
+              {draft.sections.length === ALL_REPORT_SECTIONS.length ? "Quitar todo" : "Incluir todo"}
             </button>
           </div>
+          <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+            {REPORT_SECTIONS.map((section) => (
+              <label key={section.id} className={`flex cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2 ${draft.sections.includes(section.id) ? "border-blue-300 bg-blue-50" : "border-slate-200"}`}>
+                <input type="checkbox" checked={draft.sections.includes(section.id)} onChange={() => toggle(section.id)} className="mt-0.5 h-4 w-4 accent-blue-600" />
+                <span>
+                  <span className="block text-xs font-semibold text-slate-700">{section.label}</span>
+                  <span className="block text-[11px] text-slate-500">{section.hint}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-slate-400">Dentro del reporte puedes cambiar el periodo y filtrar por concepto, proyecto o unidad; también tocando las gráficas.</p>
         </div>
       </div>
       <div className="mt-4 flex justify-end gap-2">
@@ -5645,27 +5588,315 @@ function ReportBuilderModal({ initial, projects, onGenerate, onClose }) {
   );
 }
 
+/* ---------- Piezas del tablero ---------- */
+
+const CONCEPT_COLORS = { fuel: "#2563eb", travel: "#7c3aed", consumables: "#d97706", coolant: "#0891b2", parts: "#db2777", tolls: "#059669" };
+const conceptOf = (inv) => CONCEPT_CATEGORIES.find((c) => inConcept(inv, c.id))?.id ?? "travel";
+const conceptName = (id) => CONCEPT_CATEGORIES.find((c) => c.id === id)?.label ?? "Otro";
+const percent = (part, whole) => (whole > 0 ? Math.round((part / whole) * 1000) / 10 : 0);
+const changeOf = (now, before) => (before > 0 ? ((now - before) / before) * 100 : null);
+
+function compactMoney(amount, currency) {
+  try {
+    return new Intl.NumberFormat("es-MX", { style: "currency", currency, notation: "compact", maximumFractionDigits: 1 }).format(amount || 0);
+  } catch {
+    return formatCurrency(amount, currency);
+  }
+}
+
+// El periodo anterior del mismo tamaño (para comparar).
+function previousRange(period) {
+  const { from, to } = periodRange(period);
+  if (!from || !to) return null;
+  const start = parseISODate(from);
+  if (period === "month" || period === "lastMonth") {
+    return { from: localISODate(new Date(start.getFullYear(), start.getMonth() - 1, 1)), to: localISODate(new Date(start.getFullYear(), start.getMonth(), 0)) };
+  }
+  if (period === "year") return { from: `${start.getFullYear() - 1}-01-01`, to: `${start.getFullYear() - 1}-12-31` };
+  const days = Math.round((parseISODate(to) - start) / DAY_MS) + 1;
+  return { from: localISODate(new Date(start.getTime() - days * DAY_MS)), to: localISODate(new Date(start.getTime() - DAY_MS)) };
+}
+
+function groupTotals(rows, keyOf, labelOf = (k) => k) {
+  const map = new Map();
+  for (const inv of rows) {
+    const key = keyOf(inv) || "";
+    const entry = map.get(key) ?? { key, label: key ? labelOf(key) : "Sin dato", value: 0, count: 0 };
+    entry.value += Number(inv.amount) || 0;
+    entry.count += 1;
+    map.set(key, entry);
+  }
+  return [...map.values()].sort((a, b) => b.value - a.value);
+}
+
+function ReportCard({ title, hint, className = "", children, action = null }) {
+  return (
+    <section className={`break-inside-avoid rounded-2xl border border-slate-200 bg-white p-4 shadow-sm ${className}`}>
+      <div className="mb-3 flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-bold text-slate-800">{title}</h3>
+          {hint && <p className="mt-0.5 text-[11px] text-slate-400">{hint}</p>}
+        </div>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function ReportKpi({ label, value, sub, change, goodWhenDown = false, tone = "blue" }) {
+  const up = change != null && change > 0.5;
+  const down = change != null && change < -0.5;
+  const good = (down && goodWhenDown) || (up && !goodWhenDown);
+  const tones = { blue: "border-l-blue-600", emerald: "border-l-emerald-500", amber: "border-l-amber-500", violet: "border-l-violet-500", rose: "border-l-rose-500" };
+  return (
+    <div className={`break-inside-avoid rounded-2xl border border-l-4 border-slate-200 bg-white p-3.5 shadow-sm ${tones[tone] ?? tones.blue}`}>
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{label}</p>
+      <p className="mt-1 truncate text-2xl font-bold text-slate-900" title={String(value)}>
+        {value}
+      </p>
+      <div className="mt-1 flex flex-wrap items-center gap-x-2 text-[11px] text-slate-500">
+        {change != null && (up || down) && (
+          <span className={`flex items-center gap-0.5 font-semibold ${good ? "text-emerald-600" : "text-amber-600"}`}>
+            {up ? <TrendingUp size={12} /> : <TrendingDown size={12} />} {Math.abs(change).toFixed(1)}%
+          </span>
+        )}
+        {change != null && !up && !down && <span className="font-semibold text-slate-400">Igual</span>}
+        {sub && <span className="truncate">{sub}</span>}
+      </div>
+    </div>
+  );
+}
+
+// Barras horizontales; tocar una filtra todo el reporte.
+function ReportBars({ items, total, currency, color = "#2563eb", active, onPick, empty = "Sin datos en el periodo." }) {
+  if (items.length === 0) return <p className="py-6 text-center text-xs text-slate-400">{empty}</p>;
+  const max = Math.max(...items.map((i) => i.value), 1);
+  return (
+    <div className="space-y-2">
+      {items.map((item) => (
+        <button
+          key={item.key || "none"}
+          type="button"
+          onClick={() => onPick?.(item.key)}
+          disabled={!onPick || !item.key}
+          className={`block w-full rounded-lg px-1.5 py-1 text-left transition ${active && active !== item.key ? "opacity-40" : ""} ${onPick && item.key ? "hover:bg-slate-50" : ""}`}
+          title={onPick && item.key ? "Filtrar el reporte con esto" : undefined}
+        >
+          <span className="flex items-baseline justify-between gap-2 text-[11px]">
+            <span className="min-w-0 truncate font-semibold text-slate-700">{item.label}</span>
+            <span className="shrink-0 text-slate-500">
+              <b className="text-slate-800">{formatCurrency(item.value, currency)}</b> · {percent(item.value, total)}%
+            </span>
+          </span>
+          <span className="mt-1 block h-2 w-full overflow-hidden rounded-full bg-slate-100">
+            <span className="block h-full rounded-full transition-all duration-500" style={{ width: `${Math.max(2, (item.value / max) * 100)}%`, background: item.color ?? color }} />
+          </span>
+          {item.sub && <span className="mt-0.5 block text-[10px] text-slate-400">{item.sub}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ReportDonut({ segments, currency, active, onPick }) {
+  const total = segments.reduce((s, x) => s + x.value, 0);
+  if (total <= 0) return <p className="py-6 text-center text-xs text-slate-400">Sin gasto en el periodo.</p>;
+  let cumulative = 0;
+  const stops = segments.map((s) => {
+    const start = (cumulative / total) * 360;
+    cumulative += s.value;
+    return `${s.color} ${start}deg ${(cumulative / total) * 360}deg`;
+  });
+  return (
+    <div className="flex flex-wrap items-center gap-5">
+      <div className="relative h-36 w-36 shrink-0 rounded-full" style={{ background: `conic-gradient(${stops.join(", ")})` }}>
+        <div className="absolute inset-5 flex flex-col items-center justify-center rounded-full bg-white text-center">
+          <span className="text-[10px] text-slate-400">Total</span>
+          <span className="text-sm font-bold text-slate-800">{compactMoney(total, currency)}</span>
+        </div>
+      </div>
+      <div className="min-w-0 flex-1 space-y-1">
+        {segments.map((s) => (
+          <button
+            key={s.key}
+            type="button"
+            onClick={() => onPick?.(s.key)}
+            className={`flex w-full items-center gap-2 rounded-lg px-1.5 py-1 text-left text-[11px] hover:bg-slate-50 ${active && active !== s.key ? "opacity-40" : ""}`}
+          >
+            <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: s.color }} />
+            <span className="min-w-0 flex-1 truncate text-slate-600">{s.label}</span>
+            <b className="shrink-0 text-slate-800">{formatCurrency(s.value, currency)}</b>
+            <span className="w-11 shrink-0 text-right text-slate-400">{percent(s.value, total)}%</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Columnas del gasto en el tiempo, con la línea del promedio.
+function ReportTrend({ rows, period, currency }) {
+  const { group, buckets } = timeBuckets(rows, period);
+  const values = buckets.map((b) => sumOf(b.rows, amountOf));
+  const max = Math.max(...values, 1);
+  const withSpend = values.filter((v) => v > 0);
+  const avg = withSpend.length ? withSpend.reduce((a, b) => a + b, 0) / values.length : 0;
+  if (buckets.length === 0 || withSpend.length === 0) return <p className="py-10 text-center text-xs text-slate-400">Sin gasto en el periodo.</p>;
+  const peak = buckets[values.indexOf(Math.max(...values))];
+  return (
+    <div>
+      <div className="relative flex h-44 items-end gap-[2px] border-b border-slate-200">
+        <div className="pointer-events-none absolute inset-x-0 border-t border-dashed border-amber-400" style={{ bottom: `${(avg / max) * 100}%` }}>
+          <span className="absolute -top-4 right-0 rounded bg-amber-50 px-1 text-[9px] font-semibold text-amber-700">Promedio {compactMoney(avg, currency)}</span>
+        </div>
+        {buckets.map((b, i) => (
+          <div key={b.key} className="group relative flex h-full min-w-0 flex-1 items-end" title={`${b.label}: ${formatCurrency(values[i], currency)} · ${b.rows.length} facturas`}>
+            <div className="w-full rounded-t-sm bg-blue-600 transition-all duration-500 group-hover:bg-blue-500" style={{ height: `${values[i] > 0 ? Math.max(2, (values[i] / max) * 100) : 0}%` }} />
+          </div>
+        ))}
+      </div>
+      <div className="mt-1 flex justify-between text-[10px] text-slate-400">
+        <span>{buckets[0].short}</span>
+        {buckets.length > 2 && <span>{buckets[Math.floor(buckets.length / 2)].short}</span>}
+        <span>{buckets[buckets.length - 1].short}</span>
+      </div>
+      <p className="mt-2 text-[11px] text-slate-500">
+        Agrupado {group === "month" ? "por mes" : group === "week" ? "por semana" : "por día"}. El punto más alto fue {peak.label} con <b>{formatCurrency(Math.max(...values), currency)}</b>.
+      </p>
+    </div>
+  );
+}
+
+/* ---------- El reporte ---------- */
+
 function InvoiceReport({ report, invoices, orders, projects, currency, userName, onEdit, onBack }) {
   const { format } = useDateFormat();
+  const sections = new Set(Array.isArray(report.sections) && report.sections.length ? report.sections : ALL_REPORT_SECTIONS);
+  const [period, setPeriod] = useState(reportPeriodValue(report));
+  const [filters, setFilters] = useState({ concept: "", project: "", unit: "", vendor: "" });
+  useEffect(() => setPeriod(reportPeriodValue(report)), [report.period, report.from, report.to]);
+  const setFilter = (key, value) => setFilters((prev) => ({ ...prev, [key]: prev[key] === value ? "" : value }));
   const scope = reportScopeData(report.scope, invoices, orders, projects);
-  const period = reportPeriodValue(report);
-  const inPeriod = scope.invoices.filter((i) => inSummaryPeriod(i, period));
-  const dates = inPeriod.map((i) => String(i.date || "").slice(0, 10)).filter(Boolean).sort();
+  const scopeLabel = reportScopeOptions(projects).find((o) => o.id === report.scope)?.label ?? "Todas las facturas";
+
+  // Las rechazadas y anuladas no cuentan.
+  const counted = scope.invoices.filter((i) => !isInvoiceClosed(i));
+  const matches = (inv) =>
+    (!filters.concept || conceptOf(inv) === filters.concept) &&
+    (!filters.project || (inv.project || "") === filters.project) &&
+    (!filters.unit || (inv.unit || "") === filters.unit) &&
+    (!filters.vendor || (inv.vendor || "") === filters.vendor);
+  const rows = counted.filter((i) => inSummaryPeriod(i, period) && matches(i));
+  const prev = previousRange(period);
+  const prevRows = prev ? counted.filter((i) => inSummaryPeriod(i, prev) && matches(i)) : [];
+  const closedInPeriod = scope.invoices.filter((i) => isInvoiceClosed(i) && inSummaryPeriod(i, period) && matches(i));
+
+  const total = sumOf(rows, amountOf);
+  const prevTotal = sumOf(prevRows, amountOf);
+  const avgTicket = rows.length ? total / rows.length : 0;
+  const prevAvg = prevRows.length ? prevTotal / prevRows.length : 0;
+  const fuelRows = rows.filter((i) => i.module === "fuel");
+  const liters = sumOf(fuelRows, (i) => i.liters);
+  const fuelSpend = sumOf(fuelRows.filter((i) => Number(i.liters) > 0), amountOf);
+  const pricePerLiter = liters > 0 ? fuelSpend / liters : null;
+  const prevFuel = prevRows.filter((i) => i.module === "fuel" && Number(i.liters) > 0);
+  const prevLiters = sumOf(prevFuel, (i) => i.liters);
+  const prevPrice = prevLiters > 0 ? sumOf(prevFuel, amountOf) / prevLiters : null;
+  const toVerify = rows.filter((i) => i.status === "pending");
+  const toApprove = rows.filter((i) => i.status === "verified" && !i.approved);
+  const approved = rows.filter((i) => i.approved);
+  const withoutDocument = rows.filter((i) => !i.documentUrl);
+
+  const byConcept = groupTotals(rows, conceptOf, conceptName).map((g) => ({ ...g, color: CONCEPT_COLORS[g.key] ?? "#64748b" }));
+  const byProject = groupTotals(rows, (i) => i.project, (k) => k);
+  const byUnit = groupTotals(rows, (i) => i.unit, (k) => k);
+  const byVendor = groupTotals(rows, (i) => i.vendor, (k) => k);
+  const topN = (list, n = 8) => list.slice(0, n).map((g) => ({ ...g, sub: `${countLabel(g.count, "factura")} · promedio ${formatCurrency(g.value / g.count, currency)}` }));
+
+  const dates = rows.map((i) => String(i.date || "").slice(0, 10)).filter(Boolean).sort();
   const range = periodRange(period);
   const from = range.from ?? dates[0];
   const to = range.to ?? localISODate();
   const rangeText = from ? `Del ${formatDate(from, format)} al ${formatDate(to, format)}` : "Sin facturas en el periodo";
-  const scopeLabel = reportScopeOptions(projects).find((o) => o.id === report.scope)?.label ?? "Todas las facturas";
-  const phrase = report.period === "custom" ? "en el periodo" : summaryPeriod(report.period).phrase;
-  const ctx = { currency, period, orders: scope.orders, projects: scope.projects, phrase };
   const generatedAt = new Date().toLocaleString("es-MX", { dateStyle: "medium", timeStyle: "short" });
+  const vsText = prev ? `vs. ${formatDate(prev.from, format)} – ${formatDate(prev.to, format)}` : "";
+
+  // Resumen en palabras.
+  const insights = [];
+  const recommendations = [];
+  if (rows.length === 0) insights.push("No hay facturas que cuenten en este periodo con los filtros elegidos.");
+  else {
+    const change = changeOf(total, prevTotal);
+    insights.push(
+      `Se gastaron ${formatCurrency(total, currency)} en ${countLabel(rows.length, "factura")}${
+        change != null ? `, ${Math.abs(change).toFixed(1)}% ${change >= 0 ? "más" : "menos"} que el periodo anterior (${formatCurrency(prevTotal, currency)})` : ""
+      }.`
+    );
+    if (byConcept[0]) insights.push(`El concepto con más gasto fue ${byConcept[0].label}: ${formatCurrency(byConcept[0].value, currency)} (${percent(byConcept[0].value, total)}% del total).`);
+    const topProject = byProject.find((g) => g.key);
+    if (topProject) insights.push(`El proyecto con más gasto fue ${topProject.label}, con ${formatCurrency(topProject.value, currency)} (${percent(topProject.value, total)}%).`);
+    const topUnit = byUnit.find((g) => g.key);
+    if (topUnit) insights.push(`La unidad que más gastó fue ${topUnit.label}: ${formatCurrency(topUnit.value, currency)} en ${countLabel(topUnit.count, "factura")}.`);
+    const topVendor = byVendor.find((g) => g.key);
+    if (topVendor) insights.push(`El proveedor principal fue ${topVendor.label}: ${formatCurrency(topVendor.value, currency)} (${percent(topVendor.value, total)}%).`);
+    if (liters > 0)
+      insights.push(
+        `Se cargaron ${Math.round(liters).toLocaleString("es-MX")} litros de combustible a ${formatMoney(pricePerLiter, currency)} por litro en promedio${
+          prevPrice ? ` (${pricePerLiter >= prevPrice ? "subió" : "bajó"} ${Math.abs(changeOf(pricePerLiter, prevPrice)).toFixed(1)}%)` : ""
+        }.`
+      );
+    const biggest = [...rows].sort((a, b) => b.amount - a.amount)[0];
+    if (biggest) insights.push(`La factura más alta fue de ${formatCurrency(biggest.amount, currency)}${biggest.vendor ? ` con ${biggest.vendor}` : ""} el ${formatDate(String(biggest.date).slice(0, 10), format)}.`);
+    if (toVerify.length || toApprove.length)
+      insights.push(
+        `Faltan por verificar ${countLabel(toVerify.length, "factura")} (${formatCurrency(sumOf(toVerify, amountOf), currency)}) y por aprobar ${countLabel(toApprove.length, "factura")} (${formatCurrency(sumOf(toApprove, amountOf), currency)}).`
+      );
+    if (toVerify.length + toApprove.length > 0) recommendations.push("Revisa y aprueba las facturas pendientes antes del cierre del periodo para que los totales queden firmes.");
+    if (withoutDocument.length > 0) recommendations.push(`${countLabel(withoutDocument.length, "factura no tiene", "facturas no tienen")} documento adjunto: súbelo para tener respaldo ante una auditoría.`);
+    if (topVendor && percent(topVendor.value, total) >= 40) recommendations.push(`${topVendor.label} concentra ${percent(topVendor.value, total)}% del gasto: conviene negociar precios o comparar con otros proveedores.`);
+    if (prevPrice && pricePerLiter && changeOf(pricePerLiter, prevPrice) > 3) recommendations.push("El precio del combustible subió: revisa las estaciones donde se carga y el rendimiento de las unidades.");
+    if (change != null && change > 20) recommendations.push(`El gasto creció ${change.toFixed(0)}%: revisa en "Por concepto" y "Por proyecto" qué lo provocó.`);
+    if (closedInPeriod.length > 0) recommendations.push(`${countLabel(closedInPeriod.length, "factura fue rechazada o anulada", "facturas fueron rechazadas o anuladas")} en el periodo; no cuentan en los totales.`);
+  }
+
+  // Tabla cruzada proyecto × concepto
+  const matrixConcepts = byConcept.map((c) => c.key);
+  const matrixProjects = byProject.slice(0, 12);
+  const cell = (projectKey, conceptKey) => sumOf(rows.filter((i) => (i.project || "") === projectKey && conceptOf(i) === conceptKey), amountOf);
+  const maxCell = Math.max(1, ...matrixProjects.flatMap((p) => matrixConcepts.map((c) => cell(p.key, c))));
+
+  // Combustible por unidad: litros, gasto, $/L y rendimiento
+  const fuelByUnit = groupTotals(fuelRows, (i) => i.unit, (k) => k)
+    .slice(0, 8)
+    .map((g) => {
+      const list = fuelRows.filter((i) => (i.unit || "") === g.key);
+      const l = sumOf(list, (i) => i.liters);
+      const eff = list.map((i) => Number(i.efficiency)).filter((v) => v > 0);
+      return { ...g, liters: l, price: l > 0 ? sumOf(list.filter((i) => Number(i.liters) > 0), amountOf) / l : null, efficiency: eff.length ? eff.reduce((a, b) => a + b, 0) / eff.length : null };
+    });
+
+  const activeFilters = [
+    filters.concept && { key: "concept", label: `Concepto: ${conceptName(filters.concept)}` },
+    filters.project && { key: "project", label: `Proyecto: ${filters.project}` },
+    filters.unit && { key: "unit", label: `Unidad: ${filters.unit}` },
+    filters.vendor && { key: "vendor", label: `Proveedor: ${filters.vendor}` },
+  ].filter(Boolean);
+  const selectClass = "rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs focus:border-blue-400 focus:outline-none";
+  const periodId = typeof period === "string" ? period : "custom";
+  const statusSegments = [
+    { key: "pending", label: "Por verificar", value: sumOf(toVerify, amountOf), count: toVerify.length, color: "#d97706" },
+    { key: "verified", label: "Verificadas sin aprobar", value: sumOf(toApprove, amountOf), count: toApprove.length, color: "#2563eb" },
+    { key: "approved", label: "Aprobadas", value: sumOf(approved, amountOf), count: approved.length, color: "#059669" },
+  ];
 
   return (
     // Sin "print-color-adjust", el navegador no imprime el color de las barras.
     <div className="space-y-4" style={{ printColorAdjust: "exact", WebkitPrintColorAdjust: "exact" }}>
+      {/* Encabezado */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-600">Reporte</p>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-600">Reporte · tablero de gastos</p>
           <h1 className="break-words text-xl font-bold text-slate-900">{report.title}</h1>
           <p className="mt-1 text-sm text-slate-500">
             {scopeLabel} · {rangeText}
@@ -5686,27 +5917,278 @@ function InvoiceReport({ report, invoices, orders, projects, currency, userName,
           </button>
         </div>
       </div>
-      <div className="grid grid-flow-row-dense grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {report.items.map((item, index) => {
-          const catalog = reportCatalog(item.concept);
-          const widget = catalog.widgets.find((w) => w.id === item.widget);
-          if (!widget) return null;
-          const conceptLabel = REPORT_CONCEPTS.find((c) => c.id === item.concept)?.label ?? "";
-          const rows = item.concept === "all" ? inPeriod : inPeriod.filter((i) => inConcept(i, item.concept));
-          return (
-            <WidgetCard
-              key={index}
-              widget={widget}
-              label={`${conceptLabel} · ${widget.label}`}
-              chart={item.chart}
-              rows={rows}
-              ctx={ctx}
-              period={period}
-              group={item.group}
-            />
-          );
-        })}
+
+      {/* Filtros del tablero */}
+      <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm print:hidden">
+        <Filter size={14} className="text-slate-400" />
+        <select aria-label="Periodo" value={periodId} onChange={(e) => setPeriod(e.target.value === "custom" ? reportPeriodValue({ ...report, period: "custom" }) : e.target.value)} className={selectClass}>
+          {SUMMARY_PERIODS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+          {report.period === "custom" && <option value="custom">Fechas del reporte</option>}
+        </select>
+        <select aria-label="Concepto" value={filters.concept} onChange={(e) => setFilters((f) => ({ ...f, concept: e.target.value }))} className={selectClass}>
+          <option value="">Todos los conceptos</option>
+          {CONCEPT_CATEGORIES.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.label}
+            </option>
+          ))}
+        </select>
+        <select aria-label="Proyecto" value={filters.project} onChange={(e) => setFilters((f) => ({ ...f, project: e.target.value }))} className={selectClass}>
+          <option value="">Todos los proyectos</option>
+          {[...new Set(counted.map((i) => i.project).filter(Boolean))].sort().map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </select>
+        <select aria-label="Unidad" value={filters.unit} onChange={(e) => setFilters((f) => ({ ...f, unit: e.target.value }))} className={selectClass}>
+          <option value="">Todas las unidades</option>
+          {[...new Set(counted.map((i) => i.unit).filter(Boolean))].sort().map((u) => (
+            <option key={u} value={u}>
+              {u}
+            </option>
+          ))}
+        </select>
+        {activeFilters.map((f) => (
+          <span key={f.key} className="inline-flex items-center gap-1 rounded-full bg-blue-50 py-0.5 pl-2.5 pr-1 text-[11px] font-medium text-blue-700">
+            {f.label}
+            <button type="button" onClick={() => setFilters((prevF) => ({ ...prevF, [f.key]: "" }))} aria-label={`Quitar ${f.label}`} className="flex h-4 w-4 items-center justify-center rounded-full hover:bg-blue-100">
+              <X size={10} />
+            </button>
+          </span>
+        ))}
+        <span className="ml-auto text-[10px] text-slate-400">Toca una barra o un concepto para filtrar todo el reporte.</span>
       </div>
+      {activeFilters.length > 0 && <p className="hidden text-xs text-slate-500 print:block">Filtros: {activeFilters.map((f) => f.label).join(" · ")}</p>}
+
+      {/* Indicadores */}
+      {sections.has("kpis") && (
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
+          <ReportKpi label="Gasto total" value={formatCurrency(total, currency)} change={changeOf(total, prevTotal)} goodWhenDown sub={vsText} />
+          <ReportKpi label="Facturas" value={rows.length.toLocaleString("es-MX")} change={changeOf(rows.length, prevRows.length)} sub={`${byVendor.filter((g) => g.key).length} proveedores`} tone="violet" />
+          <ReportKpi label="Ticket promedio" value={formatCurrency(avgTicket, currency)} change={changeOf(avgTicket, prevAvg)} goodWhenDown sub="por factura" tone="violet" />
+          <ReportKpi
+            label="Combustible"
+            value={`${Math.round(liters).toLocaleString("es-MX")} L`}
+            change={changeOf(liters, prevLiters)}
+            goodWhenDown
+            sub={pricePerLiter ? `${formatMoney(pricePerLiter, currency)} por litro` : "sin cargas"}
+            tone="blue"
+          />
+          <ReportKpi label="Por verificar" value={toVerify.length.toLocaleString("es-MX")} sub={formatCurrency(sumOf(toVerify, amountOf), currency)} tone="amber" />
+          <ReportKpi label="Por aprobar" value={toApprove.length.toLocaleString("es-MX")} sub={`${formatCurrency(sumOf(toApprove, amountOf), currency)} · ${percent(approved.length, rows.length)}% aprobadas`} tone="emerald" />
+        </div>
+      )}
+
+      {/* Resumen ejecutivo */}
+      {sections.has("summary") && (
+        <ReportCard title="Resumen ejecutivo" hint="Lo más importante del periodo, calculado con los filtros de arriba.">
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+            <ul className="space-y-1.5">
+              {insights.map((text) => (
+                <li key={text} className="flex gap-2 text-xs leading-relaxed text-slate-600">
+                  <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-blue-600" />
+                  {text}
+                </li>
+              ))}
+            </ul>
+            <div className="rounded-xl bg-amber-50 p-3">
+              <p className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-amber-700">
+                <Lightbulb size={13} /> Recomendaciones
+              </p>
+              {recommendations.length === 0 ? (
+                <p className="text-xs text-amber-800">Todo en orden: no hay pendientes ni señales de alerta en este periodo.</p>
+              ) : (
+                <ul className="space-y-1">
+                  {recommendations.map((text) => (
+                    <li key={text} className="text-xs leading-relaxed text-amber-900">
+                      • {text}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </ReportCard>
+      )}
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        {sections.has("trend") && (
+          <ReportCard title="Gasto en el tiempo" hint="Cada columna es el gasto de un día, una semana o un mes. La línea punteada es el promedio." className="lg:col-span-2">
+            <ReportTrend rows={rows} period={period} currency={currency} />
+          </ReportCard>
+        )}
+        {sections.has("concepts") && (
+          <ReportCard title="Gasto por concepto" hint="En qué se va el dinero. Toca un concepto para ver solo ese en todo el reporte.">
+            <ReportDonut segments={byConcept} currency={currency} active={filters.concept} onPick={(key) => setFilter("concept", key)} />
+          </ReportCard>
+        )}
+        {sections.has("status") && (
+          <ReportCard title="Estado de las facturas" hint="Avance de la revisión: de cargada a verificada y aprobada.">
+            {rows.length === 0 ? (
+              <p className="py-6 text-center text-xs text-slate-400">Sin facturas en el periodo.</p>
+            ) : (
+              <>
+                <div className="flex h-4 w-full overflow-hidden rounded-full bg-slate-100">
+                  {statusSegments.map((s) => (
+                    <span key={s.key} className="h-full transition-all duration-500" style={{ width: `${percent(s.count, rows.length)}%`, background: s.color }} title={`${s.label}: ${s.count}`} />
+                  ))}
+                </div>
+                <div className="mt-3 grid grid-cols-3 gap-2">
+                  {statusSegments.map((s) => (
+                    <div key={s.key} className="rounded-xl bg-slate-50 p-2.5">
+                      <p className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500">
+                        <span className="h-2 w-2 rounded-full" style={{ background: s.color }} /> {s.label}
+                      </p>
+                      <p className="mt-1 text-lg font-bold text-slate-800">{s.count}</p>
+                      <p className="text-[10px] text-slate-400">{formatCurrency(s.value, currency)}</p>
+                    </div>
+                  ))}
+                </div>
+                {closedInPeriod.length > 0 && <p className="mt-2 text-[11px] text-slate-400">Además, {countLabel(closedInPeriod.length, "factura rechazada o anulada", "facturas rechazadas o anuladas")} (no cuentan).</p>}
+              </>
+            )}
+          </ReportCard>
+        )}
+        {sections.has("projects") && (
+          <ReportCard title="Gasto por proyecto" hint="Los proyectos que más gastan. Toca uno para filtrar el reporte.">
+            <ReportBars items={topN(byProject)} total={total} currency={currency} color="#7c3aed" active={filters.project} onPick={(key) => setFilter("project", key)} />
+          </ReportCard>
+        )}
+        {sections.has("units") && (
+          <ReportCard title="Gasto por unidad" hint="Las unidades con más gasto en el periodo.">
+            <ReportBars items={topN(byUnit)} total={total} currency={currency} color="#0891b2" active={filters.unit} onPick={(key) => setFilter("unit", key)} />
+          </ReportCard>
+        )}
+        {sections.has("vendors") && (
+          <ReportCard title="Gasto por proveedor" hint="A quién se le compra más. Útil para negociar precios.">
+            <ReportBars items={topN(byVendor)} total={total} currency={currency} color="#d97706" active={filters.vendor} onPick={(key) => setFilter("vendor", key)} />
+          </ReportCard>
+        )}
+        {sections.has("fuel") && (
+          <ReportCard title="Combustible" hint="Litros, precio por litro y rendimiento promedio (km/L) de cada unidad.">
+            {fuelByUnit.length === 0 ? (
+              <p className="py-6 text-center text-xs text-slate-400">Sin cargas de combustible en el periodo.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-100 text-[10px] uppercase tracking-wide text-slate-400">
+                      <th className="py-1.5 pr-2 font-semibold">Unidad</th>
+                      <th className="py-1.5 pr-2 text-right font-semibold">Litros</th>
+                      <th className="py-1.5 pr-2 text-right font-semibold">Gasto</th>
+                      <th className="py-1.5 pr-2 text-right font-semibold">$ / litro</th>
+                      <th className="py-1.5 text-right font-semibold">km / L</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {fuelByUnit.map((u) => (
+                      <tr key={u.key || "none"} className="border-b border-slate-50 last:border-0">
+                        <td className="py-1.5 pr-2 font-medium text-slate-700">{u.label}</td>
+                        <td className="py-1.5 pr-2 text-right text-slate-600">{Math.round(u.liters).toLocaleString("es-MX")}</td>
+                        <td className="py-1.5 pr-2 text-right font-semibold text-slate-700">{formatCurrency(u.value, currency)}</td>
+                        <td className="py-1.5 pr-2 text-right text-slate-600">{u.price ? formatMoney(u.price, currency) : "—"}</td>
+                        <td className="py-1.5 text-right text-slate-600">{u.efficiency ? u.efficiency.toFixed(2) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </ReportCard>
+        )}
+      </div>
+
+      {sections.has("matrix") && (
+        <ReportCard title="Proyecto por concepto" hint="Cuánto gastó cada proyecto en cada concepto. Entre más intenso el color, mayor el gasto.">
+          {matrixProjects.length === 0 ? (
+            <p className="py-6 text-center text-xs text-slate-400">Sin datos en el periodo.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] text-left text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 text-[10px] uppercase tracking-wide text-slate-400">
+                    <th className="py-2 pr-2 font-semibold">Proyecto</th>
+                    {matrixConcepts.map((c) => (
+                      <th key={c} className="px-2 py-2 text-right font-semibold">
+                        {conceptName(c)}
+                      </th>
+                    ))}
+                    <th className="py-2 pl-2 text-right font-semibold text-slate-600">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {matrixProjects.map((p) => (
+                    <tr key={p.key || "none"} className="border-b border-slate-50">
+                      <td className="py-1.5 pr-2 font-medium text-slate-700">{p.label}</td>
+                      {matrixConcepts.map((c) => {
+                        const value = cell(p.key, c);
+                        return (
+                          <td key={c} className="px-2 py-1.5 text-right text-slate-700" style={value ? { background: `rgb(37 99 235 / ${0.06 + (value / maxCell) * 0.34})` } : undefined}>
+                            {value ? formatCurrency(value, currency) : "—"}
+                          </td>
+                        );
+                      })}
+                      <td className="py-1.5 pl-2 text-right font-bold text-slate-800">{formatCurrency(p.value, currency)}</td>
+                    </tr>
+                  ))}
+                  <tr className="border-t-2 border-slate-200 font-bold text-slate-800">
+                    <td className="py-1.5 pr-2">Total</td>
+                    {matrixConcepts.map((c) => (
+                      <td key={c} className="px-2 py-1.5 text-right">
+                        {formatCurrency(sumOf(rows.filter((i) => conceptOf(i) === c), amountOf), currency)}
+                      </td>
+                    ))}
+                    <td className="py-1.5 pl-2 text-right">{formatCurrency(total, currency)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          )}
+        </ReportCard>
+      )}
+
+      {sections.has("top") && (
+        <ReportCard title="Facturas más altas" hint="Las 10 de mayor monto en el periodo, para revisarlas con cuidado.">
+          {rows.length === 0 ? (
+            <p className="py-6 text-center text-xs text-slate-400">Sin facturas en el periodo.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] text-left text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 text-[10px] uppercase tracking-wide text-slate-400">
+                    {["Fecha", "Concepto", "Proveedor", "Proyecto", "Unidad", "Estado", "Monto"].map((h) => (
+                      <th key={h} className={`py-2 pr-2 font-semibold ${h === "Monto" ? "text-right" : ""}`}>
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...rows]
+                    .sort((a, b) => b.amount - a.amount)
+                    .slice(0, 10)
+                    .map((inv) => (
+                      <tr key={inv.key} className="border-b border-slate-50 last:border-0">
+                        <td className="whitespace-nowrap py-1.5 pr-2 text-slate-500">{formatDate(String(inv.date).slice(0, 10), format)}</td>
+                        <td className="py-1.5 pr-2 text-slate-700">{expenseTypeLabel(inv.expenseType)}</td>
+                        <td className="py-1.5 pr-2 text-slate-700">{inv.vendor || "—"}</td>
+                        <td className="py-1.5 pr-2 text-slate-600">{inv.project || "—"}</td>
+                        <td className="py-1.5 pr-2 text-slate-600">{inv.unit || "—"}</td>
+                        <td className="py-1.5 pr-2 text-slate-500">{inv.approved ? "Aprobada" : STATUS_BADGE_STYLES[inv.status]?.label ?? inv.status}</td>
+                        <td className="whitespace-nowrap py-1.5 text-right font-semibold text-slate-800">{formatMoney(inv.amount, currency)}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </ReportCard>
+      )}
     </div>
   );
 }
@@ -6822,50 +7304,26 @@ function FuelPage({
     <div className="space-y-5">
       {breadcrumb && <InvoiceBreadcrumb items={breadcrumb} />}
 
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className={`min-w-0 ${!inProjects ? "page-intro" : ""}`}>
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="min-w-0 break-words text-xl font-bold text-slate-900">{!inProjects ? "Facturas y Gastos" : projectLabel || "Proyectos"}</h1>
-            {currentProject?.name && (
-              <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${currentProject.closed ? "bg-slate-100 text-slate-500" : "bg-emerald-50 text-emerald-700"}`}>
-                {currentProject.closed ? "Cerrado" : "Activo"}
-              </span>
-            )}
-          </div>
-          <p className="page-intro mt-1 text-sm text-slate-500">
-            {!inProjects
-              ? "Integra consumo de combustible, consumibles, refrigerante, refacciones y casetas de la flotilla."
-              : currentProject
-              ? "Todas las facturas de este proyecto y su resumen por concepto."
-              : "Resumen de todos los conceptos de tus proyectos."}
-          </p>
-        </div>
+      <div className={`min-w-0 ${!inProjects ? "page-intro" : ""}`}>
         <div className="flex flex-wrap items-center gap-2">
-          {isAdmin && currentProject?.name && (
-            <button
-              onClick={() => onSetProjectClosed(currentProject.name, !currentProject.closed)}
-              title="Solo cambia si aparece en la vista de proyectos activos. Sus facturas no se modifican."
-              className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-            >
-              {currentProject.closed ? "Reabrir proyecto" : "Cerrar proyecto"}
-            </button>
+          <h1 className="min-w-0 break-words text-xl font-bold text-slate-900">{!inProjects ? "Facturas y Gastos" : projectLabel || "Proyectos"}</h1>
+          {currentProject?.name && (
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${currentProject.closed ? "bg-slate-100 text-slate-500" : "bg-emerald-50 text-emerald-700"}`}>
+              {currentProject.closed ? "Cerrado" : "Activo"}
+            </span>
           )}
-          <button
-            onClick={openReportBuilder}
-            className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-          >
-            <BarChart3 size={14} /> Crear reporte
-          </button>
-          <button
-            onClick={() => onAddInvoice(INVOICE_CATEGORY_TYPE[concept], currentProject?.name ?? "")}
-            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
-          >
-            <Plus size={15} /> Cargar Factura
-          </button>
         </div>
+        <p className="page-intro mt-1 text-sm text-slate-500">
+          {!inProjects
+            ? "Integra consumo de combustible, consumibles, refrigerante, refacciones y casetas de la flotilla."
+            : currentProject
+            ? "Todas las facturas de este proyecto y su resumen por concepto."
+            : "Resumen de todos los conceptos de tus proyectos."}
+        </p>
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      {/* Pestañas y botones en un mismo renglón: sin espacios en blanco. */}
+      <div className="flex flex-wrap items-center gap-2">
         {/* Los conceptos se ven dentro de Proyectos; el resumen general no los separa. */}
         {inProjects ? (
           <PillTabs
@@ -6888,6 +7346,29 @@ function FuelPage({
             onChange={setProjectScope}
           />
         )}
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {isAdmin && currentProject?.name && (
+            <button
+              onClick={() => onSetProjectClosed(currentProject.name, !currentProject.closed)}
+              title="Solo cambia si aparece en la vista de proyectos activos. Sus facturas no se modifican."
+              className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+            >
+              {currentProject.closed ? "Reabrir proyecto" : "Cerrar proyecto"}
+            </button>
+          )}
+          <button
+            onClick={openReportBuilder}
+            className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+          >
+            <BarChart3 size={14} /> Crear reporte
+          </button>
+          <button
+            onClick={() => onAddInvoice(INVOICE_CATEGORY_TYPE[concept], currentProject?.name ?? "")}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700"
+          >
+            <Plus size={15} /> Cargar Factura
+          </button>
+        </div>
       </div>
 
       {view === "overview" && (
