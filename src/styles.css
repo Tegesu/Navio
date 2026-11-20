@@ -389,8 +389,17 @@ html.dark .tiles-native-dark .leaflet-tile-pane {
   margin: 11mm 11mm 11mm;
 }
 
-/* Mensajes en el teléfono: llenan el espacio entre el encabezado (que crece
-   con la barra de estado) y la barra inferior (que sube con la de gestos). */
+/* Mensajes en el teléfono: llenan el espacio entre el encabezado y la barra
+   inferior. Se miden desde los bordes de la pantalla (no con 100vh, que en
+   algunos teléfonos no coincide con lo visible):
+   - arriba: el encabezado mide 49px más su relleno de arriba
+     (max(0.5rem, --safe-top), el mismo de mobile.jsx);
+   - abajo: la barra inferior (mobile.jsx) va a max(6px, --safe-bottom - 6px)
+     del borde y mide 68px; se dejan 10px de aire. */
 .mobile-messages {
-  height: calc(100vh - 8.5rem - var(--safe-bottom) - max(0px, var(--safe-top) - 0.5rem));
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: calc(49px + max(0.5rem, var(--safe-top)));
+  bottom: calc(max(6px, var(--safe-bottom) - 6px) + 78px);
 }

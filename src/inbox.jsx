@@ -592,7 +592,7 @@ function Conversation({ channel, isAdmin, onBack, onChanged, jumpTo }) {
   ].filter(Boolean);
 
   const header = (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-0.5 sm:gap-1.5">
       <ChannelAvatar channel={channel} />
       <div className="ml-1 min-w-0 flex-1">
         <p className="flex items-center gap-1 truncate text-sm font-bold text-slate-800">
@@ -606,16 +606,16 @@ function Conversation({ channel, isAdmin, onBack, onChanged, jumpTo }) {
       </div>
       {canCall && (
         <>
-          <button type="button" onClick={() => calls.start(channel, "audio")} aria-label="Llamada de voz" title="Llamada de voz" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50">
+          <button type="button" onClick={() => calls.start(channel, "audio")} aria-label="Llamada de voz" title="Llamada de voz" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50 sm:h-9 sm:w-9">
             <Phone size={17} />
           </button>
-          <button type="button" onClick={() => calls.start(channel, "video")} aria-label="Videollamada" title="Videollamada" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50">
+          <button type="button" onClick={() => calls.start(channel, "video")} aria-label="Videollamada" title="Videollamada" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-blue-600 hover:bg-blue-50 sm:h-9 sm:w-9">
             <Video size={18} />
           </button>
         </>
       )}
       <div className="relative shrink-0">
-        <button type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="Más opciones del chat" aria-expanded={menuOpen} className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100">
+        <button type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="Más opciones del chat" aria-expanded={menuOpen} className="flex h-8 w-8 items-center sm:h-9 sm:w-9 justify-center rounded-lg text-slate-500 hover:bg-slate-100">
           <MoreVertical size={17} />
         </button>
         {menuOpen && (
@@ -958,7 +958,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
         </div>
       )}
       {!open && <PushInvite compact={compact} />}
-      <div className={`grid min-h-0 flex-1 overflow-hidden border-slate-200 bg-white lg:grid-cols-[300px_minmax(0,1fr)] ${compact ? "" : "messages-panel h-[calc(100vh-14rem)] min-h-[420px] rounded-2xl border shadow-sm"}`}>
+      <div className={`grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] overflow-hidden border-slate-200 bg-white lg:grid-cols-[300px_minmax(0,1fr)] ${compact ? "" : "messages-panel h-[calc(100vh-14rem)] min-h-[420px] rounded-2xl border shadow-sm"}`}>
         <div className={`min-h-0 flex-col border-slate-100 lg:flex lg:border-r ${open ? "hidden" : "flex"}`}>
           <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-3 py-2.5">
             <p className="text-xs font-bold text-slate-700">Conversaciones</p>

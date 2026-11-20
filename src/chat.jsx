@@ -1373,7 +1373,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 border-b border-slate-100 px-3 py-2">
+      <div className="flex items-center gap-0.5 border-b border-slate-100 px-2 py-2 sm:gap-2 sm:px-3">
         {onBack && (
           <button type="button" onClick={onBack} aria-label="Volver a las conversaciones" className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 lg:hidden">
             <ArrowLeft size={16} />
