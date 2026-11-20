@@ -49,41 +49,51 @@ function Badge({ count }) {
   return <span className="absolute -right-2 -top-1.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white">{count > 9 ? "9+" : count}</span>;
 }
 
+// Barra inferior flotante: una cápsula de vidrio con la sección activa en un
+// círculo de color con brillo. "Registrar" (+) va en medio, elevado.
 function BottomNav({ tab, onChange, badges }) {
   return (
-    <nav
-      className="fixed inset-x-0 bottom-0 z-40 flex items-end border-t border-slate-200 bg-white/95 backdrop-blur print:hidden"
-      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
-      aria-label="Secciones principales"
-    >
-      {TABS.map((t) => {
-        const Icon = t.icon;
-        const active = tab === t.id;
-        if (t.primary) {
+    <nav className="fixed inset-x-3 z-40 mx-auto max-w-md print:hidden" style={{ bottom: "calc(10px + env(safe-area-inset-bottom))" }} aria-label="Secciones principales">
+      <div className="flex h-[66px] items-center rounded-[30px] border border-slate-200 bg-white/85 px-1.5 shadow-[0_12px_32px_rgb(0_0_0/0.28)] backdrop-blur-xl">
+        {TABS.map((t) => {
+          const Icon = t.icon;
+          const active = tab === t.id;
+          if (t.primary) {
+            return (
+              <div key={t.id} className="flex flex-1 justify-center">
+                <button
+                  onClick={() => onChange(t.id)}
+                  aria-current={active ? "page" : undefined}
+                  aria-label={t.label}
+                  className={`-mt-9 flex h-[60px] w-[60px] flex-col items-center justify-center gap-0.5 rounded-full bg-blue-600 text-white ring-[5px] ring-[rgb(var(--bg-page))] transition duration-200 active:scale-95 ${
+                    active ? "scale-105 shadow-[0_0_24px_rgb(var(--bg-blue-600)/0.75)]" : "shadow-[0_10px_24px_rgb(var(--bg-blue-600)/0.5)]"
+                  }`}
+                >
+                  <Icon size={24} strokeWidth={2.4} />
+                  <span className="text-[9px] font-semibold leading-none">{t.label}</span>
+                </button>
+              </div>
+            );
+          }
           return (
-            <button key={t.id} onClick={() => onChange(t.id)} aria-current={active ? "page" : undefined} className="flex min-h-[60px] flex-1 flex-col items-center justify-end gap-1 pb-1.5 text-[11px] font-semibold text-slate-500">
-              <span className={`-mt-5 flex h-12 w-12 items-center justify-center rounded-2xl text-white shadow-lg ring-4 ring-white transition ${active ? "bg-blue-700" : "bg-blue-600"}`}>
-                <Icon size={22} />
-              </span>
-              {t.label}
-            </button>
+            <div key={t.id} className="flex flex-1 justify-center">
+              <button
+                onClick={() => onChange(t.id)}
+                aria-current={active ? "page" : undefined}
+                className={`relative flex h-[56px] w-[56px] flex-col items-center justify-center gap-1 rounded-full transition-all duration-300 ${
+                  active ? "scale-105 bg-blue-600 text-white shadow-[0_0_22px_rgb(var(--bg-blue-600)/0.65)]" : "text-slate-400 hover:text-slate-600"
+                }`}
+              >
+                <span className="relative">
+                  <Icon size={20} strokeWidth={active ? 2.4 : 2} />
+                  <Badge count={badges[t.id]} />
+                </span>
+                <span className={`text-[10px] leading-none ${active ? "font-bold" : "font-semibold"}`}>{t.label}</span>
+              </button>
+            </div>
           );
-        }
-        return (
-          <button
-            key={t.id}
-            onClick={() => onChange(t.id)}
-            aria-current={active ? "page" : undefined}
-            className={`flex min-h-[60px] flex-1 flex-col items-center justify-center gap-1 text-[11px] font-semibold transition ${active ? "text-blue-600" : "text-slate-400"}`}
-          >
-            <span className={`relative flex h-8 w-12 items-center justify-center rounded-full transition ${active ? "bg-blue-50" : ""}`}>
-              <Icon size={20} />
-              <Badge count={badges[t.id]} />
-            </span>
-            {t.label}
-          </button>
-        );
-      })}
+        })}
+      </div>
     </nav>
   );
 }

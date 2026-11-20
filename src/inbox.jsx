@@ -950,7 +950,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
   }
 
   return (
-    <div className={compact ? "flex h-[calc(100vh-7.5rem)] flex-col" : "space-y-4"}>
+    <div className={compact ? "flex h-[calc(100vh-9rem-env(safe-area-inset-bottom))] flex-col" : "space-y-4"}>
       {!compact && (
         <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Mensajes</h1>
