@@ -211,12 +211,29 @@ function emit(table, eventType, row, old = {}) {
   for (const l of listeners) if (l.table === table && (l.event === "*" || l.event === eventType)) setTimeout(() => l.cb({ eventType, new: row, old }), 0);
 }
 window.__emit = emit;
-supabase.channel = () => {
+// Avisos en vivo (broadcast), como "está escribiendo". window.__broadcasts
+// guarda lo que manda la página; window.__broadcast(topic, event, payload)
+// simula que otra persona manda uno.
+const broadcastListeners = [];
+window.__broadcasts = [];
+window.__broadcast = (topic, event, payload) => {
+  for (const l of broadcastListeners) if (l.topic === topic && l.event === event) setTimeout(() => l.cb({ type: "broadcast", event, payload }), 0);
+};
+supabase.channel = (topic = "", opts = {}) => {
   const mine = [];
+  const myBroadcast = [];
   const c = {
-    on: (_type, filter, cb) => { const l = { table: filter.table, event: filter.event, cb }; mine.push(l); listeners.push(l); return c; },
-    subscribe: () => c,
-    _off: () => mine.forEach((l) => listeners.splice(listeners.indexOf(l), 1)),
+    topic,
+    on: (type, filter, cb) => {
+      if (type === "broadcast") { const l = { topic, event: filter.event, cb }; myBroadcast.push(l); broadcastListeners.push(l); return c; }
+      const l = { table: filter.table, event: filter.event, cb }; mine.push(l); listeners.push(l); return c;
+    },
+    subscribe: (cb) => { if (typeof cb === "function") setTimeout(() => cb("SUBSCRIBED"), 0); return c; },
+    send: async (msg) => { window.__broadcasts.push({ topic, private: !!opts?.config?.private, ...msg }); return "ok"; },
+    _off: () => {
+      mine.forEach((l) => listeners.splice(listeners.indexOf(l), 1));
+      myBroadcast.forEach((l) => broadcastListeners.splice(broadcastListeners.indexOf(l), 1));
+    },
   };
   return c;
 };

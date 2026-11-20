@@ -898,6 +898,106 @@ function StickerPanel({ onSend, onClose }) {
 
 /* ---------- La conversación ---------- */
 
+// ---------------------------------------------------------------------------
+// "Está escribiendo": avisos en vivo por un canal privado de Supabase
+// ("typing:<chat>"). Solo pueden escucharlo y mandarlo quienes pueden leer el
+// chat (migración v31). No se guarda nada. Sin la migración, no se ve el aviso.
+// ---------------------------------------------------------------------------
+const TYPING_SEND_EVERY = 2500; // mientras se escribe, se repite el aviso
+const TYPING_TTL = 6000; // si no llega otro aviso, se quita solo
+const TYPING_IDLE = 4000; // sin teclear este tiempo, se avisa que ya no escribe
+const firstName = (name) => String(name ?? "").trim().split(/\s+/)[0].slice(0, 30);
+
+function useTyping(channelId, myId, myName) {
+  const [others, setOthers] = useState([]); // [{ userId, name, kind, until }]
+  const chanRef = useRef(null);
+  const readyRef = useRef(false);
+  const lastSent = useRef({ at: 0, kind: null });
+
+  useEffect(() => {
+    if (!myId || !channelId || typeof supabase.channel !== "function") return undefined;
+    setOthers([]);
+    readyRef.current = false;
+    lastSent.current = { at: 0, kind: null };
+    const chan = supabase.channel(`typing:${channelId}`, { config: { private: true, broadcast: { self: false } } });
+    chanRef.current = chan;
+    chan.on("broadcast", { event: "typing" }, (message) => {
+      const data = message?.payload;
+      if (!data?.userId || String(data.userId) === String(myId)) return;
+      const userId = String(data.userId);
+      setOthers((prev) => {
+        const rest = prev.filter((x) => x.userId !== userId);
+        if (data.kind !== "text" && data.kind !== "voice") return rest; // dejó de escribir
+        return [...rest, { userId, name: String(data.name ?? ""), kind: data.kind, until: Date.now() + TYPING_TTL }];
+      });
+    });
+    chan.subscribe((status, err) => {
+      readyRef.current = status === "SUBSCRIBED";
+      // Sin permiso (falta la v31): se deja de intentar en esta conversación.
+      if (status === "CHANNEL_ERROR" && /unauthori|permission|denied|forbidden/i.test(err?.message ?? "")) {
+        readyRef.current = false;
+        chanRef.current = null;
+        supabase.removeChannel(chan);
+      }
+    });
+    const sweep = window.setInterval(() => {
+      setOthers((prev) => (prev.some((x) => x.until < Date.now()) ? prev.filter((x) => x.until >= Date.now()) : prev));
+    }, 1000);
+    return () => {
+      window.clearInterval(sweep);
+      if (readyRef.current && lastSent.current.kind) {
+        chan.send({ type: "broadcast", event: "typing", payload: { userId: myId, kind: null } })?.catch?.(() => {});
+      }
+      readyRef.current = false;
+      chanRef.current = null;
+      supabase.removeChannel(chan);
+    };
+  }, [channelId, myId]);
+
+  // kind: "text" (escribe), "voice" (graba un audio) o null (ya no).
+  const report = useCallback(
+    (kind) => {
+      const chan = chanRef.current;
+      if (!chan || !readyRef.current) return;
+      const now = Date.now();
+      const last = lastSent.current;
+      if (kind === last.kind && (kind === null || now - last.at < TYPING_SEND_EVERY)) return;
+      lastSent.current = { at: now, kind };
+      chan.send({ type: "broadcast", event: "typing", payload: { userId: myId, name: myName, kind } })?.catch?.(() => {});
+    },
+    [myId, myName]
+  );
+
+  return { others, report };
+}
+
+// Burbuja con tres puntitos y "Fulano está escribiendo…".
+function TypingBubble({ people }) {
+  const voice = people.length === 1 && people[0].kind === "voice";
+  const label =
+    people.length === 1
+      ? `${people[0].name} está ${voice ? "grabando un audio" : "escribiendo"}`
+      : people.length === 2
+        ? `${people[0].name} y ${people[1].name} están escribiendo`
+        : `${people.length} personas están escribiendo`;
+  return (
+    <div className="typing-in flex items-center gap-2 pt-1" role="status" aria-live="polite">
+      <div className="flex h-8 shrink-0 items-center gap-1 rounded-2xl rounded-bl-md bg-white px-3 shadow-sm" aria-hidden="true">
+        {voice ? (
+          <Mic size={14} className="animate-pulse text-rose-500" />
+        ) : (
+          <>
+            <span className="typing-dot h-1.5 w-1.5 rounded-full bg-slate-400" />
+            <span className="typing-dot h-1.5 w-1.5 rounded-full bg-slate-400" />
+            <span className="typing-dot h-1.5 w-1.5 rounded-full bg-slate-400" />
+          </>
+        )}
+      </div>
+      <p className="min-w-0 truncate text-[11px] italic text-slate-400">{label}…</p>
+    </div>
+  );
+}
+
 export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jumpRequest = null }) {
   const { user, profile } = useAuth();
   const inbox = useInbox();
@@ -949,6 +1049,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
   const galleryRef = useRef(null);
   const docRef = useRef(null);
   const channelId = channel.id;
+  const typing = useTyping(channelId, user?.id, firstName(profile?.fullName));
 
   const loadMessages = useCallback(
     async (beforeId = null) => {
@@ -1262,6 +1363,40 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
     onError: () => showToast("No se pudo usar el micrófono. Revisa el permiso en los ajustes."),
   });
 
+  // "Está escribiendo": aviso mientras hay texto (no al editar uno ya enviado)
+  // y mientras se graba un audio.
+  const reportTyping = typing.report;
+  useEffect(() => {
+    if (editing || !draft.trim()) {
+      reportTyping(null);
+      return undefined;
+    }
+    reportTyping("text");
+    const idle = window.setTimeout(() => reportTyping(null), TYPING_IDLE);
+    return () => window.clearTimeout(idle);
+  }, [draft, editing, reportTyping]);
+  useEffect(() => {
+    if (!voice.mode) return undefined;
+    reportTyping("voice");
+    const again = window.setInterval(() => reportTyping("voice"), TYPING_SEND_EVERY);
+    return () => {
+      window.clearInterval(again);
+      reportTyping(null);
+    };
+  }, [voice.mode, reportTyping]);
+  // Nombres: los del chat que ya conocemos; si no, el que manda el aviso.
+  const typingPeople = useMemo(() => {
+    if (!typing.others.length) return [];
+    const names = new Map();
+    for (const m of messages ?? []) if (m.senderId && m.senderName) names.set(String(m.senderId), m.senderName);
+    if (channel.kind === "direct" && channel.otherUserId && channel.otherUserName) names.set(String(channel.otherUserId), channel.otherUserName);
+    return typing.others.map((x) => ({ ...x, name: firstName(names.get(x.userId) || x.name) || "Alguien" }));
+  }, [typing.others, messages, channel.kind, channel.otherUserId, channel.otherUserName]);
+  useEffect(() => {
+    const box = scrollRef.current;
+    if (box && stickRef.current && typingPeople.length) box.scrollTop = box.scrollHeight;
+  }, [typingPeople.length]);
+
   // Fotos, videos y documentos esperan aquí a que se revisen y se comenten.
   function addPending(fileList, kind, reset) {
     const files = [...(fileList ?? [])].slice(0, 10);
@@ -1520,6 +1655,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
             </div>
           );
         })}
+        {typingPeople.length > 0 && !onlyStarred && <TypingBubble people={typingPeople} />}
       </div>
 
       {(replyTo || editing) && (
