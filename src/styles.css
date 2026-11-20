@@ -291,7 +291,7 @@ html.dark .splash-n {
 /* Teléfono: los avisos flotantes van arriba de la barra inferior. */
 .has-bottom-nav .cookie-notice,
 .has-bottom-nav .toast-host {
-  bottom: calc(92px + env(safe-area-inset-bottom));
+  bottom: calc(84px + env(safe-area-inset-bottom));
 }
 
 /* Cartel de bienvenida del teléfono: azul en claro; carbón con lavanda en oscuro. */

@@ -53,8 +53,8 @@ function Badge({ count }) {
 // círculo de color con brillo. "Registrar" (+) va en medio, elevado.
 function BottomNav({ tab, onChange, badges }) {
   return (
-    <nav className="fixed inset-x-3 z-40 mx-auto max-w-md print:hidden" style={{ bottom: "calc(10px + env(safe-area-inset-bottom))" }} aria-label="Secciones principales">
-      <div className="flex h-[66px] items-center rounded-[30px] border border-slate-200 bg-white/85 px-1.5 shadow-[0_12px_32px_rgb(0_0_0/0.28)] backdrop-blur-xl">
+    <nav className="fixed inset-x-2 z-40 mx-auto max-w-md print:hidden" style={{ bottom: "max(4px, env(safe-area-inset-bottom))" }} aria-label="Secciones principales">
+      <div className="flex h-[68px] items-center rounded-[34px] border border-slate-200 bg-white/90 px-1.5 shadow-[0_-6px_18px_rgb(0_0_0/0.10),0_16px_40px_rgb(0_0_0/0.38),inset_0_1px_0_rgb(255_255_255/0.10)] backdrop-blur-xl">
         {TABS.map((t) => {
           const Icon = t.icon;
           const active = tab === t.id;
@@ -65,8 +65,8 @@ function BottomNav({ tab, onChange, badges }) {
                   onClick={() => onChange(t.id)}
                   aria-current={active ? "page" : undefined}
                   aria-label={t.label}
-                  className={`-mt-9 flex h-[60px] w-[60px] flex-col items-center justify-center gap-0.5 rounded-full bg-blue-600 text-white ring-[5px] ring-[rgb(var(--bg-page))] transition duration-200 active:scale-95 ${
-                    active ? "scale-105 shadow-[0_0_24px_rgb(var(--bg-blue-600)/0.75)]" : "shadow-[0_10px_24px_rgb(var(--bg-blue-600)/0.5)]"
+                  className={`-mt-5 flex h-[58px] w-[58px] flex-col items-center justify-center gap-0.5 rounded-full bg-[radial-gradient(circle_at_32%_28%,rgb(var(--bg-blue-500)),rgb(var(--bg-blue-700)))] text-white ring-4 ring-[rgb(var(--bg-page))] transition duration-200 active:scale-95 ${
+                    active ? "scale-105 shadow-[0_0_26px_rgb(var(--bg-blue-600)/0.8)]" : "shadow-[0_8px_22px_rgb(var(--bg-blue-600)/0.55)]"
                   }`}
                 >
                   <Icon size={24} strokeWidth={2.4} />
@@ -81,7 +81,9 @@ function BottomNav({ tab, onChange, badges }) {
                 onClick={() => onChange(t.id)}
                 aria-current={active ? "page" : undefined}
                 className={`relative flex h-[56px] w-[56px] flex-col items-center justify-center gap-1 rounded-full transition-all duration-300 ${
-                  active ? "scale-105 bg-blue-600 text-white shadow-[0_0_22px_rgb(var(--bg-blue-600)/0.65)]" : "text-slate-400 hover:text-slate-600"
+                  active
+                    ? "scale-105 bg-[radial-gradient(circle_at_32%_28%,rgb(var(--bg-blue-500)),rgb(var(--bg-blue-700)))] text-white shadow-[0_0_24px_rgb(var(--bg-blue-600)/0.7),0_6px_14px_rgb(0_0_0/0.25)]"
+                    : "text-slate-400 hover:text-slate-600"
                 }`}
               >
                 <span className="relative">
