@@ -288,10 +288,33 @@ html.dark .splash-n {
   }
 }
 
+/* Bordes del teléfono: lo que ocupan la barra de estado (arriba) y la barra de
+   gestos (abajo). En la app de Android los manda la app (--navio-safe-*); en el
+   navegador, el propio navegador (env). */
+:root {
+  --safe-top: var(--navio-safe-top, env(safe-area-inset-top, 0px));
+  --safe-bottom: var(--navio-safe-bottom, env(safe-area-inset-bottom, 0px));
+}
+
 /* Teléfono: los avisos flotantes van arriba de la barra inferior. */
 .has-bottom-nav .cookie-notice,
 .has-bottom-nav .toast-host {
-  bottom: calc(84px + env(safe-area-inset-bottom));
+  bottom: calc(84px + var(--safe-bottom));
+}
+
+/* Barra inferior del teléfono: el mismo sombreado del cartel de bienvenida,
+   con el color más fuerte arriba que se desvanece poco a poco hacia abajo. */
+.bottom-nav-bar {
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.16) 0%, rgba(37, 99, 235, 0.08) 35%, rgba(37, 99, 235, 0.02) 75%, rgba(37, 99, 235, 0) 100%),
+    rgba(255, 255, 255, 0.92);
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 -6px 18px rgba(15, 23, 42, 0.06),
+    0 14px 34px rgba(15, 23, 42, 0.24);
+}
+html.dark .bottom-nav-bar {
+  background: linear-gradient(180deg, rgba(143, 127, 246, 0.36) 0%, rgba(143, 127, 246, 0.17) 35%, rgba(143, 127, 246, 0.05) 72%, rgba(143, 127, 246, 0) 100%),
+    linear-gradient(180deg, rgba(44, 42, 58, 0.95) 0%, rgba(37, 37, 36, 0.95) 100%);
+  box-shadow: inset 0 0 0 1px rgba(165, 151, 253, 0.2), inset 0 1px 0 rgba(205, 196, 255, 0.14), 0 -6px 18px rgba(0, 0, 0, 0.1),
+    0 16px 40px rgba(0, 0, 0, 0.45);
 }
 
 /* Cartel de bienvenida del teléfono: azul en claro; carbón con lavanda en oscuro. */
@@ -364,4 +387,10 @@ html.dark .tiles-native-dark .leaflet-tile-pane {
 @page {
   size: A4;
   margin: 11mm 11mm 11mm;
+}
+
+/* Mensajes en el teléfono: llenan el espacio entre el encabezado (que crece
+   con la barra de estado) y la barra inferior (que sube con la de gestos). */
+.mobile-messages {
+  height: calc(100vh - 8.5rem - var(--safe-bottom) - max(0px, var(--safe-top) - 0.5rem));
 }

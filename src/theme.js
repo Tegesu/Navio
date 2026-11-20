@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { Capacitor, SystemBars } from "@capacitor/core";
 
 /* ---------------------------------------------------------------------- */
 /*  Tema claro / oscuro                                                   */
@@ -29,6 +30,22 @@ function apply(choice, animate) {
   }
   root.classList.toggle("dark", isDark(choice));
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", isDark(choice) ? "#1e1e1d" : "#2563eb");
+  syncSystemBars();
+}
+
+// App de Android: la página llega hasta arriba, detrás de la hora y la batería.
+// Esos íconos van claros sobre el tema oscuro y oscuros sobre el claro. Solo
+// cuando la app avisó las medidas de las barras (--navio-safe-top); si no, se
+// dejan como los pone el teléfono.
+function syncSystemBars() {
+  try {
+    if (!Capacitor.isNativePlatform() || !Capacitor.isPluginAvailable("SystemBars")) return;
+    if (!document.documentElement.style.getPropertyValue("--navio-safe-top")) return;
+    const dark = document.documentElement.classList.contains("dark");
+    SystemBars.setStyle({ style: dark ? "DARK" : "LIGHT" }).catch(() => {});
+  } catch {
+    // Sin la app: nada que hacer.
+  }
 }
 
 let current = typeof window !== "undefined" ? readChoice() : "system";
@@ -41,6 +58,8 @@ if (typeof window !== "undefined") {
       listeners.forEach((l) => l());
     }
   });
+  // La app de Android mandó las medidas de las barras del teléfono.
+  window.addEventListener("navio:safearea", syncSystemBars);
   // Otra pestaña cambió el tema.
   window.addEventListener("storage", (e) => {
     if (e.key !== KEY) return;

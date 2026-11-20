@@ -62,7 +62,7 @@ function MessageBanner({ banner, onClose }) {
     window.postMessage({ type: "navio:open", url: `/?open=messages&sub=channel:${banner.channelId}` }, window.location.origin);
   };
   return (
-    <div role="status" className="fixed left-1/2 top-[max(env(safe-area-inset-top),0.5rem)] z-[60] w-[min(92vw,380px)] -translate-x-1/2">
+    <div role="status" className="fixed left-1/2 top-[max(var(--safe-top),0.5rem)] z-[60] w-[min(92vw,380px)] -translate-x-1/2">
       <div className="flex items-center gap-2.5 rounded-2xl border border-slate-200 bg-white p-2.5 shadow-xl">
         <button type="button" onClick={open} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
           <img src={avatarUrl(banner.name)} alt="" className="h-9 w-9 shrink-0 rounded-full" />
@@ -950,7 +950,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
   }
 
   return (
-    <div className={compact ? "flex h-[calc(100vh-8.5rem-env(safe-area-inset-bottom))] flex-col" : "space-y-4"}>
+    <div className={compact ? "mobile-messages flex flex-col" : "space-y-4"}>
       {!compact && (
         <div className="page-intro">
           <h1 className="text-xl font-bold text-slate-900">Mensajes</h1>

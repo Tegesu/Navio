@@ -271,7 +271,7 @@ export function AuthLayout({ children }) {
         <LoginShowcase />
       </aside>
       <main className="relative z-10 flex min-h-[100dvh] w-full flex-col justify-end md:min-h-screen md:w-[40%] md:min-w-[340px] md:max-w-[460px] md:shrink-0 md:justify-start md:border-l md:border-slate-200 md:bg-white lg:w-1/4 lg:min-w-[380px]">
-        <div className="login-card mx-3 mb-3 mt-28 flex flex-col rounded-3xl bg-white shadow-2xl md:m-0 md:flex-1 md:rounded-none md:shadow-none">
+        <div className="login-card mx-3 mb-[calc(0.75rem+var(--safe-bottom))] mt-28 flex flex-col rounded-3xl bg-white shadow-2xl md:m-0 md:flex-1 md:rounded-none md:shadow-none">
           <div className="mx-auto flex w-full max-w-[420px] flex-1 flex-col justify-center px-6 pb-4 pt-7 md:py-8 lg:px-7">
             <div className="mb-6 flex items-center gap-2.5 md:mb-7">
               <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-sm font-extrabold text-white shadow-lg shadow-blue-600/30">N</div>

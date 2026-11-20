@@ -877,7 +877,7 @@ export function CallProvider({ children }) {
         />
       )}
       {joinPrompt && (
-        <div className="fixed bottom-[calc(100px+env(safe-area-inset-bottom))] right-4 z-[3000] w-[min(92vw,320px)] rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
+        <div className="fixed bottom-[calc(100px+var(--safe-bottom))] right-4 z-[3000] w-[min(92vw,320px)] rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
           <p className="text-sm font-bold text-slate-800">{joinPrompt.kind === "video" ? "Videollamada" : "Llamada"} en curso</p>
           <p className="mt-1 text-xs text-slate-500">
             De {joinPrompt.callerName || "alguien de tu empresa"} · {joinPrompt.people} {joinPrompt.people === 1 ? "persona" : "personas"} dentro.
@@ -1145,7 +1145,7 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           style={{ translate: `${offset.x}px ${offset.y}px` }}
-          className={`fixed bottom-[calc(100px+env(safe-area-inset-bottom))] right-3 z-[3000] w-[min(92vw,300px)] touch-none select-none overflow-hidden rounded-2xl bg-slate-950 text-white shadow-2xl ring-1 ring-[rgb(255_255_255/0.08)] transition-[opacity,transform] duration-300 lg:bottom-5 lg:right-5 ${entered ? "scale-100 opacity-100" : "scale-90 opacity-0"}`}
+          className={`fixed bottom-[calc(100px+var(--safe-bottom))] right-3 z-[3000] w-[min(92vw,300px)] touch-none select-none overflow-hidden rounded-2xl bg-slate-950 text-white shadow-2xl ring-1 ring-[rgb(255_255_255/0.08)] transition-[opacity,transform] duration-300 lg:bottom-5 lg:right-5 ${entered ? "scale-100 opacity-100" : "scale-90 opacity-0"}`}
         >
           {showVideo && (
             <div className="relative h-40 w-full bg-slate-900">
@@ -1199,7 +1199,7 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
         {video && joined.length === 0 && localStream && (
           <LiveVideo stream={localStream} mirrored={call.facing === "user" && !call.sharing} contain={call.sharing} className="absolute inset-0 h-full w-full" />
         )}
-        <div className="relative z-10 flex items-center justify-between px-4 pt-[max(env(safe-area-inset-top),0.75rem)]">
+        <div className="relative z-10 flex items-center justify-between px-4 pt-[max(var(--safe-top),0.75rem)]">
           <button type="button" onClick={() => onView("float")} aria-label="Ventana flotante" title="Ventana flotante" className="flex h-10 w-10 items-center justify-center rounded-full bg-[rgb(255_255_255/0.12)] hover:bg-[rgb(255_255_255/0.22)]">
             <ChevronDown size={20} />
           </button>
@@ -1250,11 +1250,11 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
           <LiveVideo
             stream={localStream}
             mirrored={call.facing === "user" && !call.sharing}
-            className="absolute right-4 top-[max(env(safe-area-inset-top),0.75rem)] z-20 mt-14 h-36 w-24 rounded-2xl shadow-xl ring-1 ring-[rgb(255_255_255/0.25)] sm:h-44 sm:w-32"
+            className="absolute right-4 top-[max(var(--safe-top),0.75rem)] z-20 mt-14 h-36 w-24 rounded-2xl shadow-xl ring-1 ring-[rgb(255_255_255/0.25)] sm:h-44 sm:w-32"
           />
         )}
 
-        <div className="relative z-10 px-6 pb-[max(env(safe-area-inset-bottom),1.5rem)] pt-4">{controls(false) ?? <div className="h-20" />}</div>
+        <div className="relative z-10 px-6 pb-[max(var(--safe-bottom),1.5rem)] pt-4">{controls(false) ?? <div className="h-20" />}</div>
       </div>
     </>
   );

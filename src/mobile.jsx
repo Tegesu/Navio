@@ -53,8 +53,9 @@ function Badge({ count }) {
 // círculo de color con brillo. "Registrar" (+) va en medio, elevado.
 function BottomNav({ tab, onChange, badges }) {
   return (
-    <nav className="fixed inset-x-2 z-40 mx-auto max-w-md print:hidden" style={{ bottom: "max(4px, env(safe-area-inset-bottom))" }} aria-label="Secciones principales">
-      <div className="flex h-[68px] items-center rounded-[34px] border border-slate-200 bg-white/90 px-1.5 shadow-[0_-6px_18px_rgb(0_0_0/0.10),0_16px_40px_rgb(0_0_0/0.38),inset_0_1px_0_rgb(255_255_255/0.10)] backdrop-blur-xl">
+    // Abajo: casi pegada al borde, justo sobre la rayita de gestos del teléfono.
+    <nav className="fixed inset-x-2 z-40 mx-auto max-w-md print:hidden" style={{ bottom: "max(6px, calc(var(--safe-bottom) - 6px))" }} aria-label="Secciones principales">
+      <div className="bottom-nav-bar flex h-[68px] items-center rounded-[34px] px-1.5 backdrop-blur-xl">
         {TABS.map((t) => {
           const Icon = t.icon;
           const active = tab === t.id;
@@ -423,7 +424,7 @@ export function MobileAppShell({ vehicles, trips, userName, userAvatar, companyN
     <div className="min-h-screen bg-page">
       <header
         className="sticky top-0 z-30 flex items-center justify-between gap-2 border-b border-slate-200 bg-white/95 px-3 py-2 backdrop-blur"
-        style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}
+        style={{ paddingTop: "max(0.5rem, var(--safe-top))" }}
       >
         {title ? (
           <button onClick={() => goBack(() => setScreen(null))} className="flex min-h-[40px] min-w-0 items-center gap-1.5 text-sm font-bold text-slate-800">

@@ -324,11 +324,11 @@ export function CameraCapture({ onCapture, onClose }) {
       <div className="relative min-h-0 flex-1">
         <video ref={video} autoPlay playsInline muted className="absolute inset-0 h-full w-full object-contain" />
         {error && <p className="absolute inset-x-4 top-1/2 -translate-y-1/2 text-center text-sm text-white">{error}</p>}
-        <button type="button" onClick={onClose} aria-label="Cerrar cámara" className="absolute left-3 top-3 flex h-10 w-10 items-center justify-center rounded-full bg-black/50 text-white" style={{ marginTop: "env(safe-area-inset-top)" }}>
+        <button type="button" onClick={onClose} aria-label="Cerrar cámara" className="absolute left-3 top-3 flex h-10 w-10 items-center justify-center rounded-full bg-black/50 text-white" style={{ marginTop: "var(--safe-top)" }}>
           <X size={20} />
         </button>
       </div>
-      <div className="flex items-center justify-around px-6 py-5" style={{ paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}>
+      <div className="flex items-center justify-around px-6 py-5" style={{ paddingBottom: "max(1.25rem, var(--safe-bottom))" }}>
         <span className="h-11 w-11" />
         <button type="button" onClick={shoot} aria-label="Tomar foto" className="flex h-16 w-16 items-center justify-center rounded-full border-4 border-white">
           <span className="h-12 w-12 rounded-full bg-white" />
