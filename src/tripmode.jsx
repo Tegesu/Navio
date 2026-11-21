@@ -145,19 +145,20 @@ function TripMap({ me, from, to, stops, routePoints, follow, picking, onPick, on
 /* ---------- Buscar un lugar ---------- */
 // { results, state: idle | loading | done | error, error }
 function usePlaceSearch(text, near) {
-  const [found, setFound] = useState({ results: [], state: "idle", error: "" });
+  const [found, setFound] = useState({ results: [], state: "idle", error: "", query: "" });
   const nearKey = near ? `${near.lat.toFixed(2)},${near.lng.toFixed(2)}` : "";
   useEffect(() => {
-    if (text.trim().length < 3) {
-      setFound({ results: [], state: "idle", error: "" });
+    const query = text.trim();
+    if (query.length < 3) {
+      setFound({ results: [], state: "idle", error: "", query });
       return undefined;
     }
     let alive = true;
-    setFound((prev) => ({ ...prev, state: "loading", error: "" }));
+    setFound((prev) => ({ ...prev, state: "loading", error: "", query }));
     const timer = window.setTimeout(() => {
       searchPlaces(text, near).then(
-        (results) => alive && setFound({ results, state: "done", error: "" }),
-        (err) => alive && setFound({ results: [], state: "error", error: err?.message || "No se pudo buscar." })
+        (results) => alive && setFound({ results, state: "done", error: "", query }),
+        (err) => alive && setFound({ results: [], state: "error", error: err?.message || "No se pudo buscar.", query })
       );
     }, 350);
     return () => {
@@ -169,15 +170,41 @@ function usePlaceSearch(text, near) {
   return found;
 }
 
-function PlaceRow({ icon, placeholder, value, onChange, near, onPickOnMap, picking, mine = null, autoFocus = false }) {
+// focusSignal: al cambiar, el campo se abre para escribir.
+// onSubmitted: después de elegir un lugar (con Enter o tocándolo).
+function PlaceRow({ icon, placeholder, value, onChange, near, onPickOnMap, picking, mine = null, autoFocus = false, focusSignal = 0, onSubmitted = null, enterHint = "search" }) {
   const [editing, setEditing] = useState(autoFocus);
   const [text, setText] = useState("");
+  const [enterPending, setEnterPending] = useState(false);
   const found = usePlaceSearch(editing ? text : "", near);
   const results = found.results;
   const close = () => {
     setEditing(false);
     setText("");
+    setEnterPending(false);
   };
+  const choose = (place) => {
+    onChange(place);
+    close();
+    onSubmitted?.();
+  };
+  useEffect(() => {
+    if (focusSignal) setEditing(true);
+  }, [focusSignal]);
+  // Enter: se queda con la primera sugerencia (si aún buscaba, en cuanto llegue).
+  // Solo cuenta la respuesta de lo que está escrito ahora.
+  useEffect(() => {
+    if (!enterPending || found.query !== text.trim() || (found.state !== "done" && found.state !== "error")) return;
+    setEnterPending(false);
+    if (found.results[0]) choose(found.results[0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enterPending, found, text]);
+  function onKeyDown(e) {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    if (found.state === "done" && found.query === text.trim() && results[0]) choose(results[0]);
+    else if (text.trim().length >= 3) setEnterPending(true);
+  }
   return (
     <div className="relative">
       <div className="flex items-center gap-2.5 px-2">
@@ -188,6 +215,8 @@ function PlaceRow({ icon, placeholder, value, onChange, near, onPickOnMap, picki
             value={text}
             onChange={(e) => setText(e.target.value)}
             onBlur={() => window.setTimeout(close, 200)}
+            onKeyDown={onKeyDown}
+            enterKeyHint={enterHint}
             placeholder={hasTomTom() ? placeholder : "Elige el punto en el mapa"}
             disabled={!hasTomTom()}
             aria-label={placeholder}
@@ -207,7 +236,7 @@ function PlaceRow({ icon, placeholder, value, onChange, near, onPickOnMap, picki
       {editing && (
         <div className="absolute inset-x-0 top-full z-10 mt-2 max-h-[45dvh] overflow-y-auto rounded-2xl bg-white p-1 shadow-xl ring-1 ring-slate-200">
           {mine && (
-            <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => (mine(), close())} className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left text-sm font-semibold text-blue-600 hover:bg-slate-50">
+            <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => (mine(), close(), onSubmitted?.())} className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left text-sm font-semibold text-blue-600 hover:bg-slate-50">
               <LocateFixed size={15} /> Mi ubicación
             </button>
           )}
@@ -227,17 +256,14 @@ function PlaceRow({ icon, placeholder, value, onChange, near, onPickOnMap, picki
               key={`${r.lat},${r.lng},${i}`}
               type="button"
               onMouseDown={(e) => e.preventDefault()}
-              onClick={() => {
-                onChange(r);
-                close();
-              }}
+              onClick={() => choose(r)}
               className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50"
             >
               <MapPin size={15} className="shrink-0 text-slate-400" />
               <span className="min-w-0 flex-1 truncate">{r.label}</span>
             </button>
           ))}
-          {found.state === "loading" && <p className="px-3 py-2 text-xs text-slate-400">Buscando…</p>}
+          {found.state === "loading" && <p className="px-3 py-2 text-xs text-slate-400">{enterPending ? "Buscando para confirmar…" : "Buscando…"}</p>}
           {found.state === "done" && results.length === 0 && <p className="px-3 py-2 text-xs text-slate-400">Sin resultados. Prueba con otro nombre o elige el punto en el mapa.</p>}
           {found.state === "error" && <p className="px-3 py-2 text-xs font-medium text-rose-600">No se pudo buscar: {found.error}</p>}
           {text.trim().length > 0 && text.trim().length < 3 && <p className="px-3 py-2 text-xs text-slate-400">Escribe al menos 3 letras.</p>}
@@ -294,6 +320,7 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
   const [sheet, setSheet] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [locating, setLocating] = useState(false);
+  const [focusTo, setFocusTo] = useState(0);
 
   // Traslados que la persona puede tomar y la unidad.
   const supervisor = profileCan(profile, "supervisor");
@@ -501,6 +528,8 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
                   mine={() => locate(true)}
                   picking={picking === "from"}
                   onPickOnMap={() => setPicking("from")}
+                  enterHint="next"
+                  onSubmitted={() => !to && setFocusTo((n) => n + 1)}
                 />
                 <div className="ml-8 mr-2 border-t border-slate-100" />
                 <PlaceRow
@@ -511,6 +540,9 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
                   near={from ?? me}
                   picking={picking === "to"}
                   onPickOnMap={() => setPicking("to")}
+                  focusSignal={focusTo}
+                  enterHint="go"
+                  onSubmitted={() => document.activeElement?.blur?.()}
                 />
               </div>
               <button type="button" onClick={swap} disabled={!from && !to} aria-label="Cambiar salida y destino" className="mr-1.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 disabled:opacity-30">
@@ -772,6 +804,15 @@ function StopAdder({ near, onAdd, onPickOnMap }) {
             onChange={(e) => setText(e.target.value)}
             placeholder={hasTomTom() ? "Agregar parada" : "Elige la parada en el mapa"}
             disabled={!hasTomTom()}
+            enterKeyHint="done"
+            onKeyDown={(e) => {
+              if (e.key !== "Enter") return;
+              e.preventDefault();
+              if (results[0]) {
+                onAdd(results[0]);
+                setText("");
+              }
+            }}
             aria-label="Agregar parada"
             className="h-10 w-full rounded-xl border border-slate-200 pl-9 pr-2 text-sm focus:border-blue-400 focus:outline-none disabled:bg-slate-50"
           />

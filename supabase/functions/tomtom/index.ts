@@ -27,13 +27,42 @@ const LIMITS: Record<string, number> = { search: 150, reverse: 150, route: 40 };
 const CACHE_MS = 10 * 60_000;
 const cache = new Map<string, { at: number; data: unknown }>();
 
+// Versión de esta función (para revisar desde fuera que se desplegó la nueva).
+const VERSION = "tomtom-4";
+
 const ORIGINS = ["https://navio-fyj2.vercel.app"];
 const cors = (origin: string | null) => ({
   "access-control-allow-origin": origin && ORIGINS.includes(origin) ? origin : ORIGINS[0],
   "access-control-allow-headers": "authorization, x-client-info, apikey, content-type",
   "access-control-allow-methods": "POST, OPTIONS",
+  "access-control-expose-headers": "x-navio-fn",
+  "x-navio-fn": VERSION,
   vary: "origin",
 });
+
+// Revisión de la llave del servidor: ¿TomTom la acepta para buscar y para
+// rutas? Solo dice "bien" o el código de TomTom (nunca la llave) y se
+// guarda 10 minutos, así no gasta consultas.
+let statusCache: { at: number; data: unknown } | null = null;
+async function keyStatus() {
+  if (statusCache && Date.now() - statusCache.at < 10 * 60_000) return statusCache.data;
+  const check = async (path: string, params: Record<string, string>) => {
+    try {
+      await tomtom(path, params);
+      return "bien";
+    } catch (err) {
+      return err instanceof TomTomError ? err.detail : "sin respuesta";
+    }
+  };
+  const data = {
+    version: VERSION,
+    llave: KEY ? "configurada" : "falta",
+    busqueda: KEY ? await check("/search/2/search/Coatzacoalcos.json", { countrySet: "MX", limit: "1" }) : "sin llave",
+    rutas: KEY ? await check("/routing/1/calculateRoute/18.14000,-94.45000:18.15000,-94.43000/json", { traffic: "false" }) : "sin llave",
+  };
+  statusCache = { at: Date.now(), data };
+  return data;
+}
 
 const num = (v: unknown, min: number, max: number) => {
   const n = Number(v);
@@ -49,7 +78,12 @@ class TomTomError extends Error {
 
 async function tomtom(path: string, params: Record<string, string>) {
   const query = new URLSearchParams({ key: KEY, language: "es-ES", ...params });
-  const res = await fetch(`https://api.tomtom.com${path}?${query}`, { signal: AbortSignal.timeout(15_000) });
+  // Si la llave está limitada al dominio de Navio, TomTom pide que la
+  // petición diga que viene de ahí (desde el servidor no lo dice sola).
+  const res = await fetch(`https://api.tomtom.com${path}?${query}`, {
+    headers: { Referer: `${ORIGINS[0]}/`, Origin: ORIGINS[0] },
+    signal: AbortSignal.timeout(15_000),
+  });
   if (!res.ok) {
     let detail = "";
     try {
@@ -70,11 +104,6 @@ Deno.serve(async (req) => {
   const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers });
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(origin) });
   if (req.method !== "POST") return json(405, { error: "Método no permitido" });
-  if (!KEY) return json(503, { error: "Falta la llave del servidor de TomTom." });
-
-  const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  const { data: auth, error: authError } = await supabase.auth.getUser(token);
-  if (authError || !auth?.user) return json(401, { error: "Inicia sesión en Navio." });
 
   let body: Record<string, unknown> = {};
   try {
@@ -82,6 +111,14 @@ Deno.serve(async (req) => {
   } catch {
     return json(400, { error: "Petición no válida." });
   }
+  // Revisión de la llave (sin sesión): ver keyStatus().
+  if (body.action === "status") return json(200, await keyStatus());
+  if (!KEY) return json(503, { error: "Falta la llave del servidor de TomTom." });
+
+  const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  const { data: auth, error: authError } = await supabase.auth.getUser(token);
+  if (authError || !auth?.user) return json(401, { error: "Inicia sesión en Navio." });
+
   const action = String(body.action ?? "");
   if (!(action in LIMITS)) return json(400, { error: "Acción no válida." });
 
