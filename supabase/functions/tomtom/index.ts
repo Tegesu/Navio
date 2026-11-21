@@ -40,11 +40,27 @@ const num = (v: unknown, min: number, max: number) => {
   return Number.isFinite(n) && n >= min && n <= max ? n : null;
 };
 
+// Error de TomTom con su código y su explicación (para saber qué pasó).
+class TomTomError extends Error {
+  constructor(public kind: "cuota" | "permiso" | "tomtom", public detail: string) {
+    super(kind);
+  }
+}
+
 async function tomtom(path: string, params: Record<string, string>) {
   const query = new URLSearchParams({ key: KEY, language: "es-ES", ...params });
   const res = await fetch(`https://api.tomtom.com${path}?${query}`, { signal: AbortSignal.timeout(15_000) });
-  if (res.status === 403 || res.status === 429) throw new Error("cuota");
-  if (!res.ok) throw new Error("tomtom");
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = String(body?.detailedError?.message ?? body?.errorText ?? body?.error?.description ?? "").slice(0, 160);
+    } catch {
+      // Sin explicación.
+    }
+    const overQuota = res.status === 429 || /over|quota|limit|qps/i.test(detail);
+    throw new TomTomError(overQuota ? "cuota" : res.status === 403 || res.status === 401 ? "permiso" : "tomtom", `${res.status}${detail ? `: ${detail}` : ""}`);
+  }
   return res.json();
 }
 
@@ -111,8 +127,14 @@ Deno.serve(async (req) => {
     if (cache.size > 2000) cache.clear();
     return json(200, data);
   } catch (err) {
-    return json((err as Error).message === "cuota" ? 429 : 502, {
-      error: (err as Error).message === "cuota" ? "Por hoy se acabaron las consultas de mapas. Puedes iniciar el viaje sin ruta." : "TomTom no respondió. Intenta de nuevo.",
-    });
+    const e = err instanceof TomTomError ? err : new TomTomError("tomtom", (err as Error)?.name === "TimeoutError" ? "tardó demasiado" : "sin respuesta");
+    console.error("tomtom", action, e.detail);
+    if (e.kind === "cuota") return json(429, { error: "Por hoy se acabaron las consultas de mapas. Puedes iniciar el viaje sin ruta." });
+    if (e.kind === "permiso") {
+      return json(502, {
+        error: `TomTom rechazó la llave del servidor (${e.detail}). Revisa en developer.tomtom.com que TOMTOM_SERVER_KEY tenga activadas Search API y Routing API y que no esté limitada a un dominio.`,
+      });
+    }
+    return json(502, { error: `TomTom no respondió (${e.detail}). Intenta de nuevo.` });
   }
 });

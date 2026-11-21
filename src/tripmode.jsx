@@ -133,27 +133,47 @@ function TripMap({ me, from, to, stops, routePoints, follow, picking, onPick, on
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recenterKey]);
 
-  return <div ref={box} className={`absolute inset-0 z-0 ${picking ? "cursor-crosshair" : ""}`} />;
+  // La clase del contenedor de Leaflet no se toca (React le borraría las de
+  // Leaflet y el mapa se vería gris): el cursor va en una envoltura.
+  return (
+    <div className={`absolute inset-0 z-0 ${picking ? "[&_.leaflet-container]:cursor-crosshair" : ""}`}>
+      <div ref={box} className="absolute inset-0" />
+    </div>
+  );
 }
 
 /* ---------- Buscar un lugar ---------- */
+// { results, state: idle | loading | done | error, error }
 function usePlaceSearch(text, near) {
-  const [results, setResults] = useState([]);
+  const [found, setFound] = useState({ results: [], state: "idle", error: "" });
+  const nearKey = near ? `${near.lat.toFixed(2)},${near.lng.toFixed(2)}` : "";
   useEffect(() => {
     if (text.trim().length < 3) {
-      setResults([]);
+      setFound({ results: [], state: "idle", error: "" });
       return undefined;
     }
-    const timer = window.setTimeout(() => searchPlaces(text, near).then(setResults, () => setResults([])), 350);
-    return () => window.clearTimeout(timer);
-  }, [text, near]);
-  return results;
+    let alive = true;
+    setFound((prev) => ({ ...prev, state: "loading", error: "" }));
+    const timer = window.setTimeout(() => {
+      searchPlaces(text, near).then(
+        (results) => alive && setFound({ results, state: "done", error: "" }),
+        (err) => alive && setFound({ results: [], state: "error", error: err?.message || "No se pudo buscar." })
+      );
+    }, 350);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text, nearKey]);
+  return found;
 }
 
 function PlaceRow({ icon, placeholder, value, onChange, near, onPickOnMap, picking, mine = null, autoFocus = false }) {
   const [editing, setEditing] = useState(autoFocus);
   const [text, setText] = useState("");
-  const results = usePlaceSearch(editing ? text : "", near);
+  const found = usePlaceSearch(editing ? text : "", near);
+  const results = found.results;
   const close = () => {
     setEditing(false);
     setText("");
@@ -217,7 +237,10 @@ function PlaceRow({ icon, placeholder, value, onChange, near, onPickOnMap, picki
               <span className="min-w-0 flex-1 truncate">{r.label}</span>
             </button>
           ))}
-          {text.trim().length >= 3 && results.length === 0 && <p className="px-3 py-2 text-xs text-slate-400">Buscando…</p>}
+          {found.state === "loading" && <p className="px-3 py-2 text-xs text-slate-400">Buscando…</p>}
+          {found.state === "done" && results.length === 0 && <p className="px-3 py-2 text-xs text-slate-400">Sin resultados. Prueba con otro nombre o elige el punto en el mapa.</p>}
+          {found.state === "error" && <p className="px-3 py-2 text-xs font-medium text-rose-600">No se pudo buscar: {found.error}</p>}
+          {text.trim().length > 0 && text.trim().length < 3 && <p className="px-3 py-2 text-xs text-slate-400">Escribe al menos 3 letras.</p>}
         </div>
       )}
     </div>
@@ -264,6 +287,7 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
   const [mode, setMode] = useState("car");
   const [route, setRoute] = useState(null);
   const [routeState, setRouteState] = useState("idle"); // idle | loading | error
+  const [routeError, setRouteError] = useState("");
   const [picking, setPicking] = useState(null); // "from" | "to" | "stop"
   const [follow, setFollow] = useState(true);
   const [recenter, setRecenter] = useState(0);
@@ -334,13 +358,19 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
       return undefined;
     }
     setRouteState("loading");
+    setRouteError("");
     planVia([from, ...usedStops, to], mode)
       .then((r) => {
         if (!alive) return;
         setRoute(r);
         setRouteState(r ? "idle" : "error");
+        if (!r) setRouteError("No se encontró una ruta entre esos puntos.");
       })
-      .catch(() => alive && setRouteState("error"));
+      .catch((err) => {
+        if (!alive) return;
+        setRouteState("error");
+        setRouteError(err?.message || "No se pudo calcular la ruta.");
+      });
     return () => {
       alive = false;
     };
@@ -546,7 +576,7 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
                 {routeState === "loading" ? (
                   <p className="text-xs text-slate-500">Calculando la ruta con el tráfico de ahora…</p>
                 ) : routeState === "error" ? (
-                  <p className="text-xs text-slate-500">No se encontró una ruta. Puedes iniciar el viaje sin ella.</p>
+                  <p className="text-xs text-slate-500">{routeError || "No se encontró una ruta."} Puedes iniciar el viaje sin ella.</p>
                 ) : (
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-bold text-slate-800">
@@ -730,7 +760,8 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
 // Agregar una parada: escribir el lugar o elegirlo en el mapa.
 function StopAdder({ near, onAdd, onPickOnMap }) {
   const [text, setText] = useState("");
-  const results = usePlaceSearch(text, near);
+  const found = usePlaceSearch(text, near);
+  const results = found.results;
   return (
     <div className="relative">
       <div className="flex gap-1.5">
@@ -749,6 +780,8 @@ function StopAdder({ near, onAdd, onPickOnMap }) {
           <Plus size={13} /> En el mapa
         </button>
       </div>
+      {found.state === "error" && <p className="mt-1 text-[11px] font-medium text-rose-600">No se pudo buscar: {found.error}</p>}
+      {found.state === "done" && results.length === 0 && <p className="mt-1 text-[11px] text-slate-400">Sin resultados para esa búsqueda.</p>}
       {results.length > 0 && (
         <div className="mt-1 max-h-48 overflow-y-auto rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
           {results.map((r, i) => (

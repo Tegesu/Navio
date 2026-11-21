@@ -112,7 +112,10 @@ function PlannerMap({ from, to, routes, selected, traffic, picking, onPick, onSe
 
   return (
     <div className="relative h-64 overflow-hidden rounded-2xl border border-slate-200 sm:h-80">
-      <div ref={box} className={`absolute inset-0 z-0 ${picking ? "cursor-crosshair" : ""}`} />
+      {/* La clase del contenedor de Leaflet no se toca: React le borraría las de Leaflet (mapa gris). */}
+      <div className={`absolute inset-0 z-0 ${picking ? "[&_.leaflet-container]:cursor-crosshair" : ""}`}>
+        <div ref={box} className="absolute inset-0" />
+      </div>
       {picking && (
         <p className="pointer-events-none absolute inset-x-2 top-2 z-[500] rounded-xl bg-slate-900/80 px-3 py-1.5 text-center text-[11px] font-semibold text-white">
           Toca el mapa para elegir {picking === "from" ? "la salida" : "el destino"}
@@ -126,16 +129,21 @@ function PlaceField({ label, value, onChange, onPickOnMap, picking, near, extra,
   const [text, setText] = useState("");
   const [manual, setManual] = useState(false);
   const [results, setResults] = useState([]);
+  const [searchError, setSearchError] = useState("");
   const timer = useRef(null);
 
   useEffect(() => {
     window.clearTimeout(timer.current);
+    setSearchError("");
     if (text.trim().length < 3) {
       setResults([]);
       return undefined;
     }
     timer.current = window.setTimeout(() => {
-      searchPlaces(text, near).then(setResults, () => setResults([]));
+      searchPlaces(text, near).then(setResults, (err) => {
+        setResults([]);
+        setSearchError(err?.message || "No se pudo buscar.");
+      });
     }, 350);
     return () => window.clearTimeout(timer.current);
   }, [text, near]);
@@ -186,6 +194,7 @@ function PlaceField({ label, value, onChange, onPickOnMap, picking, near, extra,
           {extra}
         </div>
       )}
+      {searchError && !value && <p className="mt-1 text-[11px] font-medium text-rose-600">No se pudo buscar: {searchError}</p>}
       {results.length > 0 && !value && (
         <ul className="absolute inset-x-0 top-full z-[600] mt-1 max-h-56 overflow-y-auto rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
           {results.map((r, i) => (
