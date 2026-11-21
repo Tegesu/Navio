@@ -110,6 +110,17 @@ const db = {
     { id: 1, channelId: 1, companyId: COMPANY, senderId: "u3", senderName: "Carlos Ruiz", body: "Buenos días, ya salí de Minatitlán.", createdAt: ago(2.5), deletedAt: null },
     { id: 2, channelId: 1, companyId: COMPANY, senderId: isMember ? "u1" : "u2", senderName: isMember ? "Johana Viras" : "Vania Usuario", body: "Enterados, buen viaje.", createdAt: ago(2), deletedAt: null },
     { id: 3, channelId: 2, companyId: COMPANY, senderId: "u1", senderName: "Johana Viras", body: "¿Me pasas la factura del hotel?", createdAt: ago(6), deletedAt: null },
+    // ?chatdemo: llamadas con su resultado y notas de voz.
+    ...(params.has("chatdemo")
+      ? [
+          { id: 4, channelId: 2, companyId: COMPANY, senderId: "u2", senderName: "Vania Usuario", kind: "call", body: "Llamada de voz · 4:29", attachment: { call: "audio", status: "ended", duration: 269, joined: ["u2", "u1"] }, createdAt: ago(5), deletedAt: null },
+          { id: 5, channelId: 2, companyId: COMPANY, senderId: "u1", senderName: "Johana Viras", kind: "call", body: "Videollamada perdida", attachment: { call: "video", status: "missed", joined: ["u1"] }, createdAt: ago(4.5), deletedAt: null },
+          { id: 6, channelId: 2, companyId: COMPANY, senderId: "u2", senderName: "Vania Usuario", kind: "call", body: "Llamada de voz perdida", attachment: { call: "audio", status: "declined", joined: ["u2"] }, createdAt: ago(4), deletedAt: null },
+          { id: 7, channelId: 2, companyId: COMPANY, senderId: "u1", senderName: "Johana Viras", kind: "voice", body: "", attachment: { path: `${COMPANY}/2/123e4567-e89b-12d3-a456-426614174000.webm`, mime: "audio/webm", duration: 14.2, wave: "36adhkmprtvtrpmkhda6369cfilosvusqnkhec96" }, createdAt: ago(3), deletedAt: null },
+          { id: 8, channelId: 2, companyId: COMPANY, senderId: "u2", senderName: "Vania Usuario", kind: "voice", body: "", attachment: { path: `${COMPANY}/2/223e4567-e89b-12d3-a456-426614174000.webm`, mime: "audio/webm", duration: 3.2 }, createdAt: ago(2.8), deletedAt: null },
+          { id: 9, channelId: 2, companyId: COMPANY, senderId: "u1", senderName: "Johana Viras", kind: "call", body: "Llamada de voz perdida", attachment: { call: "audio", status: "missed", joined: ["u1"] }, createdAt: ago(2.6), deletedAt: null },
+        ]
+      : []),
   ],
   warranties: [
     { id: 1, companyId: COMPANY, vehicleId: 1, unit: "Unidad 12", item: "Batería LTH", kind: "battery", vendor: "AutoZone", startDate: "2026-01-10", endDate: iso(new Date(Date.now() + 20 * 864e5)), kmStart: 140000, kmLimit: null, status: "active", createdBy: "u1", createdAt: ago(300) },
@@ -334,7 +345,7 @@ function finishIfDone(callId, by) {
   const msg = {
     id: nextId++, channelId: call.channelId, companyId: COMPANY, senderId: call.callerId, senderName: call.callerName, kind: "call",
     body: seconds != null ? `${label} · ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}` : `${label} perdida`,
-    attachment: { call: call.kind, status, ...(seconds != null ? { duration: seconds } : {}), callId: call.id, ...(people > 2 ? { people } : {}) },
+    attachment: { call: call.kind, status, ...(seconds != null ? { duration: seconds } : {}), callId: call.id, ...(people > 2 ? { people } : {}), joined: list.filter((p) => p.joinedAt).map((p) => p.userId) },
     replyToId: null, forwarded: false, editedAt: null, pinnedAt: null, createdAt: nowIso(), deletedAt: null,
   };
   db.chat_messages.push(msg);
@@ -409,7 +420,108 @@ peer.hangUp = (userId = peer.users[0]) => {
 };
 peer.decline = () => peer.hangUp();
 
+// ---- Agenda (versión de juguete de la v32) ----
+const agendaEvents = [];
+const agendaAttendees = [];
+window.__agenda = { events: agendaEvents, attendees: agendaAttendees };
+const AG_STEP = { daily: 1, weekdays: 1, weekly: 7, biweekly: 14 };
+function agendaOccurrences(e, from, to) {
+  const start = new Date(e.startsAt);
+  const out = [];
+  if (e.recurrence === "none") {
+    if (start >= from && start < to) out.push(start);
+    return out;
+  }
+  for (let n = 0; n < 800; n += 1) {
+    const d = new Date(start);
+    if (e.recurrence === "monthly") d.setMonth(d.getMonth() + n);
+    else if (e.recurrence === "yearly") d.setFullYear(d.getFullYear() + n);
+    else d.setDate(d.getDate() + n * AG_STEP[e.recurrence]);
+    if (d >= to || (e.recurUntil && d > new Date(e.recurUntil))) break;
+    if (d >= from && (e.recurrence !== "weekdays" || (d.getDay() !== 0 && d.getDay() !== 6))) out.push(d);
+  }
+  return out;
+}
+const canSeeEvent = (e) => e.visibility === "company" || e.createdBy === ME || agendaAttendees.some((a) => a.eventId === e.id && a.userId === ME);
+function seedAgenda() {
+  const at = (days, h, m = 0) => {
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+    d.setHours(h, m, 0, 0);
+    return d.toISOString();
+  };
+  const add = (e, people = []) => {
+    const ev = { id: nextId++, companyId: COMPANY, createdBy: "u1", createdByName: "Johana Viras", kind: "meeting", description: null, endsAt: null, allDay: false, timeZone: "America/Mexico_City", location: null, channelId: null, taskId: null, color: "blue", priority: "normal", recurrence: "none", recurUntil: null, reminders: [10], visibility: "participants", status: "scheduled", ...e };
+    agendaEvents.push(ev);
+    for (const [userId, response] of people) agendaAttendees.push({ eventId: ev.id, userId, response });
+    return ev;
+  };
+  const soon = new Date(Date.now() + 25 * 60000);
+  add({ title: "Revisión de bitácoras", kind: "review", startsAt: soon.toISOString(), endsAt: new Date(soon.getTime() + 30 * 60000).toISOString(), color: "violet", location: "Patio 2", channelId: 2 }, [["u2", "pending"], ["u3", "accepted"]]);
+  add({ title: "Junta semanal de operación", startsAt: at(1, 9), endsAt: at(1, 10), recurrence: "weekly", channelId: 3, color: "blue", priority: "high", visibility: "company" }, [["u2", "accepted"], ["u3", "pending"]]);
+  add({ title: "Visita a proveedor de llantas", kind: "visit", startsAt: at(3, 11, 30), endsAt: at(3, 13), color: "amber", location: "Coatzacoalcos" }, [["u2", "tentative"]]);
+  add({ title: "Verificar seguros de la flota", kind: "task", startsAt: at(6, 0), allDay: true, color: "emerald" }, [["u2", "pending"]]);
+}
+seedAgenda();
+
 const rpcs = {
+  agenda_list({ from_ts, to_ts }) {
+    const from = new Date(from_ts);
+    const to = new Date(to_ts);
+    const rows = [];
+    for (const e of agendaEvents.filter(canSeeEvent)) {
+      const length = e.endsAt ? Date.parse(e.endsAt) - Date.parse(e.startsAt) : 0;
+      for (const at of agendaOccurrences(e, new Date(from.getTime() - length), to)) {
+        rows.push({
+          ...e, startsAt: at.toISOString(), endsAt: e.endsAt ? new Date(at.getTime() + length).toISOString() : null, seriesStartsAt: e.startsAt, seriesEndsAt: e.endsAt,
+          myResponse: agendaAttendees.find((a) => a.eventId === e.id && a.userId === ME)?.response ?? null,
+          attendees: agendaAttendees.filter((a) => a.eventId === e.id).map((a) => ({ userId: a.userId, name: db.profiles.find((p) => p.id === a.userId)?.fullName, response: a.response })),
+          canEdit: e.createdBy === ME || (e.visibility === "company" && db.profiles.find((p) => p.id === ME).companyRole === "admin"),
+        });
+      }
+    }
+    return rows.sort((a, b) => a.startsAt.localeCompare(b.startsAt));
+  },
+  agenda_save({ payload }) {
+    if (!String(payload.title ?? "").trim()) throw new Error("Escribe un título.");
+    if (payload.endsAt && payload.endsAt < payload.startsAt) throw new Error("La hora de fin debe ser después del inicio (y en menos de 31 días).");
+    const fields = {
+      title: payload.title.trim(), kind: payload.kind, description: payload.description || null, startsAt: payload.startsAt, endsAt: payload.endsAt || null, allDay: !!payload.allDay,
+      timeZone: payload.timeZone, location: payload.location || null, channelId: payload.channelId, taskId: payload.taskId, color: payload.color, priority: payload.priority,
+      recurrence: payload.recurrence, recurUntil: payload.recurrence === "none" ? null : payload.recurUntil, reminders: (payload.reminders ?? []).slice(0, 6), visibility: payload.visibility,
+    };
+    let ev;
+    if (payload.id) {
+      ev = agendaEvents.find((e) => e.id === payload.id);
+      if (!ev || ev.createdBy !== ME) throw new Error("Solo quien creó el evento lo puede cambiar.");
+      Object.assign(ev, fields);
+    } else {
+      ev = { id: nextId++, companyId: COMPANY, createdBy: ME, createdByName: db.profiles.find((p) => p.id === ME).fullName, status: "scheduled", ...fields };
+      agendaEvents.push(ev);
+    }
+    const people = [...new Set((payload.attendees ?? []).filter((id) => id !== ME && db.profiles.some((p) => p.id === id)))];
+    for (let i = agendaAttendees.length - 1; i >= 0; i -= 1) if (agendaAttendees[i].eventId === ev.id && !people.includes(agendaAttendees[i].userId)) agendaAttendees.splice(i, 1);
+    for (const userId of people) if (!agendaAttendees.some((a) => a.eventId === ev.id && a.userId === userId)) agendaAttendees.push({ eventId: ev.id, userId, response: "pending" });
+    return ev.id;
+  },
+  agenda_respond({ target_event, answer }) {
+    const a = agendaAttendees.find((x) => x.eventId === target_event && x.userId === ME);
+    if (!a) throw new Error("No estás invitado a este evento.");
+    a.response = answer;
+    return null;
+  },
+  agenda_set_status({ target_event, new_status }) {
+    const e = agendaEvents.find((x) => x.id === target_event);
+    if (!e || e.createdBy !== ME) throw new Error("Solo quien creó el evento lo puede cambiar.");
+    e.status = new_status;
+    return null;
+  },
+  agenda_delete({ target_event }) {
+    const i = agendaEvents.findIndex((x) => x.id === target_event);
+    if (i < 0 || agendaEvents[i].createdBy !== ME) throw new Error("Solo quien creó el evento lo puede borrar.");
+    agendaEvents.splice(i, 1);
+    return null;
+  },
   call_open({ target_channel, call_kind }) {
     const ch = db.chat_channels.find((c) => c.id === target_channel && (c.kind === "direct" || c.kind === "group"));
     if (!ch) throw new Error("Solo se puede llamar desde una conversación directa o de grupo.");
@@ -554,6 +666,7 @@ const rpcs = {
         return {
           id: c.id, kind: c.kind, name: c.name, createdBy: c.createdBy, otherUserId: otherId ?? null, otherUserName: db.profiles.find((p) => p.id === otherId)?.fullName ?? null,
           lastMessageAt: c.lastMessageAt, lastMessage: last?.body ?? null, lastSender: last?.senderName ?? null, lastKind: last?.kind ?? "text",
+          lastSenderId: last?.senderId ?? null, lastAttachment: last?.kind === "call" ? last.attachment : null,
           unread: msgs.filter((m) => m.senderId !== ME && m.createdAt > (mine?.lastReadAt ?? "")).length,
           members: c.kind === "general" ? db.profiles.length : db.chat_members.filter((m) => m.channelId === c.id).length,
           pinnedAt: mine?.pinnedAt ?? null,

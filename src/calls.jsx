@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, Link as LinkIcon, Maximize2, Mic, MicOff, MoreVertical, Phone, PhoneOff, ScreenShare, SwitchCamera, UserPlus, Video, VideoOff } from "lucide-react";
+import { ChevronDown, Link as LinkIcon, Maximize2, Mic, MicOff, Phone, PhoneOff, ScreenShare, SwitchCamera, UserPlus, Video, VideoOff } from "lucide-react";
 import { supabase, useAuth, useToast, avatarUrl, Modal } from "./NavioDashboard.jsx";
 import { usePermissionGate } from "./permissions.jsx";
 import { useBackLayer } from "./history.js";
@@ -280,6 +280,7 @@ export function CallProvider({ children }) {
         updatePeer(id, { tick: Date.now() });
       });
       event.track.addEventListener("unmute", () => updatePeer(id, { tick: Date.now() }));
+      event.track.addEventListener("mute", () => updatePeer(id, { tick: Date.now() }));
       updatePeer(id, { stream: remote, tick: Date.now() });
     });
     pc.addEventListener("connectionstatechange", () => onPeerState(id, pc));
@@ -428,7 +429,7 @@ export function CallProvider({ children }) {
       phase: "preparing",
       view: "float",
       muted: false,
-      cameraOff: false,
+      cameraOff: kind !== "video",
       facing: "user",
       sharing: false,
     });
@@ -500,7 +501,7 @@ export function CallProvider({ children }) {
       phase: "incoming",
       view: "float",
       muted: false,
-      cameraOff: false,
+      cameraOff: info.kind !== "video",
       facing: "user",
       sharing: false,
     });
@@ -591,7 +592,7 @@ export function CallProvider({ children }) {
       phase: "joining",
       view: "float",
       muted: false,
-      cameraOff: false,
+      cameraOff: info.kind !== "video",
       facing: "user",
       sharing: false,
     });
@@ -605,33 +606,76 @@ export function CallProvider({ children }) {
     track.enabled = !track.enabled;
     patchCall({ muted: !track.enabled });
   }
-  function toggleCamera() {
-    const track = cameraTrack.current;
-    if (!track) return;
-    track.enabled = !track.enabled;
-    patchCall({ cameraOff: !track.enabled });
-  }
+  // Lo que se manda como video a cada persona: la cámara, la pantalla o nada.
+  // Se usa siempre el mismo canal de video; si cambia si se manda o no, se
+  // vuelve a negociar la conexión (la otra persona ve aparecer o irse la imagen).
   async function replaceVideo(track) {
     for (const [id, entry] of peers.current) {
-      const sender = entry.pc.getSenders().find((s) => s.track?.kind === "video");
-      if (sender) await sender.replaceTrack(track);
-      else if (track) {
-        entry.pc.addTrack(track, localRef.current);
+      const pc = entry.pc;
+      const tr = pc.getTransceivers().find((t) => t.currentDirection !== "stopped" && t.receiver?.track?.kind === "video");
+      if (tr) {
+        const was = tr.direction;
+        await tr.sender.replaceTrack(track ?? null);
+        const next = track ? (was === "recvonly" ? "sendrecv" : was === "inactive" ? "sendonly" : was) : was === "sendrecv" ? "recvonly" : was === "sendonly" ? "inactive" : was;
+        if (next !== was) {
+          tr.direction = next;
+          await sendOffer(id);
+        }
+      } else if (track) {
+        pc.addTrack(track, localRef.current);
         await sendOffer(id);
       }
     }
   }
+  async function setCamera(on) {
+    const current = callRef.current;
+    const media = localRef.current;
+    if (!current || !media || current.phase === "ended") return;
+    if (!on) {
+      const track = cameraTrack.current;
+      cameraTrack.current = null;
+      if (track) {
+        track.stop(); // se apaga la luz de la cámara
+        media.removeTrack(track);
+      }
+      if (!screenTrack.current) await replaceVideo(null);
+      setLocalStream(new MediaStream(media.getTracks()));
+      patchCall({ cameraOff: true });
+      return;
+    }
+    try {
+      const fresh = await navigator.mediaDevices.getUserMedia({ video: constraints("video", current.facing).video });
+      const track = fresh.getVideoTracks()[0];
+      if (!alive(current.key)) {
+        track.stop();
+        return;
+      }
+      media.addTrack(track);
+      cameraTrack.current = track;
+      if (!screenTrack.current) await replaceVideo(track);
+      setLocalStream(new MediaStream(media.getTracks()));
+      patchCall({ cameraOff: false, kind: "video" });
+    } catch (err) {
+      if (err?.name === "NotAllowedError" || err?.name === "SecurityError") cam.explain("denied", () => setCamera(true));
+      else showToast("No se pudo prender la cámara.");
+    }
+  }
+  function toggleCamera() {
+    const current = callRef.current;
+    if (!current || current.phase === "ended" || current.phase === "incoming") return;
+    if (cameraTrack.current) setCamera(false);
+    else cam.run(() => setCamera(true));
+  }
   async function switchCamera() {
     const current = callRef.current;
     const media = localRef.current;
-    if (!current || !media) return;
+    if (!current || !media || !cameraTrack.current) return;
     const facing = current.facing === "user" ? "environment" : "user";
     const old = cameraTrack.current;
     try {
       old?.stop();
       const fresh = await navigator.mediaDevices.getUserMedia({ video: constraints("video", facing).video });
       const track = fresh.getVideoTracks()[0];
-      track.enabled = !current.cameraOff;
       if (old) media.removeTrack(old);
       media.addTrack(track);
       cameraTrack.current = track;
@@ -649,15 +693,8 @@ export function CallProvider({ children }) {
       const track = screenTrack.current;
       screenTrack.current = null;
       track.stop();
-      if (cameraTrack.current) await replaceVideo(cameraTrack.current);
-      else
-        for (const [id, entry] of peers.current) {
-          const sender = entry.pc.getSenders().find((s) => s.track === track);
-          if (sender) {
-            entry.pc.removeTrack(sender);
-            await sendOffer(id);
-          }
-        }
+      // Vuelve la cámara si estaba prendida; si no, deja de mandarse imagen.
+      await replaceVideo(cameraTrack.current ?? null);
       setLocalStream(localRef.current ? new MediaStream(localRef.current.getTracks()) : null);
       patchCall({ sharing: false });
       return;
@@ -1009,23 +1046,30 @@ function RingingAvatar({ name, size = "h-24 w-24", ringing = false }) {
   );
 }
 
-function CallButton({ label, onClick, tone = "neutral", small = false, children }) {
+function CallButton({ label, onClick, tone = "neutral", small = false, caption = "", children }) {
   const tones = {
     neutral: "bg-[rgb(255_255_255/0.16)] text-white hover:bg-[rgb(255_255_255/0.26)]",
     active: "bg-white text-slate-900",
     danger: "bg-red-600 text-white hover:bg-red-700",
     accept: "bg-emerald-500 text-white hover:bg-emerald-600",
   };
-  return (
+  const button = (
     <button
       type="button"
       onClick={onClick}
       aria-label={label}
       title={label}
-      className={`flex shrink-0 items-center justify-center rounded-full shadow-lg transition duration-200 hover:scale-105 active:scale-95 ${small ? "h-10 w-10" : "h-14 w-14"} ${tones[tone]}`}
+      className={`flex shrink-0 items-center justify-center rounded-full shadow-lg transition duration-200 hover:scale-105 active:scale-95 ${small ? "h-10 w-10" : "h-12 w-12 sm:h-14 sm:w-14"} ${tones[tone]}`}
     >
       {children}
     </button>
+  );
+  if (!caption) return button;
+  return (
+    <span className="flex w-14 flex-col items-center gap-1 sm:w-16">
+      {button}
+      <span className="max-w-full truncate text-[10px] text-[rgb(255_255_255/0.8)]">{caption}</span>
+    </span>
   );
 }
 
@@ -1038,13 +1082,18 @@ function statusText(call, elapsed) {
   return call.endText;
 }
 
+// La imagen de alguien solo cuenta si de verdad llega (no si apagó la cámara).
+const liveVideo = (stream) => !!stream?.getVideoTracks().some((t) => t.readyState === "live" && !t.muted);
+
 function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, onHangUp, onMute, onCamera, onSwitch, onScreen, onShareLink, onInvite, onView }) {
   const [, tick] = useState(0);
-  const [menu, setMenu] = useState(false);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [hover, setHover] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [revealed, setRevealed] = useState(false);
+  const revealTimer = useRef(null);
   const drag = useRef(null);
   const entered = useEntered();
-  const video = call.kind === "video" || call.sharing;
   const full = call.view === "full" && call.phase !== "ended";
   const touch = typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches;
   useEffect(() => {
@@ -1052,58 +1101,39 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
     const timer = window.setInterval(() => tick((n) => n + 1), 1000);
     return () => window.clearInterval(timer);
   }, [call.phase]);
+  useEffect(() => () => window.clearTimeout(revealTimer.current), []);
   // "Atrás" en el teléfono: de pantalla completa a la ventana flotante.
   useBackLayer(full, () => onView("float"));
   const elapsed = call.since ? callDuration((Date.now() - call.since) / 1000) : "";
   const status = statusText(call, elapsed);
   const joined = others.filter((p) => p.status === "joined");
   const ringing = call.phase === "incoming" || call.phase === "outgoing";
-  const withVideo = joined.filter((p) => peerView[p.userId]?.stream?.getVideoTracks().some((t) => t.readyState === "live"));
+  const withVideo = joined.filter((p) => liveVideo(peerView[p.userId]?.stream));
   const primary = withVideo[0] ?? null;
+  const cameraOn = !call.cameraOff;
+  const myVideo = (cameraOn || call.sharing) && liveVideo(localStream);
   // Con varias personas dentro, el título son sus nombres.
   const shownTitle = joined.length > 1 ? joined.map((p) => String(p.userName || "Alguien").split(" ")[0]).join(", ") : call.title;
 
   // Todo el sonido de los demás (sigue aunque la ventana cambie).
   const audios = joined.map((p) => peerView[p.userId]?.stream && <RemoteAudio key={p.userId} stream={peerView[p.userId].stream} />);
 
-  const menuItems = [
-    call.id && call.phase !== "incoming" && { label: "Agregar personas", icon: UserPlus, run: onInvite },
-    call.id && call.phase !== "incoming" && { label: "Compartir enlace de la llamada", icon: LinkIcon, run: onShareLink },
-    onScreen && call.phase === "active" && { label: call.sharing ? "Dejar de compartir pantalla" : "Compartir pantalla", icon: ScreenShare, run: onScreen },
-    call.kind === "video" && touch && { label: "Girar cámara", icon: SwitchCamera, run: onSwitch },
-  ].filter(Boolean);
-
-  const controls = (small) =>
-    call.phase === "incoming" ? (
-      <div className={`flex items-center ${small ? "gap-3" : "justify-around"}`}>
-        <CallButton label="Rechazar" onClick={onDecline} tone="danger" small={small}>
-          <PhoneOff size={small ? 17 : 22} />
+  const incomingControls = (small) => (
+    <div className={`flex items-center ${small ? "gap-4" : "justify-around"}`}>
+      <CallButton label="Rechazar" onClick={onDecline} tone="danger" small={small}>
+        <PhoneOff size={small ? 17 : 22} />
+      </CallButton>
+      <span className={small ? "" : "animate-bounce"}>
+        <CallButton label="Contestar" onClick={onAccept} tone="accept" small={small}>
+          {call.kind === "video" ? <Video size={small ? 17 : 22} /> : <Phone size={small ? 17 : 22} />}
         </CallButton>
-        <span className={small ? "" : "animate-bounce"}>
-          <CallButton label="Contestar" onClick={onAccept} tone="accept" small={small}>
-            {call.kind === "video" ? <Video size={small ? 17 : 22} /> : <Phone size={small ? 17 : 22} />}
-          </CallButton>
-        </span>
-      </div>
-    ) : call.phase === "ended" ? null : (
-      <div className={`flex items-center justify-center ${small ? "gap-2" : "gap-4"}`}>
-        <CallButton label={call.muted ? "Activar micrófono" : "Silenciar"} onClick={onMute} tone={call.muted ? "active" : "neutral"} small={small}>
-          {call.muted ? <MicOff size={small ? 16 : 21} /> : <Mic size={small ? 16 : 21} />}
-        </CallButton>
-        {call.kind === "video" && (
-          <CallButton label={call.cameraOff ? "Prender cámara" : "Apagar cámara"} onClick={onCamera} tone={call.cameraOff ? "active" : "neutral"} small={small}>
-            {call.cameraOff ? <VideoOff size={small ? 16 : 21} /> : <Video size={small ? 16 : 21} />}
-          </CallButton>
-        )}
-        <CallButton label="Colgar" onClick={onHangUp} tone="danger" small={small}>
-          <PhoneOff size={small ? 17 : 22} />
-        </CallButton>
-      </div>
-    );
+      </span>
+    </div>
+  );
 
   const tile = (p, big) => {
     const view = peerView[p.userId] ?? {};
-    const hasVideo = view.stream?.getVideoTracks().some((t) => t.readyState === "live");
+    const hasVideo = liveVideo(view.stream);
     return (
       <div key={p.userId} className={`relative flex items-center justify-center overflow-hidden rounded-2xl bg-slate-900 ${big ? "min-h-0" : ""}`}>
         {hasVideo && <LiveVideo stream={view.stream} className="absolute inset-0 h-full w-full" />}
@@ -1116,25 +1146,41 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
     );
   };
 
-  // ---- Ventana flotante ----
+  // ---- Ventana flotante (cuadrada) ----
   if (!full) {
+    // Los botones aparecen al pasar el cursor (o al tocar, en el teléfono).
+    const shown = call.phase === "incoming" || hover || focused || revealed;
+    const reveal = () => {
+      setRevealed(true);
+      window.clearTimeout(revealTimer.current);
+      revealTimer.current = window.setTimeout(() => setRevealed(false), 4000);
+    };
     const onPointerDown = (e) => {
-      if (e.target.closest("button")) return;
-      drag.current = { x: e.clientX - offset.x, y: e.clientY - offset.y };
-      e.currentTarget.setPointerCapture?.(e.pointerId);
+      if (e.target.closest("button")) {
+        if (e.pointerType !== "mouse") reveal();
+        return;
+      }
+      drag.current = { sx: e.clientX, sy: e.clientY, ox: offset.x, oy: offset.y, rect: e.currentTarget.getBoundingClientRect(), moved: false };
+      try {
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      } catch {
+        // Sin un dedo o cursor activo no hay nada que capturar.
+      }
     };
     const onPointerMove = (e) => {
-      if (!drag.current) return;
-      const maxX = 0;
-      const minX = -(window.innerWidth - 300);
-      const maxY = 0;
-      const minY = -(window.innerHeight - 200);
-      setOffset({ x: Math.min(maxX, Math.max(minX, e.clientX - drag.current.x)), y: Math.min(maxY, Math.max(minY, e.clientY - drag.current.y)) });
+      const d = drag.current;
+      if (!d) return;
+      const dx = Math.min(window.innerWidth - 8 - d.rect.right, Math.max(8 - d.rect.left, e.clientX - d.sx));
+      const dy = Math.min(window.innerHeight - 8 - d.rect.bottom, Math.max(8 - d.rect.top, e.clientY - d.sy));
+      if (Math.abs(dx) + Math.abs(dy) > 4) d.moved = true;
+      setOffset({ x: d.ox + dx, y: d.oy + dy });
     };
-    const onPointerUp = () => {
+    const onPointerUp = (e) => {
+      const d = drag.current;
       drag.current = null;
+      if (d && !d.moved && e.pointerType !== "mouse") reveal();
     };
-    const showVideo = video && call.phase !== "incoming" && call.phase !== "ended";
+    const showVideo = call.phase !== "incoming" && call.phase !== "ended" && (!!primary || myVideo);
     return (
       <>
         {audios}
@@ -1144,48 +1190,90 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
+          onMouseEnter={() => setHover(true)}
+          onMouseLeave={() => setHover(false)}
+          onFocusCapture={() => setFocused(true)}
+          onBlurCapture={(e) => !e.currentTarget.contains(e.relatedTarget) && setFocused(false)}
           style={{ translate: `${offset.x}px ${offset.y}px` }}
-          className={`fixed bottom-[calc(100px+var(--safe-bottom))] right-3 z-[3000] w-[min(92vw,300px)] touch-none select-none overflow-hidden rounded-2xl bg-slate-950 text-white shadow-2xl ring-1 ring-[rgb(255_255_255/0.08)] transition-[opacity,transform] duration-300 lg:bottom-5 lg:right-5 ${entered ? "scale-100 opacity-100" : "scale-90 opacity-0"}`}
+          className={`fixed bottom-[calc(100px+var(--safe-bottom))] right-3 z-[3000] aspect-square w-[min(58vw,230px)] touch-none select-none overflow-hidden rounded-3xl bg-slate-950 text-white shadow-2xl ring-1 ring-[rgb(255_255_255/0.08)] transition-[opacity,transform] duration-300 sm:w-[260px] lg:bottom-5 lg:right-5 lg:w-[280px] ${entered ? "scale-100 opacity-100" : "scale-90 opacity-0"}`}
         >
-          {showVideo && (
-            <div className="relative h-40 w-full bg-slate-900">
+          {/* Fondo: la imagen de la otra persona, la mía o la foto con ondas */}
+          {showVideo ? (
+            <>
               {primary ? (
                 <LiveVideo stream={peerView[primary.userId].stream} className="absolute inset-0 h-full w-full" />
               ) : (
-                localStream && <LiveVideo stream={localStream} mirrored={call.facing === "user" && !call.sharing} contain={call.sharing} className="absolute inset-0 h-full w-full" />
+                <LiveVideo stream={localStream} mirrored={call.facing === "user" && !call.sharing} contain={call.sharing} className="absolute inset-0 h-full w-full" />
               )}
-              {primary && localStream && !call.cameraOff && (
-                <LiveVideo stream={localStream} mirrored={call.facing === "user" && !call.sharing} className="absolute bottom-2 right-2 h-16 w-12 rounded-lg ring-1 ring-[rgb(255_255_255/0.3)]" />
+              {primary && myVideo && (
+                <LiveVideo stream={localStream} mirrored={call.facing === "user" && !call.sharing} className="absolute right-2.5 top-14 h-20 w-14 rounded-xl ring-1 ring-[rgb(255_255_255/0.3)]" />
               )}
-              {!primary && call.phase !== "active" && (
-                <div className="absolute inset-0 flex items-center justify-center bg-[rgb(2_6_23/0.35)]">
-                  <RingingAvatar name={call.title} size="h-14 w-14" ringing={ringing} />
-                </div>
-              )}
-            </div>
-          )}
-          <div className="flex items-center gap-2.5 px-3 pb-3 pt-2.5">
-            {!showVideo && <RingingAvatar name={call.title} size="h-10 w-10" ringing={ringing} />}
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-sm font-bold">{shownTitle}</p>
-              <p className="truncate text-[11px] text-[rgb(255_255_255/0.7)]">
+              <div className="absolute inset-x-0 top-0 bg-gradient-to-b from-[rgb(0_0_0/0.6)] to-transparent px-3 pb-6 pt-3">
+                <p className="truncate pr-9 text-sm font-bold drop-shadow">{shownTitle}</p>
+                <p className="truncate text-[11px] text-[rgb(255_255_255/0.8)]">{status}</p>
+              </div>
+            </>
+          ) : (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-[radial-gradient(120%_90%_at_50%_0%,rgb(var(--bg-blue-600)/0.35),transparent_70%)] px-4 pb-6 text-center">
+              <RingingAvatar name={call.title} size="h-16 w-16 sm:h-20 sm:w-20" ringing={ringing} />
+              <p className="mt-3 max-w-full truncate text-sm font-bold">{shownTitle}</p>
+              <p className="max-w-full truncate text-[11px] text-[rgb(255_255_255/0.7)]">
                 {status}
                 {joined.length > 1 ? ` · ${joined.length + 1} personas` : ""}
               </p>
             </div>
-            {call.phase !== "ended" && call.phase !== "incoming" && (
-              <button type="button" onClick={() => onView("full")} aria-label="Pantalla completa" title="Pantalla completa" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[rgb(255_255_255/0.12)] hover:bg-[rgb(255_255_255/0.22)]">
-                <Maximize2 size={14} />
-              </button>
-            )}
-          </div>
-          {call.phase !== "ended" && <div className="px-3 pb-3">{controls(true)}</div>}
+          )}
+
+          {call.phase !== "ended" && call.phase !== "incoming" && (
+            <button
+              type="button"
+              onClick={() => onView("full")}
+              aria-label="Pantalla completa"
+              title="Pantalla completa"
+              className={`absolute right-2.5 top-2.5 flex h-8 w-8 items-center justify-center rounded-full bg-[rgb(0_0_0/0.35)] backdrop-blur transition-opacity duration-200 hover:bg-[rgb(0_0_0/0.55)] ${shown ? "opacity-100" : "pointer-events-none opacity-0"}`}
+            >
+              <Maximize2 size={14} />
+            </button>
+          )}
+
+          {/* Botones: solo silenciar, cámara y colgar (o contestar/rechazar) */}
+          {call.phase !== "ended" && (
+            <div
+              className={`absolute inset-x-0 bottom-0 flex justify-center bg-gradient-to-t from-[rgb(0_0_0/0.7)] to-transparent px-3 pb-3 pt-10 transition-all duration-200 ${shown ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-2 opacity-0"}`}
+            >
+              {call.phase === "incoming" ? (
+                incomingControls(true)
+              ) : (
+                <div className="flex items-center gap-3">
+                  <CallButton label={call.muted ? "Activar micrófono" : "Silenciar"} onClick={onMute} tone={call.muted ? "active" : "neutral"} small>
+                    {call.muted ? <MicOff size={16} /> : <Mic size={16} />}
+                  </CallButton>
+                  <CallButton label={cameraOn ? "Apagar cámara" : "Prender cámara"} onClick={onCamera} small>
+                    {cameraOn ? <Video size={16} /> : <VideoOff size={16} />}
+                  </CallButton>
+                  <CallButton label="Colgar" onClick={onHangUp} tone="danger" small>
+                    <PhoneOff size={17} />
+                  </CallButton>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </>
     );
   }
 
-  // ---- Pantalla completa ----
+  // ---- Pantalla completa: todas las opciones como botones ----
+  const buttons = [
+    { key: "mic", label: call.muted ? "Activar micrófono" : "Silenciar", caption: call.muted ? "Micrófono" : "Silenciar", tone: call.muted ? "active" : "neutral", run: onMute, icon: call.muted ? MicOff : Mic },
+    { key: "cam", label: cameraOn ? "Apagar cámara" : "Prender cámara", caption: "Cámara", run: onCamera, icon: cameraOn ? Video : VideoOff },
+    touch && cameraOn && !call.sharing && { key: "flip", label: "Girar cámara", caption: "Girar", run: onSwitch, icon: SwitchCamera },
+    onScreen && call.phase === "active" && { key: "screen", label: call.sharing ? "Dejar de compartir pantalla" : "Compartir pantalla", caption: "Pantalla", tone: call.sharing ? "active" : "neutral", run: onScreen, icon: ScreenShare },
+    call.id && { key: "add", label: "Agregar personas", caption: "Agregar", run: onInvite, icon: UserPlus },
+    call.id && { key: "link", label: "Compartir enlace de la llamada", caption: "Enlace", run: onShareLink, icon: LinkIcon },
+    { key: "end", label: "Colgar", caption: "Colgar", tone: "danger", run: onHangUp, icon: PhoneOff },
+  ].filter(Boolean);
+
   const gridCols = joined.length <= 1 ? "grid-cols-1" : joined.length <= 4 ? "grid-cols-2" : "grid-cols-3";
   return (
     <>
@@ -1196,39 +1284,13 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
         className={`fixed inset-0 z-[3000] flex flex-col overflow-hidden bg-slate-950 text-white transition-opacity duration-300 ${entered ? "opacity-100" : "opacity-0"}`}
       >
         {/* Fondo: mi cámara mientras conecta; luego, quienes están */}
-        {video && joined.length === 0 && localStream && (
-          <LiveVideo stream={localStream} mirrored={call.facing === "user" && !call.sharing} contain={call.sharing} className="absolute inset-0 h-full w-full" />
-        )}
+        {myVideo && joined.length === 0 && <LiveVideo stream={localStream} mirrored={call.facing === "user" && !call.sharing} contain={call.sharing} className="absolute inset-0 h-full w-full" />}
         <div className="relative z-10 flex items-center justify-between px-4 pt-[max(var(--safe-top),0.75rem)]">
           <button type="button" onClick={() => onView("float")} aria-label="Ventana flotante" title="Ventana flotante" className="flex h-10 w-10 items-center justify-center rounded-full bg-[rgb(255_255_255/0.12)] hover:bg-[rgb(255_255_255/0.22)]">
             <ChevronDown size={20} />
           </button>
           <span className="truncate px-2 text-[11px] text-[rgb(255_255_255/0.7)]">Llamada de Navio · cifrada</span>
-          <div className="relative">
-            <button type="button" onClick={() => setMenu((v) => !v)} aria-label="Más opciones de la llamada" disabled={menuItems.length === 0} className="flex h-10 w-10 items-center justify-center rounded-full bg-[rgb(255_255_255/0.12)] hover:bg-[rgb(255_255_255/0.22)] disabled:opacity-40">
-              <MoreVertical size={18} />
-            </button>
-            {menu && (
-              <>
-                <div className="fixed inset-0" onClick={() => setMenu(false)} />
-                <div className="absolute right-0 top-12 w-60 rounded-xl bg-white p-1 text-slate-700 shadow-2xl">
-                  {menuItems.map((item) => (
-                    <button
-                      key={item.label}
-                      type="button"
-                      onClick={() => {
-                        setMenu(false);
-                        item.run();
-                      }}
-                      className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium hover:bg-slate-50"
-                    >
-                      <item.icon size={14} className="shrink-0" /> {item.label}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
+          <span className="h-10 w-10" />
         </div>
 
         {joined.length > 0 && (withVideo.length > 0 || joined.length > 1) ? (
@@ -1246,7 +1308,7 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
           </p>
         )}
 
-        {video && joined.length > 0 && localStream && !call.cameraOff && (
+        {myVideo && joined.length > 0 && (
           <LiveVideo
             stream={localStream}
             mirrored={call.facing === "user" && !call.sharing}
@@ -1254,9 +1316,22 @@ function CallWindow({ call, others, peerView, localStream, onAccept, onDecline, 
           />
         )}
 
-        <div className="relative z-10 px-6 pb-[max(var(--safe-bottom),1.5rem)] pt-4">{controls(false) ?? <div className="h-20" />}</div>
+        <div className="relative z-10 px-4 pb-[max(var(--safe-bottom),1.5rem)] pt-4">
+          {call.phase === "incoming" ? (
+            incomingControls(false)
+          ) : call.phase === "ended" ? (
+            <div className="h-20" />
+          ) : (
+            <div className="mx-auto flex max-w-xl flex-wrap items-start justify-center gap-x-2 gap-y-3 sm:gap-x-4">
+              {buttons.map((b) => (
+                <CallButton key={b.key} label={b.label} caption={b.caption} tone={b.tone} onClick={b.run}>
+                  <b.icon size={21} />
+                </CallButton>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </>
   );
 }
-

@@ -23,9 +23,12 @@ import {
   Languages,
   Mic,
   Phone,
+  Play,
   PhoneIncoming,
   PhoneMissed,
+  PhoneOff,
   PhoneOutgoing,
+  Pause,
   Pin,
   PinOff,
   Plus,
@@ -43,10 +46,11 @@ import { supabase, useAuth, useToast, Modal } from "./NavioDashboard.jsx";
 import { useInbox, TaskFormModal } from "./inbox.jsx";
 import { isNativeApp } from "./tracking.jsx";
 import { Capacitor, registerPlugin } from "@capacitor/core";
-import { useVoiceNote, RecordingBar, MicButton, CameraCapture, AttachmentPreview, GifPanel } from "./chatcomposer.jsx";
+import { useVoiceNote, RecordingBar, MicButton, CameraCapture, AttachmentPreview, GifPanel, waveFromBlob, decodeWave } from "./chatcomposer.jsx";
 import { usePermissionGate } from "./permissions.jsx";
 import { useCalls, callDuration } from "./calls.jsx";
 import { clearChatNotifications } from "./push.jsx";
+import { useTypingIn, sendTyping, firstName, typingLabel, TYPING_SEND_EVERY, TYPING_IDLE } from "./typing.js";
 
 /* ---------------------------------------------------------------------- */
 /*  Conversación: mensajes, archivos, voz, stickers y acciones            */
@@ -89,7 +93,7 @@ MIME_BY_EXT.m4a = "audio/mp4";
 
 const KIND_LABEL = { image: "📷 Foto", video: "🎬 Video", file: "📄 Documento", voice: "🎤 Nota de voz", sticker: "Sticker" };
 export const previewText = (kind, body) =>
-  kind === "call" ? `📞 ${body || "Llamada"}` : kind && kind !== "text" ? `${KIND_LABEL[kind] ?? "Archivo"}${body ? `: ${body}` : ""}` : body;
+  kind === "call" ? body || "Llamada" : kind && kind !== "text" ? `${KIND_LABEL[kind] ?? "Archivo"}${body ? `: ${body}` : ""}` : body;
 
 const dayLabel = (iso) => {
   const date = new Date(iso);
@@ -109,6 +113,7 @@ const time = (iso) => (iso ? Date.parse(iso) : 0);
 // Los archivos del chat son privados: se bajan con la sesión y se muestran
 // desde la memoria del navegador (blob:), nunca con un enlace público.
 const mediaCache = new Map();
+const mediaBlobs = new Map(); // path → archivo ya descargado
 function mediaUrl(path) {
   if (!mediaCache.has(path)) {
     mediaCache.set(
@@ -118,6 +123,7 @@ function mediaUrl(path) {
         .download(path)
         .then(({ data, error }) => {
           if (error) throw error;
+          mediaBlobs.set(path, data);
           return URL.createObjectURL(data);
         })
     );
@@ -311,13 +317,214 @@ function VideoAttachment({ attachment }) {
   return url ? <video src={url} controls playsInline preload="metadata" className="max-h-72 w-60 max-w-full rounded-xl bg-black" /> : <div className="h-40 w-60 max-w-full animate-pulse rounded-xl bg-slate-200" />;
 }
 
+// Nota de voz: reproducir a la izquierda, la forma del audio a lo largo,
+// cuánto va y cuánto falta, y la velocidad (1×, 1.5×, 2×).
+const VOICE_BARS = 40;
+const waveCache = new Map(); // path → niveles (0..1)
+let playingVoice = null; // solo suena una nota a la vez
+
+// Figura fija (siempre la misma para el mismo audio) si no se puede leer el audio.
+function seededWave(seed, n = VOICE_BARS) {
+  let h = 2166136261;
+  for (const ch of String(seed)) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+  const out = [];
+  for (let i = 0; i < n; i += 1) {
+    h = Math.imul(h ^ (h >>> 15), 2246822507);
+    h ^= h >>> 13;
+    const r = ((h >>> 0) % 1000) / 1000;
+    out.push(0.2 + 0.7 * r * (0.55 + 0.45 * Math.sin((i / n) * Math.PI)));
+  }
+  return out;
+}
+
+function resample(levels, n) {
+  if (!levels?.length) return [];
+  return Array.from({ length: n }, (_, i) => {
+    const from = Math.floor((i * levels.length) / n);
+    const to = Math.max(from + 1, Math.floor(((i + 1) * levels.length) / n));
+    let max = 0;
+    for (let j = from; j < to; j += 1) max = Math.max(max, levels[j] ?? 0);
+    return max;
+  });
+}
+
 function VoiceAttachment({ attachment, mine }) {
   const url = useMediaUrl(attachment.path);
+  const audioRef = useRef(null);
+  const waveRef = useRef(null);
+  const frame = useRef(0);
+  const [playing, setPlaying] = useState(false);
+  const [time, setTime] = useState(0);
+  const [length, setLength] = useState(Number(attachment.duration) || 0);
+  const [rate, setRate] = useState(1);
+  const [levels, setLevels] = useState(() => decodeWave(attachment.wave) ?? waveCache.get(attachment.path) ?? null);
+
+  // Notas sin forma guardada (las de antes): se calcula del audio; si no se puede, una figura fija.
+  useEffect(() => {
+    if (levels || !url) return undefined;
+    let alive = true;
+    (async () => {
+      let found = null;
+      try {
+        const blob = mediaBlobs.get(attachment.path) ?? (await supabase.storage.from("chat").download(attachment.path)).data;
+        found = blob ? decodeWave(await waveFromBlob(blob)) : null;
+      } catch {
+        found = null;
+      }
+      const next = found ?? seededWave(attachment.path);
+      waveCache.set(attachment.path, next);
+      if (alive) setLevels(next);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [url, levels, attachment.path]);
+
+  useEffect(
+    () => () => {
+      window.cancelAnimationFrame(frame.current);
+      if (playingVoice === audioRef.current) playingVoice = null;
+    },
+    []
+  );
+
+  // Mientras suena, el avance se mueve suave.
+  function follow() {
+    const a = audioRef.current;
+    if (!a) return;
+    setTime(a.currentTime);
+    if (!a.paused) frame.current = window.requestAnimationFrame(follow);
+  }
+
+  function toggle() {
+    const a = audioRef.current;
+    if (!a) return;
+    if (a.paused) {
+      if (playingVoice && playingVoice !== a) playingVoice.pause();
+      playingVoice = a;
+      a.playbackRate = rate;
+      a.play().catch(() => {});
+    } else {
+      a.pause();
+    }
+  }
+
+  function seekTo(clientX) {
+    const a = audioRef.current;
+    const box = waveRef.current?.getBoundingClientRect();
+    if (!a || !box || !length) return;
+    const ratio = Math.min(1, Math.max(0, (clientX - box.left) / box.width));
+    try {
+      a.currentTime = ratio * length;
+    } catch {
+      // Algunos audios no dejan brincar; sigue desde donde iba.
+    }
+    setTime(ratio * length);
+  }
+
+  function nextRate() {
+    const value = rate === 1 ? 1.5 : rate === 1.5 ? 2 : 1;
+    setRate(value);
+    if (audioRef.current) audioRef.current.playbackRate = value;
+  }
+
+  const bars = resample(levels ?? seededWave(attachment.path), VOICE_BARS);
+  const progress = length ? Math.min(1, time / length) : 0;
+  const played = mine ? "rgb(255 255 255)" : "rgb(var(--bg-blue-600))";
+  const pending = mine ? "rgb(255 255 255 / 0.38)" : "rgb(var(--tx-slate-400) / 0.55)";
+  const started = playing || time > 0;
+
   return (
-    <div className="flex w-64 max-w-full min-w-0 items-center gap-2">
-      <Mic size={16} className={mine ? "text-blue-100" : "text-blue-600"} />
-      {url ? <audio src={url} controls preload="metadata" className="h-9 min-w-0 flex-1" /> : <span className="text-[11px] opacity-70">{url === false ? "No se pudo cargar" : "Cargando…"}</span>}
-      {attachment.duration ? <span className="text-[10px] opacity-70">{durationLabel(attachment.duration)}</span> : null}
+    <div className="flex w-64 max-w-full min-w-0 items-center gap-2.5 py-0.5">
+      <button
+        type="button"
+        onClick={toggle}
+        disabled={!url}
+        aria-label={playing ? "Pausar nota de voz" : "Reproducir nota de voz"}
+        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full shadow-sm transition active:scale-95 disabled:opacity-50 ${mine ? "bg-white text-blue-600" : "bg-blue-600 text-white"}`}
+      >
+        {playing ? <Pause size={16} className="fill-current" /> : <Play size={16} className="ml-0.5 fill-current" />}
+      </button>
+      <div className="min-w-0 flex-1">
+        <div
+          ref={waveRef}
+          role="slider"
+          tabIndex={0}
+          aria-label="Avance de la nota de voz"
+          aria-valuemin={0}
+          aria-valuemax={Math.round(length)}
+          aria-valuenow={Math.round(time)}
+          aria-valuetext={`${durationLabel(time)} de ${durationLabel(length)}`}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            seekTo(e.clientX);
+          }}
+          onKeyDown={(e) => {
+            const a = audioRef.current;
+            if (!a || !length) return;
+            if (e.key === "ArrowRight") a.currentTime = Math.min(length, a.currentTime + 5);
+            else if (e.key === "ArrowLeft") a.currentTime = Math.max(0, a.currentTime - 5);
+            else return;
+            e.preventDefault();
+            setTime(a.currentTime);
+          }}
+          className="flex h-7 cursor-pointer touch-none items-center gap-[2px]"
+        >
+          {bars.map((v, i) => (
+            <span
+              key={i}
+              className="min-w-[2px] flex-1 rounded-full transition-[background-color] duration-150"
+              style={{ height: `${Math.round(Math.max(0.14, v) * 100)}%`, backgroundColor: (i + 0.5) / bars.length <= progress ? played : pending }}
+            />
+          ))}
+        </div>
+        <div className={`mt-0.5 flex justify-between text-[10px] tabular-nums ${mine ? "text-blue-100" : "text-slate-400"}`}>
+          <span>{url === false ? "No se pudo cargar" : durationLabel(started ? time : 0)}</span>
+          <span>{started ? `-${durationLabel(Math.max(0, length - time))}` : durationLabel(length)}</span>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={nextRate}
+        aria-label={`Velocidad ${rate}×`}
+        title="Velocidad"
+        className={`h-6 shrink-0 rounded-full px-1.5 text-[10px] font-bold tabular-nums ${mine ? "bg-[rgb(255_255_255/0.18)] text-white" : "bg-slate-100 text-slate-600"}`}
+      >
+        {rate}×
+      </button>
+      {url && (
+        <audio
+          ref={audioRef}
+          src={url}
+          preload="metadata"
+          className="hidden"
+          onLoadedMetadata={(e) => {
+            const d = e.currentTarget.duration;
+            if (Number.isFinite(d) && d > 0) setLength(d);
+          }}
+          onDurationChange={(e) => {
+            const d = e.currentTarget.duration;
+            if (Number.isFinite(d) && d > 0) setLength(d);
+          }}
+          onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+          onPlay={() => {
+            setPlaying(true);
+            window.cancelAnimationFrame(frame.current);
+            frame.current = window.requestAnimationFrame(follow);
+          }}
+          onPause={() => {
+            setPlaying(false);
+            window.cancelAnimationFrame(frame.current);
+            if (audioRef.current) setTime(audioRef.current.currentTime);
+          }}
+          onEnded={() => {
+            setPlaying(false);
+            window.cancelAnimationFrame(frame.current);
+            setTime(0);
+            if (playingVoice === audioRef.current) playingVoice = null;
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -482,47 +689,67 @@ function Bubble({ message, mine, showSender, reply, reactions, starred, receipts
 
 // Una llamada en la conversación: entrante, saliente o perdida, con su
 // duración y un botón para volver a llamar.
-function CallLogBubble({ message, mine, onCallBack }) {
+// Cómo le fue a una llamada, visto por quien lee: saliente o entrante, y si se
+// contestó, se perdió, se rechazó o la otra persona estaba ocupada.
+// info: el adjunto del mensaje { call, status, duration, joined, people }.
+export function callOutcome(info, senderId, me) {
+  const data = info ?? {};
+  const video = data.call === "video";
+  const base = video ? "Videollamada" : "Llamada";
+  const status = data.status ?? (data.duration != null ? "ended" : "missed");
+  const answered = data.duration != null || status === "ended";
+  const outgoing = !!me && senderId === me;
+  const joined = Array.isArray(data.joined) ? data.joined.map(String) : null;
+  const group = Number(data.people) > 2 || (joined && joined.length > 2);
+  const duration = answered && data.duration != null ? callDuration(data.duration) : "";
+  if (outgoing) {
+    if (answered) return { video, tone: "ok", icon: PhoneOutgoing, title: `${base} saliente`, detail: duration };
+    if (status === "declined") return { video, tone: "muted", icon: PhoneOff, title: group ? `${base} rechazada` : "Rechazaron la llamada", detail: "" };
+    if (status === "busy") return { video, tone: "muted", icon: PhoneOutgoing, title: "Estaba en otra llamada", detail: "" };
+    return { video, tone: "muted", icon: PhoneOutgoing, title: `${base} sin respuesta`, detail: "" };
+  }
+  // Entrante. En grupo, si se sabe quién entró, cuenta si yo entré.
+  const iJoined = joined ? joined.includes(String(me)) : null;
+  if (answered && iJoined !== false) return { video, tone: "ok", icon: PhoneIncoming, title: `${base} entrante`, detail: duration };
+  if (status === "declined" && !group) return { video, tone: "muted", icon: PhoneOff, title: "Rechazaste la llamada", detail: "" };
+  if (status === "busy" && !group) return { video, tone: "missed", icon: PhoneMissed, title: `${base} perdida`, detail: "estabas en otra llamada" };
+  return { video, tone: "missed", icon: PhoneMissed, title: `${base} perdida`, detail: "" };
+}
+
+export const CALL_TONE = {
+  ok: "bg-emerald-50 text-emerald-600",
+  missed: "bg-rose-50 text-rose-600",
+  muted: "bg-slate-100 text-slate-500",
+};
+
+function CallLogBubble({ message, mine, userId, onCallBack }) {
   const info = message.attachment ?? {};
-  const video = info.call === "video";
-  const answered = info.duration != null;
-  const Icon = mine ? PhoneOutgoing : answered ? PhoneIncoming : PhoneMissed;
-  const title = video
-    ? answered
-      ? "Videollamada"
-      : mine
-      ? "Videollamada sin respuesta"
-      : "Videollamada perdida"
-    : answered
-    ? "Llamada de voz"
-    : mine
-    ? "Llamada sin respuesta"
-    : "Llamada perdida";
-  const missed = !answered && !mine;
+  const outcome = callOutcome(info, message.senderId, userId);
+  const Icon = outcome.icon;
   const people = Number(info.people) > 2 ? Number(info.people) : 0;
   return (
     <div id={`msg-${message.id}`} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
-      <div className={`flex min-w-[190px] max-w-[80%] items-center gap-2.5 rounded-2xl px-2.5 py-2 ${mine ? "rounded-br-md bg-blue-600 text-white" : "rounded-bl-md bg-white text-slate-700 shadow-sm"}`}>
-        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${mine ? "bg-[rgb(255_255_255/0.16)]" : missed ? "bg-amber-50 text-amber-600" : "bg-slate-100 text-slate-600"}`}>
-          <Icon size={15} />
+      <div className={`flex min-w-[200px] max-w-[80%] items-center gap-2.5 rounded-2xl bg-white px-2.5 py-2 text-slate-700 shadow-sm ${mine ? "rounded-br-md" : "rounded-bl-md"}`}>
+        <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${CALL_TONE[outcome.tone]}`}>
+          <Icon size={16} />
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block text-xs font-semibold">{title}</span>
-          <span className={`block text-[10px] ${mine ? "text-blue-100" : "text-slate-400"}`}>
+          <span className={`block text-xs font-semibold ${outcome.tone === "missed" ? "text-rose-600" : ""}`}>{outcome.title}</span>
+          <span className="block text-[10px] text-slate-400">
             {hourLabel(message.createdAt)}
-            {answered ? ` · ${callDuration(info.duration)}` : ""}
+            {outcome.detail ? ` · ${outcome.detail}` : ""}
             {people ? ` · ${people} personas` : ""}
           </span>
         </span>
         {onCallBack && (
           <button
             type="button"
-            onClick={() => onCallBack(video ? "video" : "audio")}
+            onClick={() => onCallBack(outcome.video ? "video" : "audio")}
             aria-label="Volver a llamar"
             title="Volver a llamar"
-            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${mine ? "hover:bg-[rgb(255_255_255/0.16)]" : "text-blue-600 hover:bg-blue-50"}`}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-blue-600 hover:bg-blue-50"
           >
-            {video ? <Video size={15} /> : <Phone size={15} />}
+            {outcome.video ? <Video size={15} /> : <Phone size={15} />}
           </button>
         )}
       </div>
@@ -898,88 +1125,10 @@ function StickerPanel({ onSend, onClose }) {
 
 /* ---------- La conversación ---------- */
 
-// ---------------------------------------------------------------------------
-// "Está escribiendo": avisos en vivo por un canal privado de Supabase
-// ("typing:<chat>"). Solo pueden escucharlo y mandarlo quienes pueden leer el
-// chat (migración v31). No se guarda nada. Sin la migración, no se ve el aviso.
-// ---------------------------------------------------------------------------
-const TYPING_SEND_EVERY = 2500; // mientras se escribe, se repite el aviso
-const TYPING_TTL = 6000; // si no llega otro aviso, se quita solo
-const TYPING_IDLE = 4000; // sin teclear este tiempo, se avisa que ya no escribe
-const firstName = (name) => String(name ?? "").trim().split(/\s+/)[0].slice(0, 30);
-
-function useTyping(channelId, myId, myName) {
-  const [others, setOthers] = useState([]); // [{ userId, name, kind, until }]
-  const chanRef = useRef(null);
-  const readyRef = useRef(false);
-  const lastSent = useRef({ at: 0, kind: null });
-
-  useEffect(() => {
-    if (!myId || !channelId || typeof supabase.channel !== "function") return undefined;
-    setOthers([]);
-    readyRef.current = false;
-    lastSent.current = { at: 0, kind: null };
-    const chan = supabase.channel(`typing:${channelId}`, { config: { private: true, broadcast: { self: false } } });
-    chanRef.current = chan;
-    chan.on("broadcast", { event: "typing" }, (message) => {
-      const data = message?.payload;
-      if (!data?.userId || String(data.userId) === String(myId)) return;
-      const userId = String(data.userId);
-      setOthers((prev) => {
-        const rest = prev.filter((x) => x.userId !== userId);
-        if (data.kind !== "text" && data.kind !== "voice") return rest; // dejó de escribir
-        return [...rest, { userId, name: String(data.name ?? ""), kind: data.kind, until: Date.now() + TYPING_TTL }];
-      });
-    });
-    chan.subscribe((status, err) => {
-      readyRef.current = status === "SUBSCRIBED";
-      // Sin permiso (falta la v31): se deja de intentar en esta conversación.
-      if (status === "CHANNEL_ERROR" && /unauthori|permission|denied|forbidden/i.test(err?.message ?? "")) {
-        readyRef.current = false;
-        chanRef.current = null;
-        supabase.removeChannel(chan);
-      }
-    });
-    const sweep = window.setInterval(() => {
-      setOthers((prev) => (prev.some((x) => x.until < Date.now()) ? prev.filter((x) => x.until >= Date.now()) : prev));
-    }, 1000);
-    return () => {
-      window.clearInterval(sweep);
-      if (readyRef.current && lastSent.current.kind) {
-        chan.send({ type: "broadcast", event: "typing", payload: { userId: myId, kind: null } })?.catch?.(() => {});
-      }
-      readyRef.current = false;
-      chanRef.current = null;
-      supabase.removeChannel(chan);
-    };
-  }, [channelId, myId]);
-
-  // kind: "text" (escribe), "voice" (graba un audio) o null (ya no).
-  const report = useCallback(
-    (kind) => {
-      const chan = chanRef.current;
-      if (!chan || !readyRef.current) return;
-      const now = Date.now();
-      const last = lastSent.current;
-      if (kind === last.kind && (kind === null || now - last.at < TYPING_SEND_EVERY)) return;
-      lastSent.current = { at: now, kind };
-      chan.send({ type: "broadcast", event: "typing", payload: { userId: myId, name: myName, kind } })?.catch?.(() => {});
-    },
-    [myId, myName]
-  );
-
-  return { others, report };
-}
-
 // Burbuja con tres puntitos y "Fulano está escribiendo…".
 function TypingBubble({ people }) {
   const voice = people.length === 1 && people[0].kind === "voice";
-  const label =
-    people.length === 1
-      ? `${people[0].name} está ${voice ? "grabando un audio" : "escribiendo"}`
-      : people.length === 2
-        ? `${people[0].name} y ${people[1].name} están escribiendo`
-        : `${people.length} personas están escribiendo`;
+  const label = typingLabel(people).replace(/…$/, "");
   return (
     <div className="typing-in flex items-center gap-2 pt-1" role="status" aria-live="polite">
       <div className="flex h-8 shrink-0 items-center gap-1 rounded-2xl rounded-bl-md bg-white px-3 shadow-sm" aria-hidden="true">
@@ -1049,7 +1198,9 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
   const galleryRef = useRef(null);
   const docRef = useRef(null);
   const channelId = channel.id;
-  const typing = useTyping(channelId, user?.id, firstName(profile?.fullName));
+  const typingOthers = useTypingIn(channelId, user?.id);
+  const myFirstName = firstName(profile?.fullName);
+  const reportTyping = useCallback((kind) => sendTyping(channelId, user?.id, myFirstName, kind), [channelId, user?.id, myFirstName]);
 
   const loadMessages = useCallback(
     async (beforeId = null) => {
@@ -1356,16 +1507,16 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
   }
 
   const voice = useVoiceNote({
-    onSend: (blob, seconds) => {
+    onSend: async (blob, seconds) => {
       const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
-      sendFile(new File([blob], `nota-de-voz.${ext}`, { type: blob.type }), "voice", { duration: Math.round(seconds * 10) / 10 });
+      const wave = await waveFromBlob(blob).catch(() => null);
+      sendFile(new File([blob], `nota-de-voz.${ext}`, { type: blob.type }), "voice", { duration: Math.round(seconds * 10) / 10, ...(wave ? { wave } : {}) });
     },
     onError: () => showToast("No se pudo usar el micrófono. Revisa el permiso en los ajustes."),
   });
 
   // "Está escribiendo": aviso mientras hay texto (no al editar uno ya enviado)
   // y mientras se graba un audio.
-  const reportTyping = typing.report;
   useEffect(() => {
     if (editing || !draft.trim()) {
       reportTyping(null);
@@ -1386,12 +1537,12 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
   }, [voice.mode, reportTyping]);
   // Nombres: los del chat que ya conocemos; si no, el que manda el aviso.
   const typingPeople = useMemo(() => {
-    if (!typing.others.length) return [];
+    if (!typingOthers.length) return [];
     const names = new Map();
     for (const m of messages ?? []) if (m.senderId && m.senderName) names.set(String(m.senderId), m.senderName);
     if (channel.kind === "direct" && channel.otherUserId && channel.otherUserName) names.set(String(channel.otherUserId), channel.otherUserName);
-    return typing.others.map((x) => ({ ...x, name: firstName(names.get(x.userId) || x.name) || "Alguien" }));
-  }, [typing.others, messages, channel.kind, channel.otherUserId, channel.otherUserName]);
+    return typingOthers.map((x) => ({ ...x, name: firstName(names.get(x.userId) || x.name) || "Alguien" }));
+  }, [typingOthers, messages, channel.kind, channel.otherUserId, channel.otherUserName]);
   useEffect(() => {
     const box = scrollRef.current;
     if (box && stickRef.current && typingPeople.length) box.scrollTop = box.scrollHeight;
@@ -1617,7 +1768,11 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
             Cargar mensajes anteriores
           </button>
         )}
-        {messages?.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Todavía no hay mensajes. Escribe el primero.</p>}
+        {messages?.length === 0 && (
+          <p className="py-8 text-center text-xs text-slate-400">
+            {channel.kind === "direct" && channel.otherUserName ? `Todavía no hay mensajes entre tú y ${channel.otherUserName}. Escribe el primero.` : "Todavía no hay mensajes. Escribe el primero."}
+          </p>
+        )}
         {onlyStarred && visible.length === 0 && <p className="py-8 text-center text-xs text-slate-400">No hay mensajes destacados en esta conversación.</p>}
         {visible.map((m) => {
           const mine = m.senderId === user?.id;
@@ -1628,7 +1783,7 @@ export function ChatConversation({ channel, isAdmin, onBack, header, jumpTo: jum
             <div key={m.id}>
               {showDay && <p className="py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-400">{day}</p>}
               {m.kind === "call" ? (
-                <CallLogBubble message={m} mine={mine} onCallBack={calls.available && channel.kind !== "general" ? (kind) => calls.start(channel, kind) : null} />
+                <CallLogBubble message={m} mine={mine} userId={user?.id} onCallBack={calls.available && channel.kind !== "general" ? (kind) => calls.start(channel, kind) : null} />
               ) : (
               <Bubble
                 message={m}

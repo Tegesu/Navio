@@ -497,3 +497,47 @@ export function GifPanel({ onPick, onClose }) {
   );
 }
 
+
+/* ---------- Forma del audio (notas de voz) ---------- */
+// Se guarda como texto corto: un carácter por barra, de "0" (silencio) a "v" (máximo).
+const WAVE_DIGITS = "0123456789abcdefghijklmnopqrstuv";
+
+export function encodeWave(levels) {
+  return levels.map((v) => WAVE_DIGITS[Math.max(0, Math.min(31, Math.round(v * 31)))]).join("");
+}
+
+export function decodeWave(text) {
+  if (typeof text !== "string" || !/^[0-9a-v]{8,64}$/.test(text)) return null;
+  return [...text].map((c) => WAVE_DIGITS.indexOf(c) / 31);
+}
+
+// Lee el audio y calcula qué tan fuerte suena en cada tramo (48 barras).
+export async function waveFromBlob(blob, bars = 48) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx || !blob) return null;
+  const ctx = new Ctx();
+  try {
+    const buffer = await new Promise((resolve, reject) => {
+      blob.arrayBuffer().then((data) => {
+        const done = ctx.decodeAudioData(data, resolve, reject);
+        if (done?.then) done.then(resolve, reject);
+      }, reject);
+    });
+    const samples = buffer.getChannelData(0);
+    const size = Math.max(1, Math.floor(samples.length / bars));
+    const levels = [];
+    for (let b = 0; b < bars; b += 1) {
+      let sum = 0;
+      const from = b * size;
+      const to = Math.min(samples.length, from + size);
+      for (let i = from; i < to; i += 8) sum += samples[i] * samples[i];
+      levels.push(Math.sqrt(sum / Math.max(1, (to - from) / 8)));
+    }
+    const max = Math.max(...levels, 0.0001);
+    return encodeWave(levels.map((v) => Math.pow(v / max, 0.7)));
+  } catch {
+    return null;
+  } finally {
+    ctx.close?.().catch?.(() => {});
+  }
+}

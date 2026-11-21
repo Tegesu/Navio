@@ -4,6 +4,9 @@ import {
   ArrowLeft,
   Bell,
   BellOff,
+  CalendarClock,
+  CalendarDays,
+  CalendarPlus,
   LogOut,
   MoreHorizontal,
   MoreVertical,
@@ -36,7 +39,9 @@ import {
 import { supabase, useAuth, useToast, useDateFormat, formatDate, Modal, avatarUrl, timeAgoLabel, localISODate } from "./NavioDashboard.jsx";
 import { usePeople, personName } from "./people.jsx";
 import { useBackLayer, goBack } from "./history.js";
-import { ChatConversation, previewText } from "./chat.jsx";
+import { ChatConversation, previewText, callOutcome, CALL_TONE } from "./chat.jsx";
+import { useTypingMany, typingLabel } from "./typing.js";
+import { AgendaView, UpcomingAgenda, AgendaEventForm } from "./agenda.jsx";
 import { PushInvite } from "./push.jsx";
 import { useCalls } from "./calls.jsx";
 
@@ -277,7 +282,7 @@ export function NavBadge({ id }) {
 /*  Alertas (campana)                                                     */
 /* ---------------------------------------------------------------------- */
 
-const NOTIFICATION_ICONS = { alert: Megaphone, task: ClipboardList, trip: Navigation, invoice: Receipt, team: Users };
+const NOTIFICATION_ICONS = { alert: Megaphone, task: ClipboardList, trip: Navigation, invoice: Receipt, team: Users, agenda: CalendarClock };
 
 export function BellButton({ onClick }) {
   const inbox = useInbox();
@@ -567,6 +572,7 @@ function Conversation({ channel, isAdmin, onBack, onChanged, jumpTo }) {
   const [editing, setEditing] = useState(null);
   const [permissions, setPermissions] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [scheduling, setScheduling] = useState(false);
   const channelId = channel.id;
 
   async function leave() {
@@ -588,6 +594,7 @@ function Conversation({ channel, isAdmin, onBack, onChanged, jumpTo }) {
     canSetPermissions && { label: "Quién puede escribir", icon: ShieldCheck, run: () => setPermissions(true) },
     { label: channel.pinnedAt ? "Dejar de fijar" : "Fijar conversación", icon: channel.pinnedAt ? PinOff : Pin, run: () => channelAction(inbox, showToast, "pin", channel) },
     { label: channel.muted ? "Activar avisos" : "Silenciar avisos", icon: channel.muted ? Bell : BellOff, run: () => channelAction(inbox, showToast, "mute", channel) },
+    { label: "Agendar reunión", icon: CalendarPlus, run: () => setScheduling(true) },
     channel.kind === "group" && channel.createdBy !== user?.id && { label: "Salir del grupo", icon: LogOut, run: leave, danger: true },
   ].filter(Boolean);
 
@@ -656,6 +663,19 @@ function Conversation({ channel, isAdmin, onBack, onChanged, jumpTo }) {
         />
       )}
       {permissions && <ChannelPermissionsModal channel={channel} onClose={() => setPermissions(false)} onSaved={() => inbox.reloadChannels()} />}
+      {scheduling && (
+        <AgendaEventForm
+          initial={{
+            kind: "meeting",
+            title: channel.kind === "direct" ? `Reunión con ${channelTitle(channel)}` : `Reunión: ${channelTitle(channel)}`,
+            channelId: channel.id,
+            attendees: channel.kind === "direct" && channel.otherUserId ? [channel.otherUserId] : [],
+            attendeesFromChannel: channel.kind === "group",
+            visibility: channel.kind === "general" ? "company" : "participants",
+          }}
+          onClose={() => setScheduling(false)}
+        />
+      )}
     </>
   );
 }
@@ -783,8 +803,32 @@ function ChannelPermissionsModal({ channel, onClose, onSaved }) {
 
 // Un renglón de la lista: tocarlo abre el chat; los tres puntos (o mantener
 // presionado en el teléfono) dan las opciones.
-function ChannelRow({ channel: c, active, onOpen }) {
+// Vista previa de una llamada en la lista: saliente, entrante o perdida.
+function CallPreview({ channel: c, me }) {
+  if (!c.lastAttachment) {
+    return (
+      <span className="flex min-w-0 items-center gap-1">
+        <Phone size={11} className="shrink-0" />
+        <span className="truncate">{c.lastMessage || "Llamada"}</span>
+      </span>
+    );
+  }
+  const outcome = callOutcome(c.lastAttachment, c.lastSenderId, me);
+  const Icon = outcome.icon;
+  return (
+    <span className={`flex min-w-0 items-center gap-1 ${outcome.tone === "missed" ? "font-semibold text-rose-600" : ""}`}>
+      <Icon size={11} className={`shrink-0 ${outcome.tone === "ok" ? "text-emerald-600" : ""}`} />
+      <span className="truncate">
+        {outcome.title}
+        {outcome.detail ? ` · ${outcome.detail}` : ""}
+      </span>
+    </span>
+  );
+}
+
+function ChannelRow({ channel: c, active, onOpen, typing = null }) {
   const inbox = useInbox();
+  const { user } = useAuth();
   const { showToast } = useToast();
   const [menu, setMenu] = useState(false);
   const timer = useRef(null);
@@ -825,8 +869,16 @@ function ChannelRow({ channel: c, active, onOpen }) {
             {c.lastMessageAt && <span className="shrink-0 text-[10px] text-slate-400 group-hover:invisible">{timeAgoLabel(c.lastMessageAt).replace("hace ", "")}</span>}
           </span>
           <span className="flex items-center justify-between gap-2">
-            <span className="truncate text-[11px] text-slate-400">
-              {c.lastMessage || (c.lastKind && c.lastKind !== "text") ? `${c.kind !== "direct" && c.lastSender ? `${c.lastSender.split(" ")[0]}: ` : ""}${previewText(c.lastKind, c.lastMessage) ?? ""}` : "Sin mensajes"}
+            <span className="min-w-0 truncate text-[11px] text-slate-400">
+              {typing?.length ? (
+                <span className="font-semibold italic text-blue-600">{c.kind === "direct" ? typingLabel(typing, { short: true }) : typingLabel(typing)}</span>
+              ) : c.lastKind === "call" ? (
+                <CallPreview channel={c} me={user?.id} />
+              ) : c.lastMessage || (c.lastKind && c.lastKind !== "text") ? (
+                `${c.kind !== "direct" && c.lastSender ? `${c.lastSender.split(" ")[0]}: ` : ""}${previewText(c.lastKind, c.lastMessage) ?? ""}`
+              ) : (
+                "Sin mensajes"
+              )}
             </span>
             <CountBadge count={c.unread} className="shrink-0" />
           </span>
@@ -885,6 +937,7 @@ function Highlight({ text, term }) {
 // view "channel:<id>" abre una en particular.
 export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
   const inbox = useInbox();
+  const { user } = useAuth();
   const [openId, setOpenId] = useState(null);
   const [jump, setJump] = useState(null); // { channelId, messageId }
   const [creating, setCreating] = useState(false);
@@ -896,6 +949,10 @@ export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
   const open = channels.find((c) => c.id === openId) ?? null;
   const term = query.trim();
   const shown = term ? channels.filter((c) => channelTitle(c).toLowerCase().includes(term.toLowerCase())) : channels;
+  const typingMap = useTypingMany(
+    channels.slice(0, 25).map((c) => c.id),
+    user?.id
+  );
 
   // Un chat elegido desde un aviso se abre directo.
   useEffect(() => {
@@ -1004,7 +1061,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
           <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-1.5">
             {term && <p className="px-2 pb-1 pt-1 text-[10px] font-bold uppercase tracking-wide text-slate-400">Conversaciones</p>}
             {shown.map((c) => (
-              <ChannelRow key={c.id} channel={c} active={openId === c.id} onOpen={(ch) => choose(ch)} />
+              <ChannelRow key={c.id} channel={c} active={openId === c.id} onOpen={(ch) => choose(ch)} typing={typingMap[c.id] ?? typingMap[String(c.id)] ?? null} />
             ))}
             {term && shown.length === 0 && <p className="px-2 py-2 text-[11px] text-slate-400">Ninguna conversación con ese nombre.</p>}
             {term.length >= 3 && (
@@ -1034,6 +1091,7 @@ export function MessagesPage({ isAdmin, compact = false, view = "all" }) {
             )}
             {!term && channels.length === 0 && <p className="py-8 text-center text-xs text-slate-400">Cargando conversaciones…</p>}
           </div>
+          <UpcomingAgenda />
         </div>
         <div className={`min-h-0 lg:block ${open ? "block" : "hidden"}`}>
           {open ? (
@@ -1764,6 +1822,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
   const [selectedId, setSelectedId] = useState(focusId);
   const [showClosed, setShowClosed] = useState(true);
   const [resolving, setResolving] = useState(null); // tarea por resolver desde la lista
+  const [mode, setMode] = useState(view === "agenda" ? "agenda" : "tasks");
   const tasks = inbox?.tasks ?? [];
   const today = localISODate();
 
@@ -1772,6 +1831,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
   }, [focusId]);
   useEffect(() => {
     if (view === "done") setShowClosed(true);
+    if (view === "agenda") setMode("agenda");
   }, [view]);
 
   const scopes = [
@@ -1901,8 +1961,30 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
     </div>
   );
 
+  const switcher = (
+    <div className="inline-flex rounded-xl border border-slate-200 bg-white p-0.5 shadow-sm" role="tablist" aria-label="Tareas o agenda">
+      {[
+        { id: "tasks", label: "Tareas", icon: ClipboardList },
+        { id: "agenda", label: "Agenda", icon: CalendarDays },
+      ].map((m) => (
+        <button
+          key={m.id}
+          type="button"
+          role="tab"
+          aria-selected={mode === m.id}
+          onClick={() => setMode(m.id)}
+          className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${mode === m.id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
+        >
+          <m.icon size={13} /> {m.label}
+        </button>
+      ))}
+    </div>
+  );
+  if (mode === "agenda") return <AgendaView compact={compact} switcher={switcher} />;
+
   const toolbar = (
     <div className="flex flex-wrap items-center gap-2">
+      {switcher}
       {scopes.map((s) => {
         const count = tasks.filter(s.filter).filter(isPending).length;
         return (
