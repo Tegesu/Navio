@@ -707,11 +707,18 @@ function getComplianceWidgets(records) {
 /*  Shared UI primitives                                                  */
 /* ---------------------------------------------------------------------- */
 
+// Capa de las ventanas: las llamadas la suben para que sus ventanas
+// (agregar personas, permisos) queden encima de la llamada.
+const ModalLayer = createContext("z-50");
+
 function Modal({ title, onClose, children, width = "max-w-md" }) {
+  const layer = useContext(ModalLayer);
   // "Atrás" en el teléfono cierra la ventana en vez de salir de la app.
   useBackLayer(true, onClose);
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4" onClick={onClose}>
+  // Va directo en la página (no dentro de quien la abre) para quedar encima de
+  // todo, también del encabezado y la barra inferior del teléfono.
+  return createPortal(
+    <div className={`fixed inset-0 ${layer} flex items-center justify-center bg-slate-900/40 px-4`} onClick={onClose}>
       <div className={`w-full ${width} rounded-2xl border border-slate-200 bg-white p-5 shadow-xl`} onClick={(e) => e.stopPropagation()}>
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-sm font-bold text-slate-800">{title}</h3>
@@ -721,7 +728,8 @@ function Modal({ title, onClose, children, width = "max-w-md" }) {
         </div>
         {children}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -9950,6 +9958,7 @@ export default function NavioDashboard() {
 
 // Piezas compartidas con los demás archivos de src/ (y con las pruebas).
 export {
+  ModalLayer,
   supabase,
   AuthContext,
   AuthProvider,

@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Link as LinkIcon, Maximize2, Mic, MicOff, Phone, PhoneOff, ScreenShare, SwitchCamera, UserPlus, Video, VideoOff } from "lucide-react";
-import { supabase, useAuth, useToast, avatarUrl, Modal } from "./NavioDashboard.jsx";
+import { supabase, useAuth, useToast, avatarUrl, Modal, ModalLayer } from "./NavioDashboard.jsx";
 import { usePermissionGate } from "./permissions.jsx";
 import { useBackLayer } from "./history.js";
 import { useInbox } from "./inbox.jsx";
@@ -931,10 +931,10 @@ export function CallProvider({ children }) {
       )}
       {inviting && call?.id && <InviteModal participants={participants} onInvite={invite} onClose={() => setInviting(false)} />}
       {/* Las ventanas de permiso van encima de la llamada. */}
-      <div className="relative z-[3100]">
+      <ModalLayer.Provider value="z-[3100]">
         {mic.sheet}
         {cam.sheet}
-      </div>
+      </ModalLayer.Provider>
     </CallContext.Provider>
   );
 }
@@ -949,7 +949,7 @@ function InviteModal({ participants, onInvite, onClose }) {
   const inside = new Set(participants.filter((p) => p.status === "joined" || p.status === "ringing").map((p) => p.userId));
   const list = people.filter((p) => p.id !== user?.id && !inside.has(p.id) && personName(p).toLowerCase().includes(query.trim().toLowerCase()));
   return (
-    <div className="relative z-[3100]">
+    <ModalLayer.Provider value="z-[3100]">
       <Modal title="Agregar a la llamada" width="max-w-sm" onClose={onClose}>
         <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Buscar persona" className="mb-2 h-8 w-full rounded-lg border border-slate-200 px-2.5 text-xs focus:border-blue-400 focus:outline-none" />
         <div className="max-h-64 space-y-0.5 overflow-y-auto">
@@ -979,7 +979,7 @@ function InviteModal({ participants, onInvite, onClose }) {
           </button>
         </div>
       </Modal>
-    </div>
+    </ModalLayer.Provider>
   );
 }
 
