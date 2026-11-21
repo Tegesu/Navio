@@ -299,11 +299,15 @@ const MENU = [
     route: ["messages", "all"],
   },
   {
-    title: "Tareas",
+    title: "Actividades",
     icon: ClipboardList,
     tone: "bg-violet-50 text-violet-600",
     badge: "myOpenTasks",
     route: ["tasks", "open"],
+    items: [
+      { label: "Tareas", route: ["tasks", "open"] },
+      { label: "Agenda", route: ["tasks", "agenda"] },
+    ],
   },
 ];
 

@@ -139,11 +139,15 @@ function buildTree({ groupChats }) {
       route: ["messages", "all"],
     },
     {
-      key: "tasks",
-      label: "Tareas",
+      key: "activities",
+      label: "Actividades",
       icon: ClipboardList,
       badge: "tasks",
       route: ["tasks", "open"],
+      children: [
+        { key: "tasks", label: "Tareas", route: ["tasks", "open"] },
+        { key: "agenda", label: "Agenda", route: ["tasks", "agenda"] },
+      ],
     },
   ];
 }

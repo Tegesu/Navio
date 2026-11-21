@@ -9402,8 +9402,9 @@ function NavioApp() {
 
   const meta = PAGE_META[activeTab];
   const selectedVehicle = selectedVehicleId ? vehicles.find((v) => v.id === selectedVehicleId) : null;
-  const headerTitle = selectedVehicle && activeTab === "fleet" ? selectedVehicle.unit : meta.title;
-  const headerSubtitle = selectedVehicle && activeTab === "fleet" ? "Expediente digital del vehículo" : meta.subtitle;
+  const agendaPage = activeTab === "tasks" && activeSub === "agenda";
+  const headerTitle = selectedVehicle && activeTab === "fleet" ? selectedVehicle.unit : agendaPage ? "Agenda" : meta.title;
+  const headerSubtitle = selectedVehicle && activeTab === "fleet" ? "Expediente digital del vehículo" : agendaPage ? "Reuniones, revisiones y recordatorios de tu equipo." : meta.subtitle;
 
   function goHome() {
     setActiveTab("home");

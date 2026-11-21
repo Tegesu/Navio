@@ -839,6 +839,7 @@ export function AgendaEventDetail({ item, onClose, onEdit }) {
   const channel = item.channelId ? (inbox?.channels ?? []).find((c) => Number(c.id) === Number(item.channelId)) : null;
   const task = item.taskId ? (inbox?.tasks ?? []).find((t) => Number(t.id) === Number(item.taskId)) : null;
   const [answer, setAnswer] = useState(item.myResponse ?? null);
+  const [postponing, setPostponing] = useState(false);
   const mine = answer;
   // Mi respuesta se ve al momento (sin esperar a que se recargue la agenda).
   const attendees = (Array.isArray(item.attendees) ? item.attendees : []).map((a) => (a.userId === user?.id && answer ? { ...a, response: answer } : a));
@@ -862,6 +863,15 @@ export function AgendaEventDetail({ item, onClose, onEdit }) {
     if (ok) setAnswer(value);
   };
   const setStatus = (status, text) => run("status", () => supabase.rpc("agenda_set_status", { target_event: item.id, new_status: status }), text).then(onClose);
+  async function cancelOnce() {
+    if (!window.confirm(`¿Cancelar solo la vez del ${start.toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" })}? Las demás repeticiones siguen igual.`)) return;
+    const ok = await run("status", () => supabase.rpc("agenda_skip", { target_event: item.id, occurrence: item.startsAt }), "Se canceló esa vez. Se avisó a los participantes.");
+    if (ok) onClose();
+  }
+  function cancelAll() {
+    if (!window.confirm(repeat ? `¿Cancelar "${item.title}" y todas sus repeticiones? Se avisará a los participantes.` : `¿Cancelar "${item.title}"? Se avisará a los participantes.`)) return;
+    setStatus("cancelled", "Evento cancelado. Se avisó a los participantes.");
+  }
   async function remove() {
     if (!window.confirm(`¿Borrar "${item.title}"${repeat ? " y todas sus repeticiones" : ""}? No se puede deshacer.`)) return;
     await run("delete", () => supabase.rpc("agenda_delete", { target_event: item.id }), "Evento borrado.");
@@ -1002,9 +1012,26 @@ export function AgendaEventDetail({ item, onClose, onEdit }) {
                   <CheckCircle2 size={12} /> Marcar como hecho
                 </button>
               )}
+            </>
+          )}
+        </div>
+        {item.canEdit && (
+          <div className="flex flex-wrap items-center gap-1.5 rounded-xl bg-slate-50 p-2">
+            <p className="w-full px-1 text-[10px] font-bold uppercase tracking-wide text-slate-400">{item.createdBy === user?.id ? "Como organizador" : "Como administrador"}</p>
+            <>
+              {item.status === "scheduled" && (
+                <button type="button" disabled={!!busy} onClick={() => setPostponing(true)} className="flex items-center gap-1.5 rounded-lg border border-blue-200 bg-white px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50 disabled:opacity-60">
+                  <Clock size={12} /> Posponer
+                </button>
+              )}
+              {item.status === "scheduled" && repeat && (
+                <button type="button" disabled={!!busy} onClick={cancelOnce} className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60">
+                  Cancelar solo esta vez
+                </button>
+              )}
               {item.status === "scheduled" ? (
-                <button type="button" disabled={!!busy} onClick={() => setStatus("cancelled", "Evento cancelado. Se avisó a los participantes.")} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-500 hover:bg-slate-50 disabled:opacity-60">
-                  Cancelar evento
+                <button type="button" disabled={!!busy} onClick={cancelAll} className="rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-60">
+                  {repeat ? "Cancelar todas" : "Cancelar evento"}
                 </button>
               ) : (
                 <button type="button" disabled={!!busy} onClick={() => setStatus("scheduled", "El evento vuelve a estar programado.")} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-60">
@@ -1015,224 +1042,479 @@ export function AgendaEventDetail({ item, onClose, onEdit }) {
                 <Trash2 size={14} />
               </button>
             </>
-          )}
+          </div>
+        )}
+      </div>
+      {postponing && <PostponeModal item={item} onClose={() => setPostponing(false)} onDone={onClose} />}
+    </Modal>
+  );
+}
+
+/* ---------- Posponer (quien organiza o un administrador) ---------- */
+function PostponeModal({ item, onClose, onDone }) {
+  const { showToast } = useToast();
+  const start = new Date(item.startsAt);
+  const length = item.endsAt ? Date.parse(item.endsAt) - start.getTime() : null;
+  const repeats = item.recurrence && item.recurrence !== "none";
+  const [choice, setChoice] = useState("hour");
+  const [date, setDate] = useState(dateInput(addDays(start, 1)));
+  const [time, setTime] = useState(() => {
+    const m = (Math.round((start.getHours() * 60 + start.getMinutes()) / 15) * 15) % 1440;
+    return `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
+  });
+  const [month, setMonth] = useState(new Date(start.getFullYear(), start.getMonth(), 1));
+  const [busy, setBusy] = useState(false);
+  const presets = [
+    { id: "hour", label: "1 hora después", at: new Date(start.getTime() + 3600000) },
+    { id: "tomorrow", label: "Mañana a la misma hora", at: new Date(addDays(start, 1).setHours(start.getHours(), start.getMinutes(), 0, 0)) },
+    { id: "week", label: "En una semana", at: new Date(addDays(start, 7).setHours(start.getHours(), start.getMinutes(), 0, 0)) },
+    { id: "custom", label: "Elegir otra fecha", at: null },
+  ];
+  const newStart = choice === "custom" ? (item.allDay ? new Date(`${date}T00:00`) : new Date(`${date}T${time}`)) : presets.find((p) => p.id === choice).at;
+  const newEnd = length != null ? new Date(newStart.getTime() + length) : null;
+  const timeOptions = TIME_OPTIONS.map((t) => ({ value: t, label: timeText(t) }));
+  const when = (d) => `${pretty(d.toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" }))}${item.allDay ? "" : ` · ${hourLabel(d)}`}`;
+
+  async function confirm() {
+    if (Number.isNaN(newStart.getTime())) return;
+    setBusy(true);
+    const { error } = await supabase.rpc("agenda_postpone", { target_event: item.id, occurrence: item.startsAt, new_start: newStart.toISOString(), new_end: newEnd ? newEnd.toISOString() : null });
+    setBusy(false);
+    if (error) {
+      showToast(/agenda_postpone|could not find/i.test(error.message) ? "Para posponer hace falta la actualización v33 de la base de datos." : error.message);
+      return;
+    }
+    showToast("Evento pospuesto. Se avisó a los participantes.");
+    agendaChanged();
+    onDone?.();
+    onClose();
+  }
+
+  return (
+    <Modal title="Posponer" width="max-w-md" onClose={busy ? () => {} : onClose}>
+      <div className="space-y-3">
+        <p className="text-xs text-slate-500">
+          <b className="text-slate-700">{item.title}</b>
+          <br />
+          Ahora: {when(start)}
+          {repeats ? " · solo se moverá esta vez; las demás repeticiones siguen igual." : ""}
+        </p>
+        <div className="space-y-1.5">
+          {presets.map((p) => (
+            <label key={p.id} className={`flex cursor-pointer items-center gap-2.5 rounded-xl border px-3 py-2 text-xs transition ${choice === p.id ? "border-blue-500 bg-blue-50" : "border-slate-200 hover:bg-slate-50"}`}>
+              <input type="radio" name="postpone" checked={choice === p.id} onChange={() => setChoice(p.id)} className="accent-blue-600" />
+              <span className="flex-1 font-semibold text-slate-700">{p.label}</span>
+              {p.at && <span className="text-[11px] text-slate-400">{p.at.toLocaleDateString("es-MX", { weekday: "short", day: "numeric", month: "short" })}{item.allDay ? "" : ` ${hourLabel(p.at)}`}</span>}
+            </label>
+          ))}
+        </div>
+        {choice === "custom" && (
+          <div className="grid gap-3 rounded-xl border border-slate-200 p-3 sm:grid-cols-[minmax(0,1fr)_140px]">
+            <MiniCalendar value={date} onChange={setDate} month={month} onMonth={setMonth} min={dateInput(new Date())} compact />
+            {!item.allDay && <Dropdown id="pp-time" label="Hora" value={time} onChange={setTime} options={timeOptions} icon={Clock} width={170} />}
+          </div>
+        )}
+        <p className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+          Nueva fecha: <b>{Number.isNaN(newStart.getTime()) ? "—" : when(newStart)}</b>
+          <br />
+          Se les avisará a quienes participan.
+        </p>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} disabled={busy} className="rounded-lg px-3 py-2 text-xs font-medium text-slate-500 hover:bg-slate-100 disabled:opacity-50">
+            Cancelar
+          </button>
+          <button type="button" onClick={confirm} disabled={busy} className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-60">
+            <Clock size={13} /> {busy ? "Posponiendo…" : "Posponer y avisar"}
+          </button>
         </div>
       </div>
     </Modal>
   );
 }
 
-/* ---------- Un renglón de la agenda ---------- */
-function AgendaRow({ item, onOpen, showDay = false }) {
-  const kind = kindOf(item.kind);
-  const color = colorOf(item.color);
-  const start = new Date(item.startsAt);
-  const response = item.myResponse ? RESPONSES[item.myResponse] : null;
-  const people = Array.isArray(item.attendees) ? item.attendees.length : 0;
+/* ---------- Calendario (Actividades → Agenda) ---------- */
+const VIEW_KEY = "navio.agenda.view";
+const HOUR_PX = 48;
+const WEEKDAYS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
+const startOfWeek = (d) => addDays(startOfDay(d), -((d.getDay() + 6) % 7));
+const itemEnd = (i) => (i.endsAt ? new Date(i.endsAt) : new Date(Date.parse(i.startsAt) + 30 * 60000));
+const shortTime = (d) => d.toLocaleTimeString("es-MX", { hour: "numeric", minute: "2-digit" }).replace(/\s?([ap])\.?\s?m\.?/i, " $1m");
+const hourMark = (h) => new Date(2000, 0, 1, h).toLocaleTimeString("es-MX", { hour: "numeric" }).replace(/\s?([ap])\.?\s?m\.?/i, " $1m");
+
+// Los eventos que tocan un día (los de varios días salen en cada uno).
+function touchesDay(item, day) {
+  const from = startOfDay(day).getTime();
+  const to = from + 864e5;
+  const s = Date.parse(item.startsAt);
+  const e = item.allDay && item.endsAt ? Date.parse(item.endsAt) : itemEnd(item).getTime();
+  return s < to && (e > from || (s >= from && s < to));
+}
+const sortForDay = (list) => [...list].sort((a, b) => (a.allDay === b.allDay ? Date.parse(a.startsAt) - Date.parse(b.startsAt) : a.allDay ? -1 : 1));
+
+// Al tocar un día: a las 9:00, o la siguiente hora si es hoy y ya pasó.
+function defaultStart(day) {
+  const now = new Date();
+  if (sameDay(day, now) && now.getHours() >= 9) return new Date(now.getFullYear(), now.getMonth(), now.getDate(), Math.min(23, now.getHours() + 1), 0);
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate(), 9, 0);
+}
+
+// Acomoda los eventos de un día en columnas cuando se enciman.
+function layoutDay(list, day) {
+  const dayStart = startOfDay(day).getTime();
+  const dayEnd = dayStart + 864e5;
+  const evs = list
+    .map((item) => {
+      const s = Math.max(dayStart, Date.parse(item.startsAt));
+      const e = Math.min(dayEnd, itemEnd(item).getTime());
+      return { item, s, e: Math.max(e, s + 20 * 60000) };
+    })
+    .sort((a, b) => a.s - b.s || b.e - a.e);
+  const out = [];
+  let cluster = [];
+  let clusterEnd = 0;
+  const flush = () => {
+    const cols = [];
+    for (const ev of cluster) {
+      let c = cols.findIndex((end) => end <= ev.s);
+      if (c < 0) {
+        c = cols.length;
+        cols.push(0);
+      }
+      cols[c] = ev.e;
+      ev.col = c;
+    }
+    for (const ev of cluster) out.push({ ...ev, cols: cols.length });
+    cluster = [];
+  };
+  for (const ev of evs) {
+    if (cluster.length && ev.s >= clusterEnd) {
+      flush();
+      clusterEnd = 0;
+    }
+    cluster.push(ev);
+    clusterEnd = Math.max(clusterEnd, ev.e);
+  }
+  if (cluster.length) flush();
+  return out.map((ev) => ({ ...ev, top: ((ev.s - dayStart) / 3600000) * HOUR_PX, height: Math.max(20, ((ev.e - ev.s) / 3600000) * HOUR_PX - 2) }));
+}
+
+function EventPill({ item, onOpen, compact = false }) {
+  const c = colorOf(item.color);
+  const cancelled = item.status === "cancelled";
   return (
-    <button type="button" onClick={() => onOpen(item)} className="flex w-full items-stretch gap-3 rounded-xl border border-slate-200 bg-white p-2.5 text-left shadow-sm transition hover:border-slate-300 hover:shadow">
-      <div className="w-16 shrink-0 text-right">
-        <p className="text-xs font-bold text-slate-700">{item.allDay ? "Todo el día" : hourLabel(start)}</p>
-        {showDay && <p className="text-[10px] text-slate-400">{start.toLocaleDateString("es-MX", { day: "numeric", month: "short" })}</p>}
-        {!item.allDay && item.endsAt && <p className="text-[10px] text-slate-400">{hourLabel(new Date(item.endsAt))}</p>}
-      </div>
-      <span className={`w-1 shrink-0 rounded-full ${color.dot}`} />
-      <div className="min-w-0 flex-1">
-        <p className={`flex items-center gap-1.5 text-xs font-semibold text-slate-800 ${item.status === "cancelled" ? "line-through opacity-60" : ""}`}>
-          <kind.icon size={12} className="shrink-0 text-slate-400" />
-          <span className="truncate">{item.title}</span>
-          {item.priority === "high" && <Flag size={11} className="shrink-0 text-amber-500" />}
-          {item.recurrence !== "none" && <Repeat size={11} className="shrink-0 text-slate-400" />}
-        </p>
-        <p className="mt-0.5 truncate text-[11px] text-slate-500">
-          {kind.label}
-          {item.location ? ` · ${item.location}` : ""}
-          {people ? ` · ${people + 1} personas` : ""}
-        </p>
-      </div>
-      <div className="flex shrink-0 flex-col items-end justify-center gap-1">
-        {item.status === "done" && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">Hecho</span>}
-        {item.status === "cancelled" && <span className="rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-700">Cancelado</span>}
-        {response && item.status === "scheduled" && <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${response.className}`}>{response.label}</span>}
-      </div>
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onOpen(item);
+      }}
+      title={`${item.allDay ? "Todo el día" : timeRange(item)} · ${item.title}`}
+      className={`flex w-full min-w-0 items-center gap-1 truncate rounded-md px-1.5 py-[3px] text-left text-[10px] font-semibold transition hover:brightness-95 ${
+        item.allDay ? `${c.dot} text-white` : `border-l-[3px] ${c.soft}`
+      } ${cancelled ? "line-through opacity-50" : ""}`}
+    >
+      {!item.allDay && !compact && <span className="shrink-0 opacity-80">{shortTime(new Date(item.startsAt))}</span>}
+      <span className="truncate">{item.title}</span>
     </button>
   );
 }
 
-/* ---------- La agenda completa (en Tareas) ---------- */
-export function AgendaView({ compact = false, switcher = null }) {
-  const [mode, setMode] = useState("upcoming"); // upcoming | month
-  const [month, setMonth] = useState(() => {
-    const d = new Date();
-    return new Date(d.getFullYear(), d.getMonth(), 1);
+function MonthView({ anchor, items, onCreate, onOpen, onOpenDay, compact }) {
+  const first = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+  const start = startOfWeek(first);
+  const todayKey = dateInput(new Date());
+  const maxPills = compact ? 2 : 3;
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white">
+      <div className="grid grid-cols-7 border-b border-slate-200 bg-slate-50">
+        {WEEKDAYS.map((w, i) => (
+          <p key={w} className={`py-1.5 text-center text-[10px] font-bold uppercase tracking-wide ${i >= 5 ? "text-slate-400" : "text-slate-500"}`}>
+            {compact ? w.charAt(0) : w}
+          </p>
+        ))}
+      </div>
+      <div className="grid min-h-0 flex-1 auto-rows-fr grid-cols-7">
+        {Array.from({ length: 42 }, (_, i) => {
+          const day = addDays(start, i);
+          const key = dateInput(day);
+          const inMonth = day.getMonth() === anchor.getMonth();
+          const list = sortForDay(items.filter((it) => touchesDay(it, day)));
+          const more = list.length - maxPills;
+          const isToday = key === todayKey;
+          return (
+            <div
+              key={key}
+              role="button"
+              tabIndex={0}
+              aria-label={`Agendar el ${day.toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" })}`}
+              onClick={() => onCreate(day, null)}
+              onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onCreate(day, null))}
+              className={`group flex min-h-[72px] cursor-pointer flex-col gap-0.5 overflow-hidden border-b border-r border-slate-100 p-1 transition hover:bg-blue-50/40 sm:min-h-[96px] ${inMonth ? "" : "bg-slate-50/60"} ${(i + 1) % 7 === 0 ? "border-r-0" : ""}`}
+            >
+              <div className="flex items-center justify-between px-0.5">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenDay(day);
+                  }}
+                  title="Ver el día"
+                  className={`flex h-6 min-w-[24px] items-center justify-center rounded-full px-1 text-[11px] font-bold transition ${
+                    isToday ? "bg-blue-600 text-white" : inMonth ? "text-slate-700 hover:bg-slate-100" : "text-slate-300 hover:bg-slate-100"
+                  }`}
+                >
+                  {day.getDate() === 1 && !compact ? `${day.getDate()} ${day.toLocaleDateString("es-MX", { month: "short" }).replace(".", "")}` : day.getDate()}
+                </button>
+                <Plus size={12} className="text-blue-500 opacity-0 transition group-hover:opacity-100" />
+              </div>
+              {list.slice(0, maxPills).map((item) => (
+                <EventPill key={`${item.id}-${item.startsAt}`} item={item} onOpen={onOpen} compact={compact} />
+              ))}
+              {more > 0 && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenDay(day);
+                  }}
+                  className="px-1 text-left text-[10px] font-semibold text-slate-500 hover:text-blue-600"
+                >
+                  +{more} más
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function TimeGrid({ days, items, onCreate, onOpen, onOpenDay }) {
+  const scrollRef = useRef(null);
+  const [now, setNow] = useState(Date.now());
+  const firstKey = dateInput(days[0]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60000);
+    return () => window.clearInterval(timer);
+  }, []);
+  // Al abrir, se ve desde las 7:00 (o una hora antes de ahora, si es hoy).
+  useEffect(() => {
+    const box = scrollRef.current;
+    if (!box) return;
+    const today = days.some((d) => sameDay(d, new Date()));
+    box.scrollTop = (today ? Math.max(0, new Date().getHours() - 1) : 7) * HOUR_PX;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [firstKey, days.length]);
+  const cols = `52px repeat(${days.length}, minmax(0, 1fr))`;
+  const allDay = days.map((d) => sortForDay(items.filter((i) => i.allDay && touchesDay(i, d))));
+  const timed = days.map((d) => layoutDay(items.filter((i) => !i.allDay && touchesDay(i, d)), d));
+  const anyAllDay = allDay.some((l) => l.length);
+  const nowDate = new Date(now);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white">
+      <div className="grid border-b border-slate-200 bg-slate-50" style={{ gridTemplateColumns: cols }}>
+        <div />
+        {days.map((d) => {
+          const isToday = sameDay(d, nowDate);
+          return (
+            <button key={dateInput(d)} type="button" onClick={() => onOpenDay(d)} disabled={days.length === 1} className="flex flex-col items-center py-1.5 transition enabled:hover:bg-slate-100">
+              <span className={`text-[10px] font-bold uppercase ${isToday ? "text-blue-600" : "text-slate-400"}`}>{d.toLocaleDateString("es-MX", { weekday: "short" }).replace(".", "")}</span>
+              <span className={`mt-0.5 flex h-7 w-7 items-center justify-center rounded-full text-sm font-bold ${isToday ? "bg-blue-600 text-white" : "text-slate-700"}`}>{d.getDate()}</span>
+            </button>
+          );
+        })}
+      </div>
+      {anyAllDay && (
+        <div className="grid border-b border-slate-200" style={{ gridTemplateColumns: cols }}>
+          <p className="px-1 py-1.5 text-right text-[9px] font-semibold leading-tight text-slate-400">Todo el día</p>
+          {days.map((d, idx) => (
+            <div key={dateInput(d)} onClick={() => onCreate(d, "allDay")} className="min-h-[30px] cursor-pointer space-y-0.5 border-l border-slate-100 p-0.5 hover:bg-blue-50/40">
+              {allDay[idx].map((item) => (
+                <EventPill key={`${item.id}-${item.startsAt}`} item={item} onOpen={onOpen} />
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div className="relative grid" style={{ gridTemplateColumns: cols, height: 24 * HOUR_PX }}>
+          <div className="relative">
+            {Array.from({ length: 24 }, (_, h) =>
+              h === 0 ? null : (
+                <span key={h} style={{ top: h * HOUR_PX - 7 }} className="absolute right-2 text-[10px] text-slate-400">
+                  {hourMark(h)}
+                </span>
+              )
+            )}
+          </div>
+          {days.map((d, idx) => {
+            const isToday = sameDay(d, nowDate);
+            const nowTop = ((nowDate.getHours() * 60 + nowDate.getMinutes()) / 60) * HOUR_PX;
+            return (
+              <div
+                key={dateInput(d)}
+                className="relative cursor-pointer border-l border-slate-100 hover:bg-blue-50/20"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const minutes = Math.min(23 * 60 + 30, Math.max(0, Math.floor(((e.clientY - rect.top) / HOUR_PX) * 2) * 30));
+                  onCreate(d, minutes);
+                }}
+              >
+                {Array.from({ length: 24 }, (_, h) => (
+                  <div key={h} style={{ top: h * HOUR_PX }} className="pointer-events-none absolute inset-x-0 border-t border-slate-100">
+                    <div className="absolute inset-x-0 border-t border-dashed border-slate-100" style={{ top: HOUR_PX / 2 }} />
+                  </div>
+                ))}
+                {timed[idx].map((ev) => {
+                  const c = colorOf(ev.item.color);
+                  const cancelled = ev.item.status === "cancelled";
+                  return (
+                    <button
+                      key={`${ev.item.id}-${ev.item.startsAt}`}
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpen(ev.item);
+                      }}
+                      title={`${timeRange(ev.item)} · ${ev.item.title}`}
+                      style={{ top: ev.top + 1, height: ev.height, left: `calc(${(ev.col / ev.cols) * 100}% + 2px)`, width: `calc(${100 / ev.cols}% - 4px)` }}
+                      className={`absolute z-10 overflow-hidden rounded-md border-l-[3px] px-1.5 py-0.5 text-left text-[10px] leading-tight shadow-sm transition hover:z-20 hover:shadow ${c.soft} ${cancelled ? "line-through opacity-50" : ""}`}
+                    >
+                      <span className="block truncate font-bold">{ev.item.title}</span>
+                      {ev.height >= 34 && <span className="block truncate opacity-80">{timeRange(ev.item)}</span>}
+                      {ev.height >= 52 && ev.item.location && <span className="block truncate opacity-70">{ev.item.location}</span>}
+                    </button>
+                  );
+                })}
+                {isToday && (
+                  <div style={{ top: nowTop }} className="pointer-events-none absolute inset-x-0 z-30 flex items-center">
+                    <span className="-ml-1 h-2 w-2 rounded-full bg-rose-500" />
+                    <span className="h-px flex-1 bg-rose-500" />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function AgendaView({ compact: compactProp = false }) {
+  // En el teléfono (o una ventana angosta) el calendario se acomoda más compacto.
+  const compact = compactProp || (typeof window !== "undefined" && !!window.matchMedia?.("(max-width: 640px)").matches);
+  const [view, setView] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem(VIEW_KEY);
+      if (saved === "month" || saved === "week" || saved === "day") return saved;
+    } catch {
+      // Sin almacenamiento: vista por omisión.
+    }
+    return compact ? "day" : "month";
   });
-  const [selectedDay, setSelectedDay] = useState(() => dateInput(new Date()));
+  const [anchor, setAnchor] = useState(() => startOfDay(new Date()));
   const [showCancelled, setShowCancelled] = useState(false);
   const [form, setForm] = useState(null);
   const [detail, setDetail] = useState(null);
 
-  // Rango a pedir: próximos 60 días, o las 6 semanas que se ven del mes.
-  const gridStart = useMemo(() => {
-    const first = new Date(month);
-    const offset = (first.getDay() + 6) % 7; // lunes = 0
-    return addDays(first, -offset);
-  }, [month]);
-  const todayKey = dateInput(new Date());
+  const changeView = (v) => {
+    setView(v);
+    try {
+      window.localStorage.setItem(VIEW_KEY, v);
+    } catch {
+      // Solo es comodidad.
+    }
+  };
   const range = useMemo(() => {
-    if (mode === "month") return { from: gridStart.toISOString(), to: addDays(gridStart, 42).toISOString() };
-    const today = new Date(`${todayKey}T00:00`);
-    return { from: today.toISOString(), to: addDays(today, 60).toISOString() };
-  }, [mode, gridStart, todayKey]);
-  const { items, loading, available } = useAgendaRange(range.from, range.to);
+    if (view === "month") {
+      const start = startOfWeek(new Date(anchor.getFullYear(), anchor.getMonth(), 1));
+      return { from: start, to: addDays(start, 42), days: [] };
+    }
+    if (view === "week") {
+      const start = startOfWeek(anchor);
+      return { from: start, to: addDays(start, 7), days: Array.from({ length: 7 }, (_, i) => addDays(start, i)) };
+    }
+    return { from: anchor, to: addDays(anchor, 1), days: [anchor] };
+  }, [view, anchor]);
+  const { items, available } = useAgendaRange(addDays(range.from, -1).toISOString(), range.to.toISOString());
   const shown = items.filter((i) => showCancelled || i.status !== "cancelled");
 
-  const byDay = useMemo(() => {
-    const map = new Map();
-    for (const item of shown) {
-      const key = dateInput(new Date(item.startsAt));
-      map.set(key, [...(map.get(key) ?? []), item]);
+  function move(step) {
+    if (view === "month") setAnchor(new Date(anchor.getFullYear(), anchor.getMonth() + step, 1));
+    else setAnchor(addDays(anchor, view === "week" ? 7 * step : step));
+  }
+  const title = (() => {
+    if (view === "month") return pretty(anchor.toLocaleDateString("es-MX", { month: "long", year: "numeric" }));
+    if (view === "week") {
+      const a = range.from;
+      const b = addDays(range.from, 6);
+      return a.getMonth() === b.getMonth()
+        ? `${a.getDate()} – ${b.getDate()} de ${b.toLocaleDateString("es-MX", { month: "long", year: "numeric" })}`
+        : `${a.toLocaleDateString("es-MX", { day: "numeric", month: "short" })} – ${b.toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" })}`;
     }
-    return map;
-  }, [shown]);
+    return pretty(anchor.toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long", year: "numeric" }));
+  })();
 
-  const header = (
-    <div className="flex flex-wrap items-center gap-2">
-      {switcher}
-      <div className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5">
-        {[
-          { id: "upcoming", label: "Próximos" },
-          { id: "month", label: "Mes" },
-        ].map((m) => (
-          <button key={m.id} type="button" onClick={() => setMode(m.id)} className={`rounded-md px-3 py-1 text-xs font-semibold transition ${mode === m.id ? "bg-slate-800 text-white" : "text-slate-500 hover:bg-slate-50"}`}>
-            {m.label}
-          </button>
-        ))}
-      </div>
-      <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-slate-500">
-        <input type="checkbox" checked={showCancelled} onChange={(e) => setShowCancelled(e.target.checked)} className="h-3.5 w-3.5 accent-blue-600" /> Ver cancelados
-      </label>
-      <button type="button" onClick={() => setForm({})} className="ml-auto flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700">
-        <CalendarPlus size={15} /> Agendar
-      </button>
-    </div>
-  );
-
-  let body;
-  if (!available) {
-    body = <p className="rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-10 text-center text-xs text-slate-400">La agenda se activa al aplicar la actualización v32 de la base de datos.</p>;
-  } else if (mode === "upcoming") {
-    const days = [...byDay.keys()].sort();
-    body = (
-      <div className="space-y-4">
-        {loading && <p className="py-8 text-center text-xs text-slate-400">Cargando agenda…</p>}
-        {!loading && days.length === 0 && (
-          <div className="rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-10 text-center">
-            <CalendarClock size={28} className="mx-auto text-slate-300" />
-            <p className="mt-2 text-sm font-semibold text-slate-600">Nada agendado en los próximos 60 días</p>
-            <p className="mt-1 text-xs text-slate-400">Agenda reuniones, revisiones de procesos, visitas o recordatorios. Te avisamos antes de cada uno.</p>
-          </div>
-        )}
-        {days.map((key) => (
-          <section key={key}>
-            <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400">{dayTitle(new Date(`${key}T00:00`))}</p>
-            <div className="space-y-1.5">
-              {byDay.get(key).map((item) => (
-                <AgendaRow key={`${item.id}-${item.startsAt}`} item={item} onOpen={setDetail} />
-              ))}
-            </div>
-          </section>
-        ))}
-      </div>
-    );
-  } else {
-    const weekdays = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
-    const dayItems = byDay.get(selectedDay) ?? [];
-    body = (
-      <div className="space-y-3">
-        <div className="flex items-center justify-between gap-2">
-          <button type="button" onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))} aria-label="Mes anterior" className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50">
-            <ChevronLeft size={15} />
-          </button>
-          <div className="flex items-center gap-2">
-            <p className="text-sm font-bold text-slate-800">{(() => {
-              const text = month.toLocaleDateString("es-MX", { month: "long", year: "numeric" });
-              return text.charAt(0).toUpperCase() + text.slice(1);
-            })()}</p>
-            <button
-              type="button"
-              onClick={() => {
-                const d = new Date();
-                setMonth(new Date(d.getFullYear(), d.getMonth(), 1));
-                setSelectedDay(dateInput(d));
-              }}
-              className="rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-semibold text-slate-500 hover:bg-slate-50"
-            >
-              Hoy
-            </button>
-          </div>
-          <button type="button" onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))} aria-label="Mes siguiente" className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50">
-            <ChevronRight size={15} />
-          </button>
-        </div>
-        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
-          <div className="grid grid-cols-7 border-b border-slate-100 bg-slate-50">
-            {weekdays.map((w) => (
-              <p key={w} className="py-1.5 text-center text-[10px] font-bold uppercase text-slate-400">
-                {w}
-              </p>
-            ))}
-          </div>
-          <div className="grid grid-cols-7">
-            {Array.from({ length: 42 }, (_, i) => {
-              const day = addDays(gridStart, i);
-              const key = dateInput(day);
-              const list = byDay.get(key) ?? [];
-              const inMonth = day.getMonth() === month.getMonth();
-              const isToday = key === todayKey;
-              return (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => setSelectedDay(key)}
-                  onDoubleClick={() => setForm({ startsAt: new Date(`${key}T09:00`).toISOString() })}
-                  className={`flex min-h-[64px] flex-col items-stretch gap-0.5 border-b border-r border-slate-100 p-1 text-left transition sm:min-h-[84px] ${selectedDay === key ? "bg-blue-50" : "hover:bg-slate-50"} ${inMonth ? "" : "opacity-40"}`}
-                >
-                  <span className={`flex h-5 w-5 items-center justify-center self-end rounded-full text-[10px] font-bold ${isToday ? "bg-blue-600 text-white" : "text-slate-500"}`}>{day.getDate()}</span>
-                  {list.slice(0, compact ? 2 : 3).map((item) => (
-                    <span key={`${item.id}-${item.startsAt}`} className={`truncate rounded border px-1 text-[9px] font-semibold sm:text-[10px] ${colorOf(item.color).soft} ${item.status === "cancelled" ? "line-through opacity-60" : ""}`}>
-                      {!item.allDay && <span className="hidden sm:inline">{hourLabel(new Date(item.startsAt))} </span>}
-                      {item.title}
-                    </span>
-                  ))}
-                  {list.length > (compact ? 2 : 3) && <span className="text-[9px] font-semibold text-slate-400">+{list.length - (compact ? 2 : 3)} más</span>}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-        <section>
-          <div className="mb-1.5 flex items-center justify-between">
-            <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400">{dayTitle(new Date(`${selectedDay}T00:00`))}</p>
-            <button type="button" onClick={() => setForm({ startsAt: new Date(`${selectedDay}T09:00`).toISOString() })} className="flex items-center gap-1 text-[11px] font-semibold text-blue-600 hover:underline">
-              <Plus size={12} /> Agendar este día
-            </button>
-          </div>
-          <div className="space-y-1.5">
-            {dayItems.map((item) => (
-              <AgendaRow key={`${item.id}-${item.startsAt}`} item={item} onOpen={setDetail} />
-            ))}
-            {dayItems.length === 0 && <p className="rounded-xl border border-dashed border-slate-200 bg-white px-3 py-4 text-center text-[11px] text-slate-400">Nada agendado este día.</p>}
-          </div>
-        </section>
-      </div>
-    );
+  // Tocar un día u hora: empieza a agendar ahí.
+  function create(day, minutes) {
+    if (minutes === "allDay") {
+      setForm({ startsAt: new Date(day.getFullYear(), day.getMonth(), day.getDate()).toISOString(), allDay: true });
+      return;
+    }
+    const at = minutes == null ? defaultStart(day) : new Date(day.getFullYear(), day.getMonth(), day.getDate(), Math.floor(minutes / 60), minutes % 60);
+    setForm({ startsAt: at.toISOString() });
+  }
+  function openDay(day) {
+    setAnchor(startOfDay(day));
+    changeView("day");
   }
 
   return (
-    <div className={compact ? "space-y-4 p-4 pb-24" : "space-y-4"}>
-      {compact && <h1 className="text-xl font-bold text-slate-900">Agenda</h1>}
-      {header}
-      {body}
+    <div className={compact ? "flex flex-col gap-2" : "flex h-[calc(100vh-7.5rem)] min-h-[540px] flex-col gap-3"}>
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1">
+          <button type="button" onClick={() => move(-1)} aria-label="Anterior" className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50">
+            <ChevronLeft size={15} />
+          </button>
+          <button type="button" onClick={() => setAnchor(startOfDay(new Date()))} className="h-8 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+            Hoy
+          </button>
+          <button type="button" onClick={() => move(1)} aria-label="Siguiente" className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50">
+            <ChevronRight size={15} />
+          </button>
+        </div>
+        <h2 className={`min-w-0 font-bold text-slate-800 ${compact ? "w-full text-sm sm:w-auto" : "text-base"}`}>{title}</h2>
+        <div className="ml-auto flex items-center gap-2">
+          <label className="hidden cursor-pointer items-center gap-1.5 text-[11px] text-slate-500 sm:flex">
+            <input type="checkbox" checked={showCancelled} onChange={(e) => setShowCancelled(e.target.checked)} className="h-3.5 w-3.5 accent-blue-600" /> Ver cancelados
+          </label>
+          <div className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5" role="tablist" aria-label="Vista del calendario">
+            {[
+              { id: "month", label: "Mes" },
+              { id: "week", label: "Semana" },
+              { id: "day", label: "Día" },
+            ].map((v) => (
+              <button key={v.id} type="button" role="tab" aria-selected={view === v.id} onClick={() => changeView(v.id)} className={`rounded-md px-3 py-1 text-xs font-semibold transition ${view === v.id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}>
+                {v.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <p className="-mt-1 text-[11px] text-slate-400">{view === "month" ? "Toca un día para agendar ahí." : "Toca una hora para agendar ahí."} Toca un evento para verlo, posponerlo o cancelarlo.</p>
+
+      {!available ? (
+        <p className="rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-10 text-center text-xs text-slate-400">La agenda se activa al aplicar la actualización v32 de la base de datos.</p>
+      ) : view === "month" ? (
+        <MonthView anchor={anchor} items={shown} onCreate={create} onOpen={setDetail} onOpenDay={openDay} compact={compact} />
+      ) : (
+        <div className={compact ? "flex h-[calc(100dvh-15rem)] min-h-[420px] flex-col" : "flex min-h-0 flex-1 flex-col"}>
+          <TimeGrid days={range.days} items={shown} onCreate={create} onOpen={setDetail} onOpenDay={openDay} />
+        </div>
+      )}
+
       {form && <AgendaEventForm initial={form} onClose={() => setForm(null)} />}
       {detail && (
         <AgendaEventDetail

@@ -1822,7 +1822,7 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
   const [selectedId, setSelectedId] = useState(focusId);
   const [showClosed, setShowClosed] = useState(true);
   const [resolving, setResolving] = useState(null); // tarea por resolver desde la lista
-  const [mode, setMode] = useState(view === "agenda" ? "agenda" : "tasks");
+  const mode = view === "agenda" ? "agenda" : "tasks";
   const tasks = inbox?.tasks ?? [];
   const today = localISODate();
 
@@ -1831,7 +1831,6 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
   }, [focusId]);
   useEffect(() => {
     if (view === "done") setShowClosed(true);
-    if (view === "agenda") setMode("agenda");
   }, [view]);
 
   const scopes = [
@@ -1961,30 +1960,11 @@ export function TasksPage({ isAdmin, compact = false, view = "open", focusId = n
     </div>
   );
 
-  const switcher = (
-    <div className="inline-flex rounded-xl border border-slate-200 bg-white p-0.5 shadow-sm" role="tablist" aria-label="Tareas o agenda">
-      {[
-        { id: "tasks", label: "Tareas", icon: ClipboardList },
-        { id: "agenda", label: "Agenda", icon: CalendarDays },
-      ].map((m) => (
-        <button
-          key={m.id}
-          type="button"
-          role="tab"
-          aria-selected={mode === m.id}
-          onClick={() => setMode(m.id)}
-          className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${mode === m.id ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}
-        >
-          <m.icon size={13} /> {m.label}
-        </button>
-      ))}
-    </div>
-  );
-  if (mode === "agenda") return <AgendaView compact={compact} switcher={switcher} />;
+  // Actividades → Agenda: solo el calendario.
+  if (mode === "agenda") return <AgendaView compact={compact} />;
 
   const toolbar = (
     <div className="flex flex-wrap items-center gap-2">
-      {switcher}
       {scopes.map((s) => {
         const count = tasks.filter(s.filter).filter(isPending).length;
         return (

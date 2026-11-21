@@ -438,7 +438,7 @@ function agendaOccurrences(e, from, to) {
     else if (e.recurrence === "yearly") d.setFullYear(d.getFullYear() + n);
     else d.setDate(d.getDate() + n * AG_STEP[e.recurrence]);
     if (d >= to || (e.recurUntil && d > new Date(e.recurUntil))) break;
-    if (d >= from && (e.recurrence !== "weekdays" || (d.getDay() !== 0 && d.getDay() !== 6))) out.push(d);
+    if (d >= from && (e.recurrence !== "weekdays" || (d.getDay() !== 0 && d.getDay() !== 6)) && !(e.skipped ?? []).includes(d.toISOString())) out.push(d);
   }
   return out;
 }
@@ -476,7 +476,7 @@ const rpcs = {
           ...e, startsAt: at.toISOString(), endsAt: e.endsAt ? new Date(at.getTime() + length).toISOString() : null, seriesStartsAt: e.startsAt, seriesEndsAt: e.endsAt,
           myResponse: agendaAttendees.find((a) => a.eventId === e.id && a.userId === ME)?.response ?? null,
           attendees: agendaAttendees.filter((a) => a.eventId === e.id).map((a) => ({ userId: a.userId, name: db.profiles.find((p) => p.id === a.userId)?.fullName, response: a.response })),
-          canEdit: e.createdBy === ME || (e.visibility === "company" && db.profiles.find((p) => p.id === ME).companyRole === "admin"),
+          canEdit: e.createdBy === ME || db.profiles.find((p) => p.id === ME).companyRole === "admin",
         });
       }
     }
@@ -503,6 +503,27 @@ const rpcs = {
     for (let i = agendaAttendees.length - 1; i >= 0; i -= 1) if (agendaAttendees[i].eventId === ev.id && !people.includes(agendaAttendees[i].userId)) agendaAttendees.splice(i, 1);
     for (const userId of people) if (!agendaAttendees.some((a) => a.eventId === ev.id && a.userId === userId)) agendaAttendees.push({ eventId: ev.id, userId, response: "pending" });
     return ev.id;
+  },
+  agenda_postpone({ target_event, occurrence, new_start, new_end }) {
+    const e = agendaEvents.find((x) => x.id === target_event);
+    const admin = db.profiles.find((p) => p.id === ME).companyRole === "admin";
+    if (!e || !(e.createdBy === ME || admin)) throw new Error("Solo quien organiza el evento (o un administrador) lo puede posponer.");
+    if (e.recurrence === "none") {
+      Object.assign(e, { startsAt: new_start, endsAt: new_end ?? null });
+      for (const a of agendaAttendees.filter((x) => x.eventId === e.id)) a.response = "pending";
+      return e.id;
+    }
+    e.skipped = [...(e.skipped ?? []), new Date(occurrence).toISOString()];
+    const copy = { ...e, id: nextId++, startsAt: new_start, endsAt: new_end ?? null, recurrence: "none", recurUntil: null, skipped: [] };
+    agendaEvents.push(copy);
+    for (const a of agendaAttendees.filter((x) => x.eventId === e.id)) agendaAttendees.push({ eventId: copy.id, userId: a.userId, response: "pending" });
+    return copy.id;
+  },
+  agenda_skip({ target_event, occurrence }) {
+    const e = agendaEvents.find((x) => x.id === target_event);
+    if (!e || e.recurrence === "none") throw new Error("Este evento no se repite: cancélalo completo.");
+    e.skipped = [...(e.skipped ?? []), new Date(occurrence).toISOString()];
+    return null;
   },
   agenda_respond({ target_event, answer }) {
     const a = agendaAttendees.find((x) => x.eventId === target_event && x.userId === ME);
