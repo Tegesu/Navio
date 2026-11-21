@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import L from "leaflet";
 import { ArrowUpDown, Car, Clock, Crosshair, Flag, History, LocateFixed, MapPin, Navigation, Plus, Route, Search, Truck, X } from "lucide-react";
-import { useAuth, useToast, profileCan } from "./NavioDashboard.jsx";
+import { supabase, useAuth, useToast, profileCan } from "./NavioDashboard.jsx";
 import { usePermissionGate, geoProblem } from "./permissions.jsx";
 import { useBackLayer } from "./history.js";
 import { addBaseLayer, hasTomTom, searchPlaces, placeName, planRoutes, durationText } from "./maps.js";
@@ -461,6 +461,18 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
         : null
     );
     const ok = await tracking.start({ vehicleId: vehicle.id, tripId: chosenTrip?.id ?? null, unit: vehicle.unit, source: chosenSource });
+    // Lo planeado queda con el viaje, para comparar con lo real (v34).
+    if (ok?.id && (route || to)) {
+      supabase
+        .rpc("set_route_plan", {
+          target_route: ok.id,
+          planned_minutes: route?.minutes ?? null,
+          planned_km: route?.km ?? null,
+          planned_arrival: route ? arrival.toISOString() : null,
+          destination: to?.label ?? null,
+        })
+        .then(() => {}, () => {});
+    }
     if (ok !== false) {
       setSheet(false);
       setFollow(true);
@@ -583,6 +595,7 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
         {active ? (
           <div className="space-y-2 rounded-2xl bg-white/95 p-2.5 shadow-xl ring-1 ring-slate-200 backdrop-blur">
             <TrackingLiveCard />
+            <SlowNotice />
             <TrackingModeNote />
             <TrackingError />
             {confirming ? (
@@ -786,6 +799,36 @@ export function TripMapScreen({ vehicles, trips = [], onShowHistory }) {
       )}
       {geo.sheet}
     </div>
+  );
+}
+
+// Aviso durante el viaje: la unidad casi no avanza y qué dice TomTom del tráfico.
+function SlowNotice() {
+  const { slow, trafficEvents = [] } = useTracking();
+  const done = trafficEvents.filter((e) => e.endedAt);
+  if (!slow && done.length === 0) return null;
+  if (slow) {
+    const since = new Date(slow.startedAt).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" });
+    const traffic = slow.verdict === "traffic";
+    return (
+      <p className={`rounded-xl px-3 py-2 text-[11px] font-medium ${traffic ? "bg-rose-50 text-rose-700" : "bg-amber-50 text-amber-800"}`}>
+        <b>Avance lento desde las {since}</b>
+        <br />
+        {slow.pending
+          ? "Revisando el tráfico con TomTom…"
+          : traffic
+          ? `Tráfico confirmado: la calle va a ${Math.round(slow.currentSpeedKmh ?? 0)} km/h (normal ${Math.round(slow.freeFlowSpeedKmh ?? 0)}). Queda registrado.`
+          : slow.verdict === "clear"
+          ? "TomTom marca la calle libre."
+          : "Sin datos de tráfico para este tramo."}
+      </p>
+    );
+  }
+  const minutes = done.reduce((n, e) => n + Math.max(1, Math.round((Date.parse(e.endedAt) - Date.parse(e.startedAt)) / 60000)), 0);
+  return (
+    <p className="rounded-xl bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+      {done.length} {done.length === 1 ? "tramo lento registrado" : "tramos lentos registrados"} · {minutes} min
+    </p>
   );
 }
 

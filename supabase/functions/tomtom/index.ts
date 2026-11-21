@@ -22,13 +22,16 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.118.0";
 
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const KEY = Deno.env.get("TOMTOM_SERVER_KEY") ?? "";
+// Para el tráfico en vivo: la llave de la página (ya es pública, viene en el
+// código de Navio y tiene Traffic API). Se puede cambiar con TOMTOM_TRAFFIC_KEY.
+const TRAFFIC_KEY = Deno.env.get("TOMTOM_TRAFFIC_KEY") ?? "7L2WxUWmAj04PAArzB9kXpZz58cSdxQB";
 
-const LIMITS: Record<string, number> = { search: 150, reverse: 150, route: 40 };
+const LIMITS: Record<string, number> = { search: 150, reverse: 150, route: 40, traffic_start: 30, traffic_end: 60 };
 const CACHE_MS = 10 * 60_000;
 const cache = new Map<string, { at: number; data: unknown }>();
 
 // Versión de esta función (para revisar desde fuera que se desplegó la nueva).
-const VERSION = "tomtom-4";
+const VERSION = "tomtom-5";
 
 const ORIGINS = ["https://navio-fyj2.vercel.app"];
 const cors = (origin: string | null) => ({
@@ -59,6 +62,14 @@ async function keyStatus() {
     llave: KEY ? "configurada" : "falta",
     busqueda: KEY ? await check("/search/2/search/Coatzacoalcos.json", { countrySet: "MX", limit: "1" }) : "sin llave",
     rutas: KEY ? await check("/routing/1/calculateRoute/18.14000,-94.45000:18.15000,-94.43000/json", { traffic: "false" }) : "sin llave",
+    trafico: await (async () => {
+      try {
+        await tomtom("/traffic/services/4/flowSegmentData/absolute/10/json", { point: "18.13450,-94.45900", unit: "KMPH" }, TRAFFIC_KEY);
+        return "bien";
+      } catch (err) {
+        return err instanceof TomTomError ? err.detail : "sin respuesta";
+      }
+    })(),
   };
   statusCache = { at: Date.now(), data };
   return data;
@@ -76,8 +87,8 @@ class TomTomError extends Error {
   }
 }
 
-async function tomtom(path: string, params: Record<string, string>) {
-  const query = new URLSearchParams({ key: KEY, language: "es-ES", ...params });
+async function tomtom(path: string, params: Record<string, string>, key = KEY) {
+  const query = new URLSearchParams({ key, language: "es-ES", ...params });
   // Si la llave está limitada al dominio de Navio, TomTom pide que la
   // petición diga que viene de ahí (desde el servidor no lo dice sola).
   const res = await fetch(`https://api.tomtom.com${path}?${query}`, {
@@ -96,6 +107,101 @@ async function tomtom(path: string, params: Record<string, string>) {
     throw new TomTomError(overQuota ? "cuota" : res.status === 403 || res.status === 401 ? "permiso" : "tomtom", `${res.status}${detail ? `: ${detail}` : ""}`);
   }
   return res.json();
+}
+
+/* ---------- Tramos lentos: evidencia de tráfico ---------- */
+const INCIDENT_TYPES: Record<number, string> = {
+  1: "Accidente", 2: "Niebla", 3: "Condiciones peligrosas", 4: "Lluvia", 5: "Hielo", 6: "Tráfico detenido",
+  7: "Carril cerrado", 8: "Calle cerrada", 9: "Obras", 10: "Viento", 11: "Inundación", 14: "Vehículo descompuesto",
+};
+const toRad = (d: number) => (d * Math.PI) / 180;
+function km(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
+  const h = Math.sin(toRad(b.lat - a.lat) / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(toRad(b.lng - a.lng) / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(h));
+}
+
+// Lo que reporta TomTom ahora en ese punto: velocidad de la calle, incidentes
+// cerca y el nombre de la calle.
+async function trafficAt(lat: number, lng: number) {
+  const out = {
+    currentSpeedKmh: null as number | null,
+    freeFlowSpeedKmh: null as number | null,
+    confidence: null as number | null,
+    roadClosure: false,
+    incidents: [] as Array<Record<string, unknown>>,
+    roadName: null as string | null,
+    note: [] as string[],
+  };
+  try {
+    const flow = await tomtom("/traffic/services/4/flowSegmentData/absolute/10/json", { point: `${lat.toFixed(5)},${lng.toFixed(5)}`, unit: "KMPH" }, TRAFFIC_KEY);
+    const d = flow?.flowSegmentData ?? {};
+    out.currentSpeedKmh = Number.isFinite(d.currentSpeed) ? d.currentSpeed : null;
+    out.freeFlowSpeedKmh = Number.isFinite(d.freeFlowSpeed) ? d.freeFlowSpeed : null;
+    out.confidence = Number.isFinite(d.confidence) ? d.confidence : null;
+    out.roadClosure = !!d.roadClosure;
+  } catch (err) {
+    out.note.push(`flujo ${err instanceof TomTomError ? err.detail : "sin respuesta"}`);
+  }
+  try {
+    const box = [lng - 0.01, lat - 0.01, lng + 0.01, lat + 0.01].map((n) => n.toFixed(5)).join(",");
+    const data = await tomtom(
+      "/traffic/services/5/incidentDetails",
+      {
+        bbox: box,
+        fields: "{incidents{geometry{type,coordinates},properties{iconCategory,magnitudeOfDelay,events{description},from,to,delay}}}",
+        timeValidityFilter: "present",
+      },
+      TRAFFIC_KEY
+    );
+    // deno-lint-ignore no-explicit-any
+    const near = (geometry: any) => {
+      const coords: number[][] = geometry?.type === "Point" ? [geometry.coordinates] : geometry?.coordinates ?? [];
+      return Math.min(...coords.map((c) => km({ lat, lng }, { lat: c[1], lng: c[0] })), 99);
+    };
+    // deno-lint-ignore no-explicit-any
+    const list: any[] = data?.incidents ?? [];
+    out.incidents = list
+      .map((i) => ({ dist: near(i.geometry), p: i.properties ?? {} }))
+      .filter((i) => i.dist <= 0.6)
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 5)
+      .map(({ dist, p }) => ({
+        type: INCIDENT_TYPES[p.iconCategory] ?? "Incidente",
+        description: String(p.events?.[0]?.description ?? "").slice(0, 120),
+        from: p.from ? String(p.from).slice(0, 80) : null,
+        to: p.to ? String(p.to).slice(0, 80) : null,
+        delayMinutes: Number.isFinite(p.delay) ? Math.round(p.delay / 60) : null,
+        magnitude: p.magnitudeOfDelay ?? null,
+        meters: Math.round(dist * 1000),
+      }));
+  } catch (err) {
+    out.note.push(`incidentes ${err instanceof TomTomError ? err.detail : "sin respuesta"}`);
+  }
+  try {
+    const rev = await tomtom(`/search/2/reverseGeocode/${lat.toFixed(5)},${lng.toFixed(5)}.json`, { radius: "100" });
+    const a = rev?.addresses?.[0]?.address ?? {};
+    out.roadName = String(a.streetName ?? a.freeformAddress ?? "").slice(0, 160) || null;
+  } catch {
+    // Sin nombre de calle.
+  }
+  return out;
+}
+
+// Cuánto avanzó la unidad entre dos momentos (con sus puntos guardados).
+async function movedBetween(routeId: number, from: string, to: string) {
+  const { data } = await supabase
+    .from("route_points")
+    .select("lat, lng, recordedAt")
+    .eq("routeId", routeId)
+    .gte("recordedAt", from)
+    .lte("recordedAt", to)
+    .order("recordedAt", { ascending: true })
+    .limit(2000);
+  const points = data ?? [];
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) total += km(points[i - 1], points[i]);
+  const hours = (Date.parse(to) - Date.parse(from)) / 3600000;
+  return { movedKm: Math.round(total * 100) / 100, unitSpeedKmh: hours > 0 ? Math.round((total / hours) * 10) / 10 : null };
 }
 
 Deno.serve(async (req) => {
@@ -121,6 +227,76 @@ Deno.serve(async (req) => {
 
   const action = String(body.action ?? "");
   if (!(action in LIMITS)) return json(400, { error: "Acción no válida." });
+
+  // Tramo lento: empieza (consulta el tráfico) o termina (cuánto avanzó).
+  if (action === "traffic_start" || action === "traffic_end") {
+    const { error: trafficLimit } = await supabase.rpc("hit_rate_limit", {
+      limit_bucket: `tomtom_${action}`,
+      limit_subject: auth.user.id,
+      max_hits: LIMITS[action],
+      per_window: "1 hour",
+      message: "Demasiados avisos de tráfico en una hora.",
+    });
+    if (trafficLimit) return json(429, { error: trafficLimit.message });
+    const now = new Date().toISOString();
+    if (action === "traffic_start") {
+      const routeId = num(body.routeId, 1, Number.MAX_SAFE_INTEGER);
+      const lat = num(body.lat, -90, 90);
+      const lng = num(body.lng, -180, 180);
+      if (routeId === null || lat === null || lng === null) return json(400, { error: "Datos no válidos." });
+      const { data: route } = await supabase.from("routes").select('id, "companyId", "createdBy", status, "startedAt"').eq("id", routeId).maybeSingle();
+      if (!route || route.createdBy !== auth.user.id || route.status !== "active") return json(403, { error: "Ese viaje no es tuyo o ya terminó." });
+      // Desde cuándo va lento: lo dice el teléfono, pero dentro de la última hora y del viaje.
+      const sinceRaw = Date.parse(String(body.since ?? ""));
+      const floor = Math.max(Date.parse(route.startedAt), Date.now() - 60 * 60_000);
+      const since = new Date(Number.isFinite(sinceRaw) ? Math.min(Date.now(), Math.max(floor, sinceRaw)) : Date.now()).toISOString();
+      const traffic = await trafficAt(lat, lng);
+      const moved = await movedBetween(routeId, since, now);
+      const cur = traffic.currentSpeedKmh;
+      const free = traffic.freeFlowSpeedKmh;
+      const slowRoad = cur !== null && free !== null && free > 0 && cur / free < 0.6;
+      const verdict = traffic.roadClosure || slowRoad || traffic.incidents.length > 0 ? "traffic" : cur !== null ? "clear" : "unknown";
+      const { data: created, error: insertError } = await supabase
+        .from("route_traffic_events")
+        .insert({
+          companyId: route.companyId,
+          routeId,
+          startedAt: since,
+          checkedAt: now,
+          lat,
+          lng,
+          roadName: traffic.roadName,
+          movedKm: moved.movedKm,
+          unitSpeedKmh: moved.unitSpeedKmh,
+          currentSpeedKmh: cur,
+          freeFlowSpeedKmh: free,
+          confidence: traffic.confidence,
+          roadClosure: traffic.roadClosure,
+          incidents: traffic.incidents,
+          verdict,
+          note: traffic.note.join(" · ") || null,
+        })
+        .select()
+        .single();
+      if (insertError) return json(500, { error: /route_traffic_events/.test(insertError.message) ? "Falta la actualización v34 de la base de datos." : "No se pudo guardar el tramo." });
+      return json(200, created);
+    }
+    const eventId = num(body.eventId, 1, Number.MAX_SAFE_INTEGER);
+    if (eventId === null) return json(400, { error: "Datos no válidos." });
+    const { data: event } = await supabase.from("route_traffic_events").select('id, "routeId", "startedAt", "endedAt"').eq("id", eventId).maybeSingle();
+    if (!event) return json(404, { error: "No se encontró el tramo." });
+    const { data: owner } = await supabase.from("routes").select('"createdBy"').eq("id", event.routeId).maybeSingle();
+    if (!owner || owner.createdBy !== auth.user.id) return json(403, { error: "Ese tramo no es tuyo." });
+    if (event.endedAt) return json(200, event);
+    const moved = await movedBetween(event.routeId, event.startedAt, now);
+    const { data: closed } = await supabase
+      .from("route_traffic_events")
+      .update({ endedAt: now, movedKm: moved.movedKm, unitSpeedKmh: moved.unitSpeedKmh })
+      .eq("id", eventId)
+      .select()
+      .single();
+    return json(200, closed);
+  }
 
   // Qué se va a pedir (validado) y su llave de memoria.
   let path = "";

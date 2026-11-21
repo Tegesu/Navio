@@ -18,7 +18,7 @@ import {
   DOCUMENT_MAX_MB,
   VehiclePhoto,
 } from "./NavioDashboard.jsx";
-import { RouteMap, routeSummary } from "./tracking.jsx";
+import { RouteMap, RouteTrafficReport, routeSummary } from "./tracking.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Expediente de la unidad y garantías: todo sale de registros reales    */
@@ -573,6 +573,7 @@ export function VehicleLocationPanel({ vehicle }) {
           <MapPin size={12} /> Ver en el mapa en vivo
         </button>
       </div>
+      <RouteTrafficReport routeId={route.id} route={route} live={live} />
     </div>
   );
 }

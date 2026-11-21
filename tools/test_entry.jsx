@@ -504,6 +504,11 @@ const rpcs = {
     for (const userId of people) if (!agendaAttendees.some((a) => a.eventId === ev.id && a.userId === userId)) agendaAttendees.push({ eventId: ev.id, userId, response: "pending" });
     return ev.id;
   },
+  set_route_plan({ target_route, planned_minutes, planned_km, planned_arrival, destination }) {
+    const r = db.routes?.find((x) => x.id === target_route);
+    if (r) Object.assign(r, { plannedMinutes: planned_minutes, plannedKm: planned_km, plannedArrival: planned_arrival, destinationLabel: destination });
+    return null;
+  },
   agenda_postpone({ target_event, occurrence, new_start, new_end }) {
     const e = agendaEvents.find((x) => x.id === target_event);
     const admin = db.profiles.find((p) => p.id === ME).companyRole === "admin";
@@ -922,6 +927,24 @@ Object.defineProperty(supabase, "functions", {
       window.__invokes.push({ name, body });
       if (name === "translate") return { data: { translation: `[EN] ${body?.text ?? ""}` }, error: null };
       // ?tomtom: lugares y rutas de mentira (TomTom no responde en localhost).
+      if (name === "tomtom" && params.has("tomtom") && (body.action === "traffic_start" || body.action === "traffic_end")) {
+        const list = (db.route_traffic_events ??= []);
+        if (body.action === "traffic_start") {
+          const jam = !window.__clearRoad;
+          const ev = {
+            id: nextId++, companyId: COMPANY, routeId: body.routeId, startedAt: body.since, checkedAt: new Date().toISOString(), endedAt: null,
+            lat: body.lat, lng: body.lng, roadName: "Avenida Universidad", movedKm: 0.12, unitSpeedKmh: 1.8,
+            currentSpeedKmh: jam ? 8 : 48, freeFlowSpeedKmh: 52, confidence: 0.95, roadClosure: false,
+            incidents: jam ? [{ type: "Accidente", description: "Choque en carril derecho", from: "Calle Morelos", to: "Calle Hidalgo", delayMinutes: 14, meters: 180 }] : [],
+            verdict: jam ? "traffic" : "clear", note: null,
+          };
+          list.push(ev);
+          return { data: { ...ev }, error: null };
+        }
+        const ev = list.find((e) => e.id === body.eventId);
+        if (ev && !ev.endedAt) Object.assign(ev, { endedAt: new Date().toISOString(), movedKm: 0.4 });
+        return { data: ev ? { ...ev } : null, error: ev ? null : { message: "No se encontró el tramo." } };
+      }
       if (name === "tomtom" && params.has("tomtom")) {
         const places = [
           { name: "Mérida", lat: 20.967, lng: -89.623 },

@@ -116,6 +116,22 @@ async function sendPoints(args) {
   return supabase.rpc("track_route_points", args);
 }
 
+/* ---------- Tramos lentos (evidencia de tráfico) ---------- */
+// Si la unidad casi no avanza durante unos minutos (y no está en el origen,
+// una parada o el destino), el servidor le pregunta a TomTom por el tráfico
+// de ese tramo en ese momento y lo guarda con el viaje (función tomtom, v34).
+const SLOW_KEY = "navio.trip.slow";
+const SLOW_WINDOW_MS = 4 * 60000; // tanto tiempo casi sin avanzar…
+const SLOW_MAX_M = 250; // …moviéndose menos que esto
+const MOVING_AGAIN_M = 500; // ya se alejó: el tramo terminó
+const PLANNED_STOP_M = 300; // cerca del origen, una parada o el destino no cuenta
+const MAX_SLOW_EVENTS = 15;
+const metersBetween = (a, b) => {
+  const r = Math.PI / 180;
+  const h = Math.sin(((b.lat - a.lat) * r) / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(((b.lng - a.lng) * r) / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.sqrt(h));
+};
+
 const TrackingContext = createContext(null);
 
 export function useTracking() {
@@ -148,6 +164,14 @@ export function TrackingProvider({ children }) {
   const flushingRef = useRef(false);
   const wakeLockRef = useRef(null);
   const hiddenAtRef = useRef(null);
+  // Tramos lentos del viaje en curso.
+  const trailRef = useRef([]); // ubicaciones recientes { lat, lng, t }
+  const firstFixRef = useRef(null);
+  const slowRef = useRef(readStored(SLOW_KEY)); // tramo abierto { eventId?, lat, lng, startedAt, pending? }
+  const slowEndRef = useRef(null); // el último que terminó (para no repetirlo al instante)
+  const slowCountRef = useRef(0); // cuántos lleva este viaje
+  const [slow, setSlow] = useState(() => readStored(SLOW_KEY));
+  const [trafficEvents, setTrafficEvents] = useState([]);
 
   const native = isNativeApp();
   // Con qué se registra el viaje en curso en este dispositivo.
@@ -186,8 +210,99 @@ export function TrackingProvider({ children }) {
     wakeLockRef.current = null;
   }
 
+  function setSlowState(value) {
+    slowRef.current = value;
+    writeStored(SLOW_KEY, value);
+    setSlow(value);
+  }
+
+  // La unidad lleva unos minutos casi sin avanzar: se pide la evidencia al servidor.
+  async function startSlow(sinceT, fix) {
+    const current = activeRef.current;
+    if (!current?.routeId || slowRef.current) return;
+    setSlowState({ pending: true, lat: fix.lat, lng: fix.lng, startedAt: new Date(sinceT).toISOString() });
+    await flush();
+    let data = null;
+    try {
+      const res = await supabase.functions.invoke("tomtom", {
+        body: { action: "traffic_start", routeId: current.routeId, lat: fix.lat, lng: fix.lng, since: new Date(sinceT).toISOString() },
+      });
+      data = res.error ? null : res.data;
+    } catch {
+      data = null;
+    }
+    if (activeRef.current?.routeId !== current.routeId) return;
+    if (!data?.id) {
+      // Sin la función nueva o sin red: se intenta de nuevo más adelante.
+      setSlowState(null);
+      slowEndRef.current = { ...fix, t: Date.now() };
+      return;
+    }
+    slowCountRef.current += 1;
+    setSlowState({ eventId: data.id, lat: fix.lat, lng: fix.lng, startedAt: data.startedAt, verdict: data.verdict, currentSpeedKmh: data.currentSpeedKmh, freeFlowSpeedKmh: data.freeFlowSpeedKmh });
+    setTrafficEvents((prev) => [...prev.filter((e) => e.id !== data.id), data]);
+  }
+
+  async function endSlow() {
+    const open = slowRef.current;
+    setSlowState(null);
+    slowEndRef.current = open ? { lat: open.lat, lng: open.lng, t: Date.now() } : null;
+    if (!open?.eventId) return;
+    await flush();
+    try {
+      const { data } = await supabase.functions.invoke("tomtom", { body: { action: "traffic_end", eventId: open.eventId } });
+      if (data?.id) setTrafficEvents((prev) => prev.map((e) => (e.id === data.id ? data : e)));
+    } catch {
+      // El tramo queda abierto; se ve igual en el reporte.
+    }
+  }
+
+  // Revisa con cada ubicación (y cada medio minuto) si la unidad está atorada.
+  function checkSlow(fix) {
+    const current = activeRef.current;
+    if (!current?.routeId || current.source === "tracker") return;
+    const open = slowRef.current;
+    if (open) {
+      if (!open.pending && metersBetween(open, fix) > MOVING_AGAIN_M) endSlow();
+      return;
+    }
+    if (slowCountRef.current >= MAX_SLOW_EVENTS) return;
+    const trail = trailRef.current;
+    let old = null;
+    for (let i = trail.length - 1; i >= 0; i -= 1) {
+      if (fix.t - trail[i].t >= SLOW_WINDOW_MS) {
+        old = trail[i];
+        break;
+      }
+    }
+    if (!old) return;
+    const since = trail.filter((p) => p.t >= old.t);
+    if (since.some((p) => metersBetween(old, p) > SLOW_MAX_M) || metersBetween(old, fix) > SLOW_MAX_M) return;
+    // Donde empezó, una parada planeada o el destino no son atascos.
+    const plan = readPlan();
+    const planned = [firstFixRef.current, plan?.destination, ...(plan?.stops ?? [])].filter((p) => p && Number.isFinite(p.lat));
+    if (planned.some((p) => metersBetween(p, fix) < PLANNED_STOP_M)) return;
+    const last = slowEndRef.current;
+    if (last && metersBetween(last, fix) < PLANNED_STOP_M && fix.t - last.t < 5 * 60000) return;
+    startSlow(old.t, fix);
+  }
+
+  function trackSlowFix(fix) {
+    if (!firstFixRef.current) firstFixRef.current = fix;
+    const trail = trailRef.current;
+    trail.push(fix);
+    while (trail.length && fix.t - trail[0].t > SLOW_WINDOW_MS + 3 * 60000) trail.shift();
+    checkSlow(fix);
+  }
+
   function stopLocal() {
     clearWatch();
+    trailRef.current = [];
+    firstFixRef.current = null;
+    slowEndRef.current = null;
+    slowCountRef.current = 0;
+    setSlowState(null);
+    setTrafficEvents([]);
     queueRef.current = [];
     persistQueue();
     writeStored(ACTIVE_KEY, null);
@@ -244,6 +359,7 @@ export function TrackingProvider({ children }) {
     const { latitude, longitude, speed, heading, accuracy } = position.coords;
     const kmh = speed != null && speed >= 0 ? Math.round(speed * 36) / 10 : null;
     setLastFix({ lat: latitude, lng: longitude, speed: kmh, accuracy, at: now });
+    trackSlowFix({ lat: latitude, lng: longitude, t: now });
     setError((prev) => (prev.startsWith("Buscando") || prev.startsWith("No se pudo obtener") ? "" : prev));
     if (now - lastPointRef.current < MIN_POINT_MS) return;
     lastPointRef.current = now;
@@ -399,9 +515,15 @@ export function TrackingProvider({ children }) {
     queueRef.current = [];
     persistQueue();
     lastPointRef.current = 0;
+    trailRef.current = [];
+    firstFixRef.current = null;
+    slowEndRef.current = null;
+    slowCountRef.current = 0;
+    setSlowState(null);
+    setTrafficEvents([]);
     follow(route, unit);
     announceTripsChanged();
-    return true;
+    return route;
   }
 
   async function stop({ completeTrip = true } = {}) {
@@ -409,6 +531,7 @@ export function TrackingProvider({ children }) {
     if (!current) return null;
     setStatus("stopping");
     clearWatch();
+    if (slowRef.current?.eventId) await endSlow();
     const sent = await flush();
     if (!sent && activeRef.current) {
       setStatus("tracking");
@@ -568,7 +691,34 @@ export function TrackingProvider({ children }) {
   useEffect(() => clearWatch, []);
 
   const clearError = () => setError("");
-  const value = { active, status, stats, lastFix, pending, error, clearError, orphan, consent, mode, native, tracker, trackerSeenAt, pausedMs, start, stop, follow, finishOrphan, giveConsent, reloadTracker };
+  // Sin señal unos minutos (detenido del todo): también puede ser un atasco.
+  const lastFixRef = useRef(null);
+  lastFixRef.current = lastFix;
+  useEffect(() => {
+    if (!active?.routeId || active.source === "tracker") return undefined;
+    const timer = window.setInterval(() => {
+      const fix = lastFixRef.current;
+      if (fix && Date.now() - fix.at >= 60000) checkSlow({ lat: fix.lat, lng: fix.lng, t: Date.now() });
+    }, 30000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.routeId, active?.source]);
+  // Al volver a Navio a media ruta, se recuperan los tramos ya guardados.
+  useEffect(() => {
+    if (!active?.routeId) return;
+    supabase
+      .from("route_traffic_events")
+      .select("*")
+      .eq("routeId", active.routeId)
+      .order("startedAt", { ascending: true })
+      .then(({ data, error: loadError }) => {
+        if (loadError || !Array.isArray(data)) return;
+        slowCountRef.current = data.length;
+        setTrafficEvents(data);
+      });
+  }, [active?.routeId]);
+
+  const value = { active, status, stats, lastFix, pending, error, clearError, orphan, consent, mode, native, tracker, trackerSeenAt, pausedMs, start, stop, follow, finishOrphan, giveConsent, reloadTracker, slow, trafficEvents };
   return <TrackingContext.Provider value={value}>{children}</TrackingContext.Provider>;
 }
 
@@ -768,7 +918,12 @@ export function DriverPanel({ vehicles, trips = [], big = false }) {
           }
         : null
     );
-    await tracking.start({ vehicleId: vehicle.id, tripId: chosenTrip?.id ?? null, unit: vehicle.unit, source: chosenSource });
+    const started = await tracking.start({ vehicleId: vehicle.id, tripId: chosenTrip?.id ?? null, unit: vehicle.unit, source: chosenSource });
+    if (started?.id && route) {
+      supabase
+        .rpc("set_route_plan", { target_route: started.id, planned_minutes: route.minutes, planned_km: route.km, planned_arrival: new Date(Date.now() + route.minutes * 60000).toISOString(), destination: plan.to?.label ?? null })
+        .then(() => {}, () => {});
+    }
   }
 
   async function handleStop() {
@@ -1195,6 +1350,130 @@ export function routeSummary(route) {
   ];
 }
 
+// Tramos lentos de un recorrido (con lo que reportó TomTom en ese momento).
+const trafficCache = new Map();
+export function useRouteTraffic(routeId, live = false) {
+  const [events, setEvents] = useState(() => trafficCache.get(routeId) ?? null);
+  useEffect(() => {
+    if (!routeId) return undefined;
+    let alive = true;
+    const load = () =>
+      supabase
+        .from("route_traffic_events")
+        .select("*")
+        .eq("routeId", routeId)
+        .order("startedAt", { ascending: true })
+        .then(({ data, error }) => {
+          const list = error ? [] : data ?? [];
+          trafficCache.set(routeId, list);
+          if (alive) setEvents(list);
+        });
+    load();
+    const timer = live ? window.setInterval(load, 30000) : null;
+    return () => {
+      alive = false;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [routeId, live]);
+  return events;
+}
+
+const slowMinutes = (e) => Math.max(1, Math.round(((e.endedAt ? Date.parse(e.endedAt) : Date.now()) - Date.parse(e.startedAt)) / 60000));
+const clockText = (iso) => new Date(iso).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" });
+const VERDICTS = {
+  traffic: { label: "Tráfico confirmado", className: "bg-rose-50 text-rose-700" },
+  clear: { label: "Calle libre: se detuvo por otra causa", className: "bg-slate-100 text-slate-600" },
+  unknown: { label: "Sin datos de tráfico", className: "bg-amber-50 text-amber-700" },
+};
+
+export function RouteTrafficReport({ routeId, route = null, live = false }) {
+  const events = useRouteTraffic(routeId, live);
+  const [info, setInfo] = useState(route);
+  useEffect(() => {
+    if (route) {
+      setInfo(route);
+      return;
+    }
+    let alive = true;
+    supabase
+      .from("routes")
+      .select("*")
+      .eq("id", routeId)
+      .maybeSingle()
+      .then(({ data }) => alive && setInfo(data ?? null));
+    return () => {
+      alive = false;
+    };
+  }, [routeId, route]);
+  if (events === null) return null;
+  const planned = info?.plannedMinutes != null;
+  if (events.length === 0 && !planned) return null;
+  const totalSlow = events.reduce((n, e) => n + slowMinutes(e), 0);
+  const byTraffic = events.filter((e) => e.verdict === "traffic").reduce((n, e) => n + slowMinutes(e), 0);
+  const realMinutes = info?.endedAt ? Math.round((Date.parse(info.endedAt) - Date.parse(info.startedAt)) / 60000) : null;
+  const late = info?.plannedArrival && info?.endedAt ? Math.round((Date.parse(info.endedAt) - Date.parse(info.plannedArrival)) / 60000) : null;
+  return (
+    <div className="space-y-2 rounded-2xl border border-slate-200 bg-white p-3">
+      <p className="flex items-center gap-1.5 text-xs font-bold text-slate-700">
+        <AlertTriangle size={14} className="text-amber-500" /> Tráfico y tramos lentos
+      </p>
+      {planned && (
+        <div className="grid grid-cols-3 gap-2">
+          {[
+            ["Planeado", durationText(info.plannedMinutes)],
+            ["Real", realMinutes != null ? durationText(realMinutes) : "En curso"],
+            ["Llegada", late == null ? (info.plannedArrival ? `Estimada ${clockText(info.plannedArrival)}` : "—") : late > 2 ? `${late} min tarde` : late < -2 ? `${-late} min antes` : "A tiempo"],
+          ].map(([label, value]) => (
+            <div key={label} className="rounded-xl bg-slate-50 px-2.5 py-1.5">
+              <p className="text-[10px] text-slate-400">{label}</p>
+              <p className="text-xs font-bold text-slate-800">{value}</p>
+            </div>
+          ))}
+        </div>
+      )}
+      {events.length === 0 ? (
+        <p className="text-[11px] text-slate-500">Sin tramos lentos en este viaje.</p>
+      ) : (
+        <p className="text-[11px] text-slate-600">
+          {totalSlow} min en tramos lentos; <b className="text-rose-700">{byTraffic} min por tráfico confirmado por TomTom</b>.
+        </p>
+      )}
+      {events.map((e) => {
+        const v = VERDICTS[e.verdict] ?? VERDICTS.unknown;
+        return (
+          <div key={e.id} className="space-y-0.5 rounded-xl bg-slate-50 p-2.5 text-[11px] text-slate-600">
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
+              <span className="font-bold text-slate-800">
+                {clockText(e.startedAt)} – {e.endedAt ? clockText(e.endedAt) : "sigue"} · {slowMinutes(e)} min
+              </span>
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${v.className}`}>{v.label}</span>
+            </div>
+            <p>
+              {e.roadName || "Calle sin nombre"} · avanzó {formatKm(e.movedKm)}
+              {e.unitSpeedKmh != null ? ` (${Math.round(e.unitSpeedKmh)} km/h)` : ""}
+            </p>
+            {e.currentSpeedKmh != null && (
+              <p>
+                TomTom: la calle iba a <b>{Math.round(e.currentSpeedKmh)} km/h</b> (normal {Math.round(e.freeFlowSpeedKmh ?? 0)} km/h)
+                {e.roadClosure ? " · calle cerrada" : ""} · consultado a las {clockText(e.checkedAt)}
+              </p>
+            )}
+            {(e.incidents ?? []).map((i, n) => (
+              <p key={n} className="text-rose-700">
+                ⚠ {i.type}
+                {i.description ? `: ${i.description}` : ""}
+                {i.from ? ` (${i.from}${i.to ? ` → ${i.to}` : ""})` : ""}
+                {i.delayMinutes ? ` · retraso ${i.delayMinutes} min` : ""}
+              </p>
+            ))}
+          </div>
+        );
+      })}
+      {events.length > 0 && <p className="text-[10px] text-slate-400">Navio consultó el tráfico a TomTom en el momento, desde el servidor. Estos datos no se pueden modificar.</p>}
+    </div>
+  );
+}
+
 // El recorrido de una ruta ya guardada, con inicio (A) y fin (B).
 export function RouteMap({ routeId, live = false, className = "h-72" }) {
   const [points, setPoints] = useState(null);
@@ -1207,15 +1486,17 @@ export function RouteMap({ routeId, live = false, className = "h-72" }) {
     };
   }, [routeId]);
   const lines = useMemo(() => (points ? [{ id: "route", points }] : []), [points]);
+  const slowEvents = useRouteTraffic(routeId, live);
   const pins = useMemo(() => {
     if (!points || points.length === 0) return [];
     const first = points[0];
     const last = points[points.length - 1];
     return [
+      ...(slowEvents ?? []).map((e) => ({ id: `t${e.id}`, lat: e.lat, lng: e.lng, text: "!", color: e.verdict === "traffic" ? "#e11d48" : "#f59e0b" })),
       { id: "a", lat: first.lat, lng: first.lng, text: "A", color: "#10b981" },
       { id: "b", lat: last.lat, lng: last.lng, text: live ? "●" : "B", color: live ? "#2563eb" : "#e11d48" },
     ];
-  }, [points, live]);
+  }, [points, live, slowEvents]);
   return (
     <div className={`relative overflow-hidden rounded-xl border border-slate-200 ${className}`}>
       <MapView lines={lines} pins={pins} fitKey={points ? `${routeId}:${points.length}` : undefined} />

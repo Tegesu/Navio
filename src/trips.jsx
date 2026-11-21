@@ -16,7 +16,7 @@ import {
   profileCan,
 } from "./NavioDashboard.jsx";
 import { usePeople, personName } from "./people.jsx";
-import { DriverPanel, RouteMap, formatDuration, formatKm, routeSummary, useTracking } from "./tracking.jsx";
+import { DriverPanel, RouteMap, RouteTrafficReport, formatDuration, formatKm, routeSummary, useTracking } from "./tracking.jsx";
 import { TripMapScreen } from "./tripmode.jsx";
 
 /* ---------------------------------------------------------------------- */
@@ -266,6 +266,7 @@ function TripDetailModal({ trip, onClose }) {
                 </div>
               ))}
             </div>
+            <RouteTrafficReport routeId={trip.routeId} live={trip.status === "ongoing"} />
           </>
         ) : (
           <p className="rounded-xl border border-dashed border-slate-200 px-3 py-4 text-center text-xs text-slate-400">
