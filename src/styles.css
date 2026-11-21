@@ -437,3 +437,13 @@ html.dark .tiles-native-dark .leaflet-tile-pane {
   top: calc(49px + max(0.5rem, var(--safe-top)));
   bottom: calc(max(6px, var(--safe-bottom) - 6px) + 78px);
 }
+
+/* Teléfono, pestaña Viaje: el mapa ocupa todo entre el encabezado y el borde
+   de abajo (la barra inferior flota encima). Mismo encabezado que Mensajes. */
+.trip-screen {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: calc(49px + max(0.5rem, var(--safe-top)));
+  bottom: 0;
+}

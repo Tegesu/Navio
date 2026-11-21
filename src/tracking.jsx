@@ -635,7 +635,7 @@ export function TrackingLiveCard({ big = false }) {
   );
 }
 
-function TrackingError() {
+export function TrackingError() {
   const { error, clearError } = useTracking();
   const [asking, setAsking] = useState(false);
   if (!error) return null;
@@ -670,7 +670,7 @@ function TrackingError() {
 }
 
 // Qué puede hacer la persona con el teléfono mientras dura el viaje.
-function TrackingModeNote() {
+export function TrackingModeNote() {
   const { mode, trackerSeenAt, active } = useTracking();
   const [, tick] = useState(0);
   useEffect(() => {
@@ -699,7 +699,7 @@ function TrackingModeNote() {
 }
 
 // Un viaje que quedó abierto (por ejemplo, se inició en otro teléfono).
-function OrphanRouteNotice({ vehicles }) {
+export function OrphanRouteNotice({ vehicles }) {
   const { orphan, follow, finishOrphan, active } = useTracking();
   if (!orphan || active) return null;
   const unit = vehicles.find((v) => v.id === orphan.vehicleId)?.unit ?? "tu unidad";

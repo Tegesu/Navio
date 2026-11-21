@@ -17,6 +17,7 @@ import {
 } from "./NavioDashboard.jsx";
 import { usePeople, personName } from "./people.jsx";
 import { DriverPanel, RouteMap, formatDuration, formatKm, routeSummary, useTracking } from "./tracking.jsx";
+import { TripMapScreen } from "./tripmode.jsx";
 
 /* ---------------------------------------------------------------------- */
 /*  Traslados — viajes programados y su registro real                     */
@@ -516,59 +517,59 @@ export function TransfersPage({ vehicles, trips, insertTrip, updateTrip, removeT
 export function MobileTripTab({ vehicles, trips }) {
   const { user } = useAuth();
   const { format } = useDateFormat();
-  const tracking = useTracking();
   const [detailId, setDetailId] = useState(null);
+  const [listOpen, setListOpen] = useState(false);
   const mine = trips
     .filter((t) => t.assignedTo === user?.id)
     .sort((a, b) => String(b.date).localeCompare(String(a.date)) || b.id - a.id);
   const upcoming = mine.filter((t) => ["scheduled", "ongoing"].includes(t.status));
-  const recent = mine.filter((t) => t.status === "completed").slice(0, 5);
+  const recent = mine.filter((t) => t.status === "completed").slice(0, 10);
   const detail = trips.find((t) => t.id === detailId) ?? null;
 
   return (
-    <div className="space-y-4 p-4 pb-24">
-      <h1 className="text-xl font-bold text-slate-900">Viaje</h1>
-      <DriverPanel vehicles={vehicles} trips={trips} big />
-
-      {!tracking?.active && upcoming.length > 0 && (
-        <div>
-          <h2 className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Tus traslados</h2>
-          <div className="space-y-2">
-            {upcoming.map((t) => (
-              <button key={t.id} onClick={() => setDetailId(t.id)} className="block w-full rounded-xl border border-slate-200 bg-white p-3 text-left">
-                <p className="flex items-center gap-1.5 text-sm font-bold text-slate-800">
-                  <span className="truncate">{t.origin}</span> <Navigation size={13} className="shrink-0 text-blue-500" /> <span className="truncate">{t.destination}</span>
-                </p>
-                <p className="mt-0.5 text-[11px] text-slate-500">
-                  {t.unit} · {formatDate(t.date, format)}
-                  {t.cargo ? ` · ${t.cargo}` : ""}
-                </p>
-              </button>
-            ))}
+    <>
+      <TripMapScreen vehicles={vehicles} trips={trips} onShowHistory={() => setListOpen(true)} />
+      {listOpen && (
+        <Modal title="Mis traslados y viajes" width="max-w-md" onClose={() => setListOpen(false)}>
+          <div className="max-h-[70dvh] space-y-4 overflow-y-auto">
+            <div>
+              <h2 className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Por hacer</h2>
+              {upcoming.length === 0 && <p className="text-xs text-slate-400">No tienes traslados asignados.</p>}
+              <div className="space-y-2">
+                {upcoming.map((t) => (
+                  <button key={t.id} onClick={() => setDetailId(t.id)} className="block w-full rounded-xl border border-slate-200 bg-white p-3 text-left">
+                    <p className="flex items-center gap-1.5 text-sm font-bold text-slate-800">
+                      <span className="truncate">{t.origin}</span> <Navigation size={13} className="shrink-0 text-blue-500" /> <span className="truncate">{t.destination}</span>
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      {t.unit} · {formatDate(t.date, format)}
+                      {t.cargo ? ` · ${t.cargo}` : ""}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <h2 className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Viajes recientes</h2>
+              {recent.length === 0 && <p className="text-xs text-slate-400">Todavía no hay viajes terminados.</p>}
+              <div className="space-y-2">
+                {recent.map((t) => (
+                  <button key={t.id} onClick={() => setDetailId(t.id)} className="flex w-full items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white p-3 text-left">
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs font-bold text-slate-800">
+                        {t.origin} → {t.destination}
+                      </span>
+                      <span className="block text-[11px] text-slate-400">{formatDate(t.date, format)}</span>
+                    </span>
+                    <span className="shrink-0 text-xs font-semibold text-slate-600">{formatKm(t.distanceKm)}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
-        </div>
+        </Modal>
       )}
-
-      {recent.length > 0 && (
-        <div>
-          <h2 className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400">Viajes recientes</h2>
-          <div className="space-y-2">
-            {recent.map((t) => (
-              <button key={t.id} onClick={() => setDetailId(t.id)} className="flex w-full items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white p-3 text-left">
-                <span className="min-w-0">
-                  <span className="block truncate text-xs font-bold text-slate-800">
-                    {t.origin} → {t.destination}
-                  </span>
-                  <span className="block text-[11px] text-slate-400">{formatDate(t.date, format)}</span>
-                </span>
-                <span className="shrink-0 text-xs font-semibold text-slate-600">{formatKm(t.distanceKm)}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
       {detail && <TripDetailModal trip={detail} onClose={() => setDetailId(null)} />}
-    </div>
+    </>
   );
 }

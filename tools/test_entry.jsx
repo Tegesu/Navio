@@ -921,6 +921,24 @@ Object.defineProperty(supabase, "functions", {
     invoke: async (name, { body } = {}) => {
       window.__invokes.push({ name, body });
       if (name === "translate") return { data: { translation: `[EN] ${body?.text ?? ""}` }, error: null };
+      // ?tomtom: lugares y rutas de mentira (TomTom no responde en localhost).
+      if (name === "tomtom" && params.has("tomtom")) {
+        const places = [
+          { name: "Mérida", lat: 20.967, lng: -89.623 },
+          { name: "Villahermosa", lat: 17.989, lng: -92.947 },
+          { name: "Campeche", lat: 19.845, lng: -90.523 },
+          { name: "Coatzacoalcos", lat: 18.134, lng: -94.459 },
+        ];
+        if (body.action === "search") {
+          const t = String(body.text).toLowerCase();
+          return { data: { results: places.filter((p) => p.name.toLowerCase().includes(t.slice(0, 3))).map((p) => ({ poi: { name: p.name }, address: { freeformAddress: `${p.name}, México` }, position: { lat: p.lat, lon: p.lng } })) }, error: null };
+        }
+        if (body.action === "reverse") return { data: { addresses: [{ address: { freeformAddress: `Punto ${Number(body.lat).toFixed(2)}, ${Number(body.lng).toFixed(2)}` } }] }, error: null };
+        const n = 30;
+        const pts = Array.from({ length: n + 1 }, (_, i) => ({ latitude: body.fromLat + ((body.toLat - body.fromLat) * i) / n + Math.sin(i / 4) * 0.05, longitude: body.fromLng + ((body.toLng - body.fromLng) * i) / n }));
+        const km = Math.hypot(body.toLat - body.fromLat, body.toLng - body.fromLng) * 105;
+        return { data: { routes: [{ summary: { lengthInMeters: km * 1000, travelTimeInSeconds: Math.round((km / 70) * 3600), trafficDelayInSeconds: 600 }, legs: [{ points: pts }] }] }, error: null };
+      }
       // Aviso de prueba: __pushTest = { firebase, total, sent, errors } para simular respuestas.
       if (name === "push" && body?.test) {
         const t = { firebase: true, web: true, total: 1, sent: 1, errors: [], ...(window.__pushTest ?? {}) };
